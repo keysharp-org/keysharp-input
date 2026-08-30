@@ -17,6 +17,7 @@ is_root_protected_chain() {
     current=$1
     while :; do
         metadata=$(stat -Lc '%u %a' -- "$current" 2>/dev/null) || return 1
+        # shellcheck disable=SC2086 # deliberate split into uid and mode
         set -- $metadata
         [ "$1" = 0 ] || return 1
         # Multi-user Nix uses a root-owned sticky, group-writable store root.
@@ -370,6 +371,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# shellcheck disable=SC1007 # CDPATH= is a prefix assignment scoped to cd
 archive_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 if ! archive_complete "$archive_dir"; then
