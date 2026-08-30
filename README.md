@@ -147,6 +147,7 @@ build/keysharp-inputd --socket /tmp/keysharp-test.sock
 
 Clients speak the protocol directly over the Unix socket. The wire contract is
 the installed header `keysharp-inputd/protocol.h`, and
+[docs/integrating.md](docs/integrating.md) is the integration guide, and
 [docs/protocol.md](docs/protocol.md) documents the handshake, message set,
 hook dispatch, and status codes. `tools/hooktest.c` is a complete worked client.
 
@@ -204,6 +205,7 @@ decisions for hooked input.
 
 | Document | Contents |
 |---|---|
+| [docs/integrating.md](docs/integrating.md) | Depending on and writing a client for the broker |
 | [docs/protocol.md](docs/protocol.md) | IPC protocol: framing, messages, status codes |
 | [docs/security-model.md](docs/security-model.md) | Authentication, authorization, enforcement |
 | [docs/permission-store.md](docs/permission-store.md) | Shared on-disk grant contract |
