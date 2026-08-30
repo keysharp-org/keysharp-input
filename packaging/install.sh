@@ -5,7 +5,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=1.2.0
+expected_version=0.1.0
 expected_protocol_name=keysharp-inputd/windows-input-v1
 skip_compatible=false
 
