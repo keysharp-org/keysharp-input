@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "$1" = remove ]; then
+    /usr/bin/systemctl disable --now keysharp-inputd.service keysharp-inputd.socket || true
+    /usr/bin/keysharp-inputd --remove-input-access || true
+fi

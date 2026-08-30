@@ -1,0 +1,8 @@
+# Grant the active session access only to keysharp-inputd's virtual devices.
+ACTION!="add|change", GOTO="keysharp_uaccess_end"
+SUBSYSTEM!="input", GOTO="keysharp_uaccess_end"
+
+ATTRS{name}=="Keysharp Virtual Input", TAG+="uaccess"
+ATTRS{name}=="Keysharp Virtual Pointer", TAG+="uaccess"
+
+LABEL="keysharp_uaccess_end"

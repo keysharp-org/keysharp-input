@@ -1,0 +1,5 @@
+/build*/
+/Testing/
+/_CPack_Packages/
+*.deb
+*.tar.gz

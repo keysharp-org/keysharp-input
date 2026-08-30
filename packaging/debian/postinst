@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "${1:-}" = configure ]; then
+    if [ -x /usr/bin/systemd-tmpfiles ] \
+        && [ -f /usr/lib/tmpfiles.d/keysharp-input-permissions.conf ]; then
+        /usr/bin/systemd-tmpfiles --create \
+            /usr/lib/tmpfiles.d/keysharp-input-permissions.conf
+    fi
+    /usr/bin/systemctl daemon-reload || true
+
+    set +e
+    /usr/bin/keysharp-inputd --install-input-access
+    setup_status=$?
+    set -e
+
+    case "$setup_status" in
+        0) ;;
+        2)
+            echo "keysharp-input: files installed, but live device/service activation was incomplete." >&2
+            echo "Run 'sudo keysharp-inputd --install-input-access' after resolving the reported issue." >&2
+            ;;
+        *)
+            echo "keysharp-input: persistent input-access setup failed (status $setup_status)." >&2
+            exit "$setup_status"
+            ;;
+    esac
+fi

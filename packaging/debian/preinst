@@ -1,0 +1,80 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
+
+portable_binary=/usr/local/bin/keysharp-inputd
+package_binary=/usr/bin/keysharp-inputd
+portable_service=/etc/systemd/system/keysharp-inputd.service
+portable_socket=/etc/systemd/system/keysharp-inputd.socket
+package_service=/usr/lib/systemd/system/keysharp-inputd.service
+package_socket=/usr/lib/systemd/system/keysharp-inputd.socket
+alternate_package_service=/lib/systemd/system/keysharp-inputd.service
+alternate_package_socket=/lib/systemd/system/keysharp-inputd.socket
+
+path_present() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
+
+canonical_path() {
+    readlink -f -- "$1" 2>/dev/null \
+        || readlink -m -- "$1" 2>/dev/null
+}
+
+portable_binary_conflicts() {
+    path_present "$portable_binary" || return 1
+    portable_resolved=$(canonical_path "$portable_binary") || return 0
+    package_resolved=$(canonical_path "$package_binary") || package_resolved=$package_binary
+    [ "$portable_resolved" != "$package_resolved" ]
+}
+
+package_unit_link() {
+    [ -L "$1" ] || return 1
+    unit_resolved=$(canonical_path "$1") || return 1
+    package_unit_resolved=$(canonical_path "$2") || package_unit_resolved=$2
+    alternate_unit_resolved=$(canonical_path "$3") || alternate_unit_resolved=$3
+    [ "$unit_resolved" = "$package_unit_resolved" ] \
+        || [ "$unit_resolved" = "$alternate_unit_resolved" ]
+}
+
+portable_service_conflicts() {
+    path_present "$portable_service" || return 1
+    ! package_unit_link "$portable_service" \
+        "$package_service" "$alternate_package_service"
+}
+
+portable_socket_conflicts() {
+    path_present "$portable_socket" || return 1
+    ! package_unit_link "$portable_socket" \
+        "$package_socket" "$alternate_package_socket"
+}
+
+case "${1:-}" in
+    install|upgrade) ;;
+    *) exit 0 ;;
+esac
+
+conflicts=
+if portable_binary_conflicts; then
+    conflicts="${conflicts} ${portable_binary}"
+fi
+if portable_service_conflicts; then
+    conflicts="${conflicts} ${portable_service}"
+fi
+if portable_socket_conflicts; then
+    conflicts="${conflicts} ${portable_socket}"
+fi
+
+if [ -n "$conflicts" ]; then
+    printf '%s\n' \
+        "keysharp-input: refusing to install the Debian package over a portable installation." \
+        "Conflicting portable paths:${conflicts}" \
+        "Remove the portable copy first, then retry the package installation:" \
+        "  sudo /usr/local/share/doc/keysharp-input/uninstall.sh" \
+        "If a keysharp-input package is already installed and the portable uninstaller refuses the layered state, remove that package first, run the portable uninstaller, then reinstall the package." >&2
+    exit 1
+fi
+
+exit 0

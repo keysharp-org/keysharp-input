@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed release tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve immutable release source
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be v followed by a three-part numeric version. Got '$RELEASE_TAG'." >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Release source must be an existing tag named $RELEASE_TAG." >&2
+            exit 1
+          fi
+          tag_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [[ "$(git rev-parse HEAD)" != "$tag_sha" ]]; then
+            echo "Checked-out source does not match refs/tags/$RELEASE_TAG." >&2
+            exit 1
+          fi
+          version=$(sed -n '/^project(keysharp-input/,/LANGUAGES C)/s/^[[:space:]]*VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt)
+          if [[ -z "$version" || "$RELEASE_TAG" != "v$version" ]]; then
+            echo "Release tag $RELEASE_TAG does not exactly match CMake project version ${version:-<missing>}." >&2
+            exit 1
+          fi
+          installer_version=$(sed -n 's/^expected_version=\([0-9.]*\)$/\1/p' packaging/install.sh)
+          nix_version=$(sed -n 's/^[[:space:]]*version = "\([0-9.]*\)";$/\1/p' nix/package.nix)
+          if [[ "$installer_version" != "$version" || "$nix_version" != "$version" ]]; then
+            echo "Release version is inconsistent across CMake, the portable installer, and Nix packaging." >&2
+            exit 1
+          fi
+
+          echo "source_sha=$tag_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  artifacts:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      # Native release artifacts target Ubuntu 22.04's glibc 2.35 baseline; CI covers the current image.
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            asset_arch: x64
+            deb_arch: amd64
+          - runner: ubuntu-22.04-arm
+            asset_arch: arm64
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: Build Linux ${{ matrix.asset_arch }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Verify immutable source
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build pkg-config libudev-dev libevdev-dev dpkg-dev
+
+      - name: Build and test portable layout
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DKEYSHARP_INPUTD_SETUP_ON_INSTALL=OFF \
+            -DKEYSHARP_INPUTD_BUILD_HOOKTEST=OFF
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+      - name: Create portable archive
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          root="$RUNNER_TEMP/keysharp-input-$VERSION-linux-$ASSET_ARCH"
+          install -D -m 0755 build/keysharp-inputd "$root/bin/keysharp-inputd"
+          install -D -m 0644 build/keysharp-inputd.service "$root/systemd/keysharp-inputd.service"
+          install -D -m 0644 systemd/keysharp-inputd.socket "$root/systemd/keysharp-inputd.socket"
+          install -D -m 0644 systemd/keysharp-input-permissions.conf \
+            "$root/tmpfiles/keysharp-input-permissions.conf"
+          install -D -m 0644 polkit/org.keysharp.input.policy "$root/polkit/org.keysharp.input.policy"
+          install -D -m 0644 udev/70-keysharp-inputd-uaccess.rules \
+            "$root/udev/70-keysharp-inputd-uaccess.rules"
+          install -D -m 0644 include/keysharp_inputd/protocol.h \
+            "$root/include/keysharp-inputd/protocol.h"
+          install -d -m 0755 "$root/docs"
+          install -m 0644 docs/*.md "$root/docs/"
+          install -m 0755 packaging/install.sh "$root/install.sh"
+          install -m 0755 packaging/uninstall.sh "$root/uninstall.sh"
+          install -m 0644 LICENSE README.md PROVENANCE.md "$root/"
+          mkdir -p dist
+          commit_epoch=$(git log -1 --format=%ct)
+          tar -C "$RUNNER_TEMP" --sort=name --mtime="@$commit_epoch" \
+            --owner=0 --group=0 --numeric-owner -czf \
+            "dist/keysharp-input-$VERSION-linux-$ASSET_ARCH.tar.gz" \
+            "keysharp-input-$VERSION-linux-$ASSET_ARCH"
+
+      - name: Create Debian package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          cmake -S . -B build-deb -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DKEYSHARP_INPUTD_SETUP_ON_INSTALL=OFF \
+            -DKEYSHARP_INPUTD_BUILD_HOOKTEST=OFF
+          cmake --build build-deb --parallel
+          cpack --config build-deb/CPackConfig.cmake -G DEB
+          package=$(find . -maxdepth 2 -type f -name '*.deb' -print -quit)
+          test -n "$package"
+          mv "$package" "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb"
+          test "$(dpkg-deb -f "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb" Provides)" = \
+            "keysharp-input-protocol-1.2"
+
+      - name: Attest release binaries
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/keysharp-input-${{ needs.prepare.outputs.version }}-linux-${{ matrix.asset_arch }}.tar.gz
+            dist/keysharp-input_${{ needs.prepare.outputs.version }}_${{ matrix.deb_arch }}.deb
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: keysharp-input-${{ matrix.asset_arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs:
+      - prepare
+      - artifacts
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag did not move
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.source_sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$EXPECTED_SHA"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: keysharp-input-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.deb > SHA256SUMS
+
+      - name: Attest checksum manifest
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$is_draft" == "true" ]]; then
+              gh release upload "$RELEASE_TAG" dist/* --clobber
+            else
+              gh release upload "$RELEASE_TAG" dist/*
+            fi
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
+          fi
