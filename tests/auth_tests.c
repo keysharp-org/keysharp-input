@@ -88,7 +88,9 @@ int main(void)
     CHECK(snprintf(runtime_directory, sizeof(runtime_directory), "%s.runtime",
         store_path) < (int)sizeof(runtime_directory));
     CHECK(KSI_INPUT_CAPABILITIES == 0x0000001Fu);
-    CHECK(KSP_INPUT_SCOPES == 0x00000180u);
+    CHECK(KSP_SCOPE_INPUT_MONITORING == 0x00000001u);
+    CHECK(KSP_SCOPE_INPUT_CONTROL == 0x00000002u);
+    CHECK(KSP_INPUT_SCOPES == 0x00000003u);
     CHECK(snprintf(marker_name, sizeof(marker_name),
         "grant-%lu-%s-%08x.grant", (unsigned long)uid, hash,
         KSP_SCOPE_INPUT_MONITORING) < (int)sizeof(marker_name));
