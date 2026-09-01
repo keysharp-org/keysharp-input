@@ -1,4 +1,4 @@
-#include "keysharp_inputd/synthetic_hooks.h"
+#include "internal/synthetic_hooks.h"
 
 static const struct {
     uint32_t trigger;
@@ -6,18 +6,18 @@ static const struct {
     bool mask_flags;
     bool keep_motion;
 } mouse_primitives[] = {
-    { KSI_MOUSEEVENTF_MOVE, KSI_MOUSEEVENTF_MOVE | KSI_MOUSEEVENTF_MOVE_NOCOALESCE
-        | KSI_MOUSEEVENTF_VIRTUALDESK | KSI_MOUSEEVENTF_ABSOLUTE, true, true },
-    { KSI_MOUSEEVENTF_WHEEL, KSI_MOUSEEVENTF_WHEEL, false, false },
-    { KSI_MOUSEEVENTF_HWHEEL, KSI_MOUSEEVENTF_HWHEEL, false, false },
-    { KSI_MOUSEEVENTF_LEFTDOWN, KSI_MOUSEEVENTF_LEFTDOWN, false, false },
-    { KSI_MOUSEEVENTF_LEFTUP, KSI_MOUSEEVENTF_LEFTUP, false, false },
-    { KSI_MOUSEEVENTF_RIGHTDOWN, KSI_MOUSEEVENTF_RIGHTDOWN, false, false },
-    { KSI_MOUSEEVENTF_RIGHTUP, KSI_MOUSEEVENTF_RIGHTUP, false, false },
-    { KSI_MOUSEEVENTF_MIDDLEDOWN, KSI_MOUSEEVENTF_MIDDLEDOWN, false, false },
-    { KSI_MOUSEEVENTF_MIDDLEUP, KSI_MOUSEEVENTF_MIDDLEUP, false, false },
-    { KSI_MOUSEEVENTF_XDOWN, KSI_MOUSEEVENTF_XDOWN, false, false },
-    { KSI_MOUSEEVENTF_XUP, KSI_MOUSEEVENTF_XUP, false, false },
+    { KSI_MOUSE_MOVE, KSI_MOUSE_MOVE | KSI_MOUSE_MOVE_NO_COALESCE
+        | KSI_MOUSE_VIRTUAL_DESKTOP | KSI_MOUSE_ABSOLUTE, true, true },
+    { KSI_MOUSE_WHEEL, KSI_MOUSE_WHEEL, false, false },
+    { KSI_MOUSE_HORIZONTAL_WHEEL, KSI_MOUSE_HORIZONTAL_WHEEL, false, false },
+    { KSI_MOUSE_LEFT_DOWN, KSI_MOUSE_LEFT_DOWN, false, false },
+    { KSI_MOUSE_LEFT_UP, KSI_MOUSE_LEFT_UP, false, false },
+    { KSI_MOUSE_RIGHT_DOWN, KSI_MOUSE_RIGHT_DOWN, false, false },
+    { KSI_MOUSE_RIGHT_UP, KSI_MOUSE_RIGHT_UP, false, false },
+    { KSI_MOUSE_MIDDLE_DOWN, KSI_MOUSE_MIDDLE_DOWN, false, false },
+    { KSI_MOUSE_MIDDLE_UP, KSI_MOUSE_MIDDLE_UP, false, false },
+    { KSI_MOUSE_X_DOWN, KSI_MOUSE_X_DOWN, false, false },
+    { KSI_MOUSE_X_UP, KSI_MOUSE_X_UP, false, false },
 };
 
 size_t ksi_synthetic_hook_input_count(const ksi_input *input)

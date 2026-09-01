@@ -9,7 +9,7 @@ an internal ABI.
 - `client_lifecycle.inc`: client removal and connection cleanup.
 - `hook_lanes.inc`: bounded output sequencing, keyboard/mouse lanes, decisions,
   and lane shutdown.
-- `grab_leases.inc`: capabilities, grabs, leases, fail-open state, and hook
+- `grab_leases.inc`: operations, grabs, leases, fail-open state, and hook
   failure accounting.
 - `hook_dispatch.inc`: physical event snapshotting, emergency replay, and
   backend hook callback dispatch.
@@ -39,14 +39,14 @@ in standalone modules.
   discovery, and protocol parsing.
 - Each hook lane owns its current event context. Other threads communicate with
   it only through bounded action, decision, and nested-transaction queues.
-- One `ksi_hook_send_ref` owns each hook stream's shared keyboard/mouse callback stack.
+- One `ksi_hook_send_ref` owns each callback stream's keyboard/mouse callback stack.
   Root turns enter only an empty stack; recursive turns enter only while the top
   callback is synchronously pumping Send.
 - The output sequencer is the only thread that writes to or recreates uinput
   devices. Admission order is fixed before work reaches that thread.
 - A `ksi_synth_completion` counts every admitted fragment; exactly the transition
   from one to zero releases the atomic-transaction count and destroys it. Recursive
-  completions also own the HookStream reply reference; ordinary batches are detached
+  completions also own the callback-stream reply reference; ordinary batches are detached
   because their RPC already acknowledged admission.
 - `flush_generation` invalidates queued snapshots during fail-open or teardown;
   stale events may release resources but must not invoke callbacks or output

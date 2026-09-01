@@ -30,6 +30,7 @@ jobs:
           ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Resolve immutable release source
         id: release
@@ -66,6 +67,18 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  nix:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: Validate Nix package
+        run: nix flake check --no-write-lock-file
+
   artifacts:
     needs: prepare
     strategy:
@@ -91,6 +104,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
+          submodules: recursive
 
       - name: Verify immutable source
         env:
@@ -107,8 +121,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DKEYSHARP_INPUTD_SETUP_ON_INSTALL=OFF \
-            -DKEYSHARP_INPUTD_BUILD_HOOKTEST=OFF
+            -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
           cmake --build build --parallel
           ctest --test-dir build --output-on-failure
 
@@ -118,16 +131,26 @@ jobs:
           ASSET_ARCH: ${{ matrix.asset_arch }}
         run: |
           root="$RUNNER_TEMP/keysharp-input-$VERSION-linux-$ASSET_ARCH"
-          install -D -m 0755 build/keysharp-inputd "$root/bin/keysharp-inputd"
-          install -D -m 0644 build/keysharp-inputd.service "$root/systemd/keysharp-inputd.service"
-          install -D -m 0644 systemd/keysharp-inputd.socket "$root/systemd/keysharp-inputd.socket"
+          stage="$RUNNER_TEMP/keysharp-input-stage"
+          DESTDIR="$stage" cmake --install build
+          install -D -m 0755 "$stage/usr/local/bin/keysharp-input" "$root/bin/keysharp-input"
+          install -d -m 0755 "$root/lib"
+          cp -a "$stage/usr/local/lib/libkeysharp-input.so"* "$root/lib/"
+          install -D -m 0644 "$stage/usr/local/include/keysharp_input/client.h" \
+            "$root/include/keysharp_input/client.h"
+          install -D -m 0644 "$stage/usr/local/include/keysharp_input/constants.h" \
+            "$root/include/keysharp_input/constants.h"
+          install -D -m 0644 "$stage/usr/local/lib/pkgconfig/keysharp-input.pc" \
+            "$root/pkgconfig/keysharp-input.pc"
+          install -d -m 0755 "$root/cmake"
+          install -m 0644 "$stage/usr/local/lib/cmake/KeysharpInput/"*.cmake "$root/cmake/"
+          install -D -m 0644 build/keysharp-input.service "$root/systemd/keysharp-input.service"
+          install -D -m 0644 systemd/keysharp-input.socket "$root/systemd/keysharp-input.socket"
           install -D -m 0644 systemd/keysharp-input-permissions.conf \
             "$root/tmpfiles/keysharp-input-permissions.conf"
           install -D -m 0644 polkit/org.keysharp.input.policy "$root/polkit/org.keysharp.input.policy"
-          install -D -m 0644 udev/70-keysharp-inputd-uaccess.rules \
-            "$root/udev/70-keysharp-inputd-uaccess.rules"
-          install -D -m 0644 include/keysharp_inputd/protocol.h \
-            "$root/include/keysharp-inputd/protocol.h"
+          install -D -m 0644 udev/70-keysharp-input-uaccess.rules \
+            "$root/udev/70-keysharp-input-uaccess.rules"
           install -d -m 0755 "$root/docs"
           install -m 0644 docs/*.md "$root/docs/"
           install -m 0755 packaging/install.sh "$root/install.sh"
@@ -148,15 +171,14 @@ jobs:
           cmake -S . -B build-deb -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
-            -DKEYSHARP_INPUTD_SETUP_ON_INSTALL=OFF \
-            -DKEYSHARP_INPUTD_BUILD_HOOKTEST=OFF
+            -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
           cmake --build build-deb --parallel
           cpack --config build-deb/CPackConfig.cmake -G DEB
           package=$(find . -maxdepth 2 -type f -name '*.deb' -print -quit)
           test -n "$package"
           mv "$package" "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb"
           test "$(dpkg-deb -f "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb" Provides)" = \
-            "keysharp-input-protocol-1.2"
+            "keysharp-input-client-abi-0"
 
       - name: Attest release binaries
         uses: actions/attest@v4
@@ -175,6 +197,7 @@ jobs:
   publish:
     needs:
       - prepare
+      - nix
       - artifacts
     runs-on: ubuntu-24.04
     permissions:
@@ -188,6 +211,7 @@ jobs:
           ref: refs/tags/${{ needs.prepare.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Verify release tag did not move
         env:

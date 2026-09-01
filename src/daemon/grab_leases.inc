@@ -1,93 +1,113 @@
 static void send_status(
     int client_fd,
     const ksi_message_header *request,
-    uint32_t response_type,
-    int32_t status,
+    uint32_t status,
     uint32_t detail)
 {
-    ksi_status_payload payload = {
-        .status = status,
-        .detail = detail,
-    };
+    uint8_t payload[KSI_STATUS_PAYLOAD_SIZE];
 
+    ksi_protocol_encode_status(payload, status, detail);
     (void)ipc_send_locked(
         client_fd,
-        response_type,
-        request->client_id,
-        request->correlation_id,
+        request->opcode,
+        KSI_FRAME_FLAG_RESPONSE,
+        request->request_id,
         &payload,
         sizeof(payload));
 }
 
 static void send_hello_status(
     const ksi_client *client,
-    uint32_t client_id,
-    uint64_t correlation_id,
-    int32_t status,
-    uint32_t granted_capabilities)
+    uint64_t request_id,
+    uint32_t status,
+    uint32_t detail,
+    uint32_t granted_scopes)
 {
-    ksi_client_hello_result_payload payload = {
-        .status = status,
-        .granted_capabilities = granted_capabilities,
-    };
+    uint8_t payload[KSI_HELLO_RESULT_PAYLOAD_SIZE];
+    size_t payload_size;
 
+    payload_size = ksi_protocol_encode_hello_result(
+        payload,
+        status,
+        detail,
+        granted_scopes,
+        client->advertised_operations);
     (void)ipc_send_locked(
         client->fd,
-        KSI_MESSAGE_CLIENT_HELLO,
-        client_id,
-        correlation_id,
+        KSI_OPCODE_HELLO,
+        KSI_FRAME_FLAG_RESPONSE,
+        request_id,
         &payload,
-        sizeof(payload));
+        payload_size);
 }
 
-static uint32_t permission_scopes_for_operations(uint32_t operations)
+static void send_authorize_status(
+    const ksi_client *client,
+    uint64_t request_id,
+    uint32_t status,
+    uint32_t detail,
+    uint32_t granted_scopes)
 {
-    uint32_t scopes = 0u;
+    uint8_t payload[KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE];
+    size_t payload_size = ksi_protocol_encode_authorize_result(
+        payload,
+        status,
+        detail,
+        granted_scopes);
 
-    if ((operations & (KSI_CAP_HOOK_KEYBOARD | KSI_CAP_HOOK_MOUSE)) != 0u) {
-        scopes |= KSP_SCOPE_INPUT_MONITORING;
-    }
-    if ((operations & (KSI_CAP_SYNTH_KEYBOARD | KSI_CAP_SYNTH_MOUSE
-            | KSI_CAP_BLOCK_INPUT)) != 0u) {
-        scopes |= KSP_SCOPE_INPUT_CONTROL;
-    }
-    return scopes;
+    (void)ipc_send_locked(client->fd, KSI_OPCODE_AUTHORIZE,
+        KSI_FRAME_FLAG_RESPONSE, request_id, payload, payload_size);
 }
 
-static uint32_t operations_allowed_by_scopes(
-    uint32_t operations, uint32_t scopes)
+static void send_authorization_status(
+    const ksi_client *client,
+    uint16_t opcode,
+    uint64_t request_id,
+    uint32_t status,
+    uint32_t detail,
+    uint32_t granted_scopes)
 {
-    uint32_t allowed = 0u;
+    if (opcode == KSI_OPCODE_AUTHORIZE) {
+        send_authorize_status(client, request_id, status, detail,
+            granted_scopes);
+    } else {
+        send_hello_status(client, request_id, status, detail,
+            granted_scopes);
+    }
+}
 
-    if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u) {
-        allowed |= operations & (KSI_CAP_HOOK_KEYBOARD | KSI_CAP_HOOK_MOUSE);
-    }
-    if ((scopes & KSP_SCOPE_INPUT_CONTROL) != 0u) {
-        allowed |= operations & (KSI_CAP_SYNTH_KEYBOARD | KSI_CAP_SYNTH_MOUSE
-            | KSI_CAP_BLOCK_INPUT);
-    }
-    return allowed;
+static void send_pending_authorization_status(
+    const ksi_client *client,
+    uint32_t status,
+    uint32_t detail,
+    uint32_t granted_scopes)
+{
+    send_authorization_status(client, client->pending_authorization_opcode,
+        client->pending_request_id, status, detail, granted_scopes);
 }
 
 static uint32_t client_persistent_allowed(const ksi_daemon_state *state, const ksi_client *client)
 {
+    uint32_t allowed = 0u;
+
     if (state == NULL || state->permission_monitor_failed) {
         return 0u;
     }
-    return ksi_auth_store_get_allowed(
-        state->permissions, client->uid, client->exe_hash);
+    if (ksp_store_check(state->permissions, client->uid, client->exe_hash,
+            KSI_INPUT_PERMISSION_SCOPES, &allowed) != 0) {
+        return 0u;
+    }
+    return allowed;
 }
 
-/* Returns the capabilities currently granted from the store without prompting.
+/* Returns scopes currently granted from the store without prompting.
  * Sets *out_missing to the durable permission scopes not yet granted. */
-static uint32_t check_capabilities_sync(
+static uint32_t check_scopes_sync(
     ksi_daemon_state *state,
     ksi_client *client,
     uint32_t requested,
     uint32_t *out_missing)
 {
-    uint32_t available_requested;
-    uint32_t required_scopes;
     uint32_t granted = 0u;
     uint32_t missing = 0u;
 
@@ -104,20 +124,17 @@ static uint32_t check_capabilities_sync(
         return 0u;
     }
 
-    available_requested = requested & KSI_INPUT_CAPABILITIES
-        & state->available_capabilities;
-    required_scopes = permission_scopes_for_operations(available_requested);
-
     uint32_t allowed;
     uint64_t generation;
 
-    if (ksi_auth_store_get_allowed_at_generation(state->permissions,
-            client->uid, client->exe_hash, &allowed, &generation) != 0) {
+    if (ksp_store_check_at_generation(state->permissions,
+            client->uid, client->exe_hash, requested,
+            &allowed, &generation) != 0) {
         return 0u;
     }
 
-    granted = operations_allowed_by_scopes(available_requested, allowed);
-    missing = required_scopes & ~allowed;
+    granted = requested & allowed;
+    missing = requested & ~allowed;
     client->permission_store_generation = generation;
     client->permission_store_generation_valid = true;
 
@@ -128,30 +145,25 @@ static uint32_t check_capabilities_sync(
     return granted;
 }
 
-static void finish_client_hello(
+static void finish_client_authorization(
     ksi_client *client,
-    uint32_t client_id,
-    uint64_t correlation_id,
+    uint16_t opcode,
+    uint64_t request_id,
     uint32_t requested,
-    uint32_t flags,
     uint32_t granted)
 {
     bool complete = requested == 0u || (granted & requested) == requested;
-    int32_t denied_status = (flags & KSI_CLIENT_HELLO_FLAG_CHECK_ONLY) != 0u
-        ? KSI_CLIENT_HELLO_STATUS_PERMISSION_DENIED
-        : -1;
 
-    client->granted_capabilities |= granted;
+    client->granted_scopes |= granted;
 
     if (complete) {
-        client->authenticated = true;
-        send_hello_status(client, client_id, correlation_id, 0, granted);
+        send_authorization_status(client, opcode, request_id, KSI_STATUS_OK,
+            KSI_DETAIL_NONE, client->granted_scopes);
         return;
     }
 
-    client->authenticated =
-        client->authenticated || client->granted_capabilities != 0u;
-    send_hello_status(client, client_id, correlation_id, denied_status, granted);
+    send_authorization_status(client, opcode, request_id, KSI_STATUS_DENIED,
+        KSI_DETAIL_NONE, 0u);
 }
 
 /* A revoke is rare control-plane work. Clear cached privileges and active grab
@@ -160,13 +172,14 @@ static void invalidate_connected_permissions(
     ksi_daemon_state *state,
     uid_t uid,
     const char *exe_hash,
+    bool all_executables,
     uint32_t scopes)
 {
     bool flush_keyboard = false;
     bool flush_mouse = false;
     bool grabs_changed = false;
 
-    if (state == NULL || exe_hash == NULL) {
+    if (state == NULL || (!all_executables && exe_hash == NULL)) {
         return;
     }
 
@@ -181,28 +194,35 @@ static void invalidate_connected_permissions(
         uint32_t old_grants;
 
         if (!client->has_identity || client->uid != uid
-            || strcmp(client->exe_hash, exe_hash) != 0) {
+            || (!all_executables
+                && strcmp(client->exe_hash, exe_hash) != 0)) {
             continue;
         }
 
-        uint32_t revoked_operations = operations_allowed_by_scopes(
-            KSI_INPUT_CAPABILITIES, scopes);
+        uint8_t notification[KSI_SESSION_REVOKED_PAYLOAD_SIZE];
 
-        old_grants = client->granted_capabilities;
-        client->granted_capabilities &= ~revoked_operations;
+        old_grants = client->granted_scopes;
+        ksi_wire_write_u32(notification, scopes & old_grants);
+        ksi_wire_write_u32(notification + 4u, 0u);
+        if ((scopes & old_grants) != 0u) {
+            (void)ipc_send_locked(client->fd, KSI_OPCODE_SESSION_REVOKED,
+                KSI_FRAME_FLAG_EVENT, 0u, notification,
+                sizeof(notification));
+        }
+        client->granted_scopes &= ~scopes;
 
-        if ((revoked_operations & KSI_CAP_HOOK_KEYBOARD) != 0u) {
+        if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u) {
             flush_keyboard = flush_keyboard
-                || (old_grants & KSI_CAP_HOOK_KEYBOARD) != 0u
-                || (client->hook_subscriptions & KSI_CAP_HOOK_KEYBOARD) != 0u;
+                || (old_grants & KSP_SCOPE_INPUT_MONITORING) != 0u
+                || (client->hook_subscriptions & KSI_OPERATION_HOOK_KEYBOARD) != 0u;
             grabs_changed = grabs_changed
-                || (client->hook_subscriptions & KSI_CAP_HOOK_KEYBOARD) != 0u;
+                || (client->hook_subscriptions & KSI_OPERATION_HOOK_KEYBOARD) != 0u;
             client->hook_subscriptions &=
-                (uint32_t)~KSI_CAP_HOOK_KEYBOARD;
+                (uint32_t)~KSI_OPERATION_HOOK_KEYBOARD;
             client->hook_subscription_ordinal[0] = 0u;
             client->consecutive_hook_failures[0] = 0u;
             client->quarantined_hooks &=
-                (uint32_t)~KSI_CAP_HOOK_KEYBOARD;
+                (uint32_t)~KSI_OPERATION_HOOK_KEYBOARD;
             client->quarantine_rearm_after_ms[0] = 0u;
             client->last_hook_quarantine_ms[0] = 0u;
 
@@ -211,18 +231,18 @@ static void invalidate_connected_permissions(
             }
         }
 
-        if ((revoked_operations & KSI_CAP_HOOK_MOUSE) != 0u) {
+        if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u) {
             flush_mouse = flush_mouse
-                || (old_grants & KSI_CAP_HOOK_MOUSE) != 0u
-                || (client->hook_subscriptions & KSI_CAP_HOOK_MOUSE) != 0u;
+                || (old_grants & KSP_SCOPE_INPUT_MONITORING) != 0u
+                || (client->hook_subscriptions & KSI_OPERATION_HOOK_MOUSE) != 0u;
             grabs_changed = grabs_changed
-                || (client->hook_subscriptions & KSI_CAP_HOOK_MOUSE) != 0u;
+                || (client->hook_subscriptions & KSI_OPERATION_HOOK_MOUSE) != 0u;
             client->hook_subscriptions &=
-                (uint32_t)~KSI_CAP_HOOK_MOUSE;
+                (uint32_t)~KSI_OPERATION_HOOK_MOUSE;
             client->hook_subscription_ordinal[1] = 0u;
             client->consecutive_hook_failures[1] = 0u;
             client->quarantined_hooks &=
-                (uint32_t)~KSI_CAP_HOOK_MOUSE;
+                (uint32_t)~KSI_OPERATION_HOOK_MOUSE;
             client->quarantine_rearm_after_ms[1] = 0u;
             client->last_hook_quarantine_ms[1] = 0u;
 
@@ -231,7 +251,7 @@ static void invalidate_connected_permissions(
             }
         }
 
-        if ((revoked_operations & KSI_CAP_BLOCK_INPUT) != 0u
+        if ((scopes & KSP_SCOPE_INPUT_CONTROL) != 0u
             && client->block_input_mask != 0u) {
             client->block_input_mask = 0u;
             grabs_changed = true;
@@ -247,7 +267,7 @@ static void invalidate_connected_permissions(
          * ordinary control connections stay open so independently retained
          * Input Control operations remain usable. */
         if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u
-            && client->connection_role == KSI_CONNECTION_HOOK_STREAM) {
+            && client->connection_role == KSI_ROLE_CALLBACK_STREAM) {
             hook_send_ref_invalidate(client->hook_send_ref);
         }
     }
@@ -262,7 +282,7 @@ static void invalidate_connected_permissions(
 
     if (grabs_changed && update_grab_state(state) != 0) {
         fprintf(stderr,
-            "inputd: failed to release grabs after permission revocation\n");
+            "keysharp-input: failed to release grabs after permission revocation\n");
     }
 }
 
@@ -296,7 +316,7 @@ static bool refresh_external_permissions(ksi_daemon_state *state)
         if (uid_already_checked) {
             continue;
         }
-        if (ksi_auth_store_get_generation(state->permissions, uid_client->uid,
+        if (ksp_store_generation(state->permissions, uid_client->uid,
                 &generation) != 0) {
             return false;
         }
@@ -365,8 +385,7 @@ static bool refresh_external_permissions(ksi_daemon_state *state)
                 matching->permission_store_generation_valid = true;
 
                 if (changed) {
-                    revoked |= permission_scopes_for_operations(
-                        matching->granted_capabilities) & ~allowed;
+                    revoked |= matching->granted_scopes & ~allowed;
                 }
             }
 
@@ -376,8 +395,7 @@ static bool refresh_external_permissions(ksi_daemon_state *state)
 
             if (revoked != 0u) {
                 invalidate_connected_permissions(state, identity_client->uid,
-                                                   identity_client->exe_hash,
-                                                   revoked);
+                    identity_client->exe_hash, false, revoked);
             } else {
                 /* Even a revoke in another capability domain fences an input
                  * authorization which began before that explicit user action. */
@@ -438,7 +456,7 @@ static void permission_monitor_fail_open(ksi_daemon_state *state)
         client->permission_store_generation_valid = false;
 
         if (!client->has_identity) {
-            client->granted_capabilities &= ~KSI_INPUT_CAPABILITIES;
+            client->granted_scopes &= ~KSI_INPUT_PERMISSION_SCOPES;
             continue;
         }
         for (nfds_t prior = 0u; prior < index; prior++) {
@@ -451,8 +469,8 @@ static void permission_monitor_fail_open(ksi_daemon_state *state)
         }
         if (!already_invalidated) {
             invalidate_connected_permissions(
-                state, client->uid, client->exe_hash,
-                KSP_INPUT_SCOPES);
+                state, client->uid, client->exe_hash, false,
+                KSI_INPUT_PERMISSION_SCOPES);
         }
     }
 
@@ -467,11 +485,11 @@ static void permission_monitor_fail_open(ksi_daemon_state *state)
     if (state->output_queue.mutex_initialized
         && !output_queue_push_release_all(&state->output_queue)) {
         fprintf(stderr,
-            "inputd: failed to enqueue release-all after permission monitor failure\n");
+            "keysharp-input: failed to enqueue release-all after permission monitor failure\n");
     }
     if (update_grab_state(state) != 0) {
         fprintf(stderr,
-            "inputd: failed to release grabs after permission monitor failure\n");
+            "keysharp-input: failed to release grabs after permission monitor failure\n");
     }
 }
 
@@ -483,7 +501,7 @@ static int permission_monitor_init(ksi_daemon_state *state)
         | IN_ONLYDIR | IN_DONT_FOLLOW;
 
     if (state == NULL || state->permissions == NULL
-        || (runtime_directory = ksi_auth_store_runtime_directory(
+        || (runtime_directory = ksp_store_runtime_directory(
                 state->permissions)) == NULL) {
         return -1;
     }
@@ -573,12 +591,12 @@ static void process_permission_notifications(
     }
 }
 
-/* Applies a completed prompt decision and sends the CLIENT_HELLO response. */
+/* Applies a completed prompt decision and sends its authorization response. */
 static void process_client_prompt_done(ksi_daemon_state *state, ksi_daemon_command *command)
 {
     ssize_t client_index;
     ksi_client *client;
-    ksi_auth_result decision;
+    ksp_polkit_result decision;
     uint32_t requested;
     uint32_t missing;
     uint32_t granted;
@@ -598,71 +616,69 @@ static void process_client_prompt_done(ksi_daemon_state *state, ksi_daemon_comma
     client = &state->clients[client_index];
     client->state = KSI_CLIENT_STATE_READY;
 
-    if (!client->pending_hello_valid) {
+    if (!client->pending_authorization) {
         free_daemon_command(command);
         return;
     }
 
-    client->pending_hello_valid = false;
+    client->pending_authorization = false;
 
     if (!input_owner_matches_uid(state, client->uid)) {
-        send_hello_status(client,
-            client->pending_hello_client_id,
-            client->pending_hello_correlation_id,
-            -1, 0u);
+        send_pending_authorization_status(client, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE, 0u);
         free_daemon_command(command);
         return;
     }
 
     decision = command->data.prompt_done.decision;
-    requested = command->data.prompt_done.requested_capabilities
-        & KSI_INPUT_CAPABILITIES;
+    requested = command->data.prompt_done.requested_scopes
+        & KSI_INPUT_PERMISSION_SCOPES;
     missing = command->data.prompt_done.missing_scopes
-        & KSP_INPUT_SCOPES;
+        & KSI_INPUT_PERMISSION_SCOPES;
 
-    if (client->pending_hello_permission_generation
+    if (client->pending_permission_generation
         != state->permission_generation) {
-        decision = KSI_AUTH_DENIED;
+        decision = KSP_POLKIT_DENIED;
     }
 
-    if (decision == KSI_AUTH_GRANTED && missing != 0u) {
-        int grant_result = ksi_auth_store_grant_if_generation(
-            state->permissions, client->uid, client->exe_hash,
-            client->exe_path, missing,
+    if (decision == KSP_POLKIT_GRANTED && missing != 0u) {
+        ksp_identity identity = {
+            .uid = client->uid,
+            .pid = client->pid,
+            .start_time = client->start_time,
+        };
+        (void)snprintf(identity.executable, sizeof(identity.executable),
+            "%s", client->exe_path);
+        (void)snprintf(identity.hash, sizeof(identity.hash),
+            "%s", client->exe_hash);
+        int grant_result = ksp_store_grant_if_generation(
+            state->permissions, &identity, missing,
             command->data.prompt_done.store_generation);
 
         if (grant_result != 0) {
-            decision = grant_result > 0 ? KSI_AUTH_DENIED : KSI_AUTH_UNAVAILABLE;
+            decision = grant_result > 0
+                ? KSP_POLKIT_DENIED : KSP_POLKIT_UNAVAILABLE;
         }
     }
 
-    granted = operations_allowed_by_scopes(
-        requested & state->available_capabilities
-            & command->data.prompt_done.available_capabilities_at_start,
-        client_persistent_allowed(state, client));
+    granted = requested & client_persistent_allowed(state, client);
 
-    if (decision != KSI_AUTH_GRANTED) {
-        client->granted_capabilities |= granted;
-        client->authenticated =
-            client->authenticated || client->granted_capabilities != 0u;
-        send_hello_status(client,
-            client->pending_hello_client_id,
-            client->pending_hello_correlation_id,
-            -1, granted);
+    if (decision != KSP_POLKIT_GRANTED) {
+        client->granted_scopes |= granted;
+        send_pending_authorization_status(client, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE, 0u);
         free_daemon_command(command);
         return;
     }
 
-    finish_client_hello(client,
-        client->pending_hello_client_id,
-        client->pending_hello_correlation_id,
-        requested,
-        client->pending_hello_flags,
-        granted);
+    finish_client_authorization(client,
+        client->pending_authorization_opcode,
+        client->pending_request_id,
+            requested,
+            granted);
     free_daemon_command(command);
 }
-/* Stores the identification result and, if a CLIENT_HELLO was buffered,
- * processes it immediately or starts the permission prompt. */
+/* Stores the identification result and resumes pending authorization. */
 static void process_client_identified(ksi_daemon_state *state, ksi_daemon_command *command)
 {
     ssize_t client_index;
@@ -688,29 +704,21 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
     if (!input_owner_matches_uid(state, client->uid)) {
         client->state = KSI_CLIENT_STATE_READY;
 
-        if (client->pending_hello_valid) {
-            client->pending_hello_valid = false;
-            send_hello_status(client,
-                client->pending_hello_client_id,
-                client->pending_hello_correlation_id,
-                -1, 0u);
+        if (client->pending_authorization) {
+            client->pending_authorization = false;
+            send_pending_authorization_status(client, KSI_STATUS_DENIED,
+                KSI_DETAIL_NONE, 0u);
         }
 
         return;
     }
 
-    /* Reject the identity if the process the worker read is not the one we
-     * accepted: a zero/mismatched start time means the pid was recycled between
-     * accept and the /proc read (TOCTOU). Deny caps rather than trust a possibly
-     * different process's exe. (Note: exec() within the same pid does NOT change
-     * start_time, so this closes pid-reuse only, not a fork-then-exec-in-pid race;
-     * that residual is accepted — the (uid, exe) boundary is same-uid-weak by
-     * design, see auth.c.) */
+    /* A changed start time means the pid was recycled while identity was read. */
     if (result != NULL && result->has_identity
-        && (result->start_time == 0u || client->accept_start_time == 0u
-            || result->start_time != client->accept_start_time)) {
+        && (result->start_time == 0u || client->start_time == 0u
+            || result->start_time != client->start_time)) {
         fprintf(stderr,
-            "inputd: rejecting identity for client pid=%ld: process start time changed "
+            "keysharp-input: rejecting identity for client pid=%ld: process start time changed "
             "between accept and identify (pid recycled)\n", (long)client->pid);
         result = NULL;
     }
@@ -727,43 +735,41 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
         }
     } else {
         client->has_identity = false;
-        fprintf(stderr, "inputd: unable to identify process for client pid=%ld uid=%ld\n",
+        fprintf(stderr, "keysharp-input: unable to identify process for client pid=%ld uid=%ld\n",
             (long)client->pid, (long)client->uid);
     }
 
     client->state = KSI_CLIENT_STATE_READY;
 
-    if (!client->pending_hello_valid) {
+    if (!client->pending_authorization) {
         return;
     }
 
-    /* There is a buffered CLIENT_HELLO — process it now that we have identity. */
+    /* Resume the request that waited for identity. */
 	{
-		uint32_t requested = client->pending_hello_requested;
-		uint32_t flags = client->pending_hello_flags;
+        uint32_t requested = client->pending_requested_scopes;
+        uint32_t authorization_mode = client->pending_authorization_mode;
 		uint32_t missing = 0u;
 		uint32_t granted;
 
-		prepare_requested_capabilities(state, requested);
-		granted = check_capabilities_sync(state, client, requested, &missing);
+        prepare_requested_scopes(state, requested);
+        granted = check_scopes_sync(state, client, requested, &missing);
 
         if (missing != 0u && state->permissions != NULL
             && !state->permission_monitor_failed
-            && (flags & KSI_CLIENT_HELLO_FLAG_CHECK_ONLY) == 0u) {
+            && authorization_mode == KSI_AUTH_REQUEST) {
             /* Need to prompt. Transition to AWAITING_PROMPT and start the worker. */
-            client->pending_hello_permission_generation =
+            client->pending_permission_generation =
                 state->permission_generation;
             if (!start_prompt_task(state->commands, state->permissions,
                                    client->fd, client->connection_id, requested, missing,
-                                   state->available_capabilities,
                                    client->exe_path, client->exe_hash,
                                    client->pid, client->uid, client->start_time)) {
                 /* Prompt thread failed; deny immediately. */
-                client->pending_hello_valid = false;
+                client->pending_authorization = false;
                 client->state = KSI_CLIENT_STATE_READY;
-                send_hello_status(client,
-                    client->pending_hello_client_id, client->pending_hello_correlation_id,
-                    -1, 0u);
+                send_pending_authorization_status(client, KSI_STATUS_UNAVAILABLE,
+                    KSI_DETAIL_NONE, 0u);
             } else {
                 client->state = KSI_CLIENT_STATE_AWAITING_PROMPT;
             }
@@ -771,71 +777,59 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
         }
 
         /* No prompt needed — grant immediately. */
-        client->pending_hello_valid = false;
+        client->pending_authorization = false;
 
-        finish_client_hello(client,
-            client->pending_hello_client_id, client->pending_hello_correlation_id,
-            requested, flags, granted);
+        finish_client_authorization(client,
+            client->pending_authorization_opcode, client->pending_request_id,
+            requested, granted);
     }
 }
 
-static uint32_t daemon_available_capabilities(const ksi_platform_backend *backend)
+static uint64_t daemon_available_operations(const ksi_platform_backend *backend)
 {
-    if (backend->get_available_capabilities != NULL) {
-        return backend->get_available_capabilities();
+    if (backend->get_available_operations != NULL) {
+        return backend->get_available_operations();
     }
 
     return 0;
 }
 
-static void prepare_requested_capabilities(ksi_daemon_state *state, uint32_t requested)
+static void prepare_requested_scopes(ksi_daemon_state *state, uint32_t requested)
 {
     if (state == NULL || state->backend == NULL || requested == 0u) {
         return;
     }
 
-    if (state->backend->prepare_capabilities != NULL) {
-        state->backend->prepare_capabilities(requested);
+    if (state->backend->prepare_scopes != NULL) {
+        state->backend->prepare_scopes(requested);
     }
 
-    state->available_capabilities = daemon_available_capabilities(state->backend);
+    state->available_operations = daemon_available_operations(state->backend);
+    state->ready_operations = state->backend->get_ready_operations != NULL
+        ? state->backend->get_ready_operations()
+        : state->available_operations;
 }
 
-static bool client_has_capability(const ksi_client *client, uint32_t capability)
+static bool client_has_scope(const ksi_client *client, uint32_t scope)
 {
-    if (!client->authenticated)
+    if (!client->hello_complete)
         return false;
-    return (client->granted_capabilities & capability) == capability;
+    return (client->granted_scopes & scope) == scope;
 }
 
-static uint32_t hook_type_to_cap_bit(uint32_t hook_type)
+static uint32_t hook_type_to_operation(uint32_t hook_type)
 {
-    if (hook_type == KSI_HOOK_KEYBOARD_LL) {
-        return KSI_CAP_HOOK_KEYBOARD;
+    if (hook_type == KSI_HOOK_KEYBOARD) {
+        return (uint32_t)KSI_OPERATION_HOOK_KEYBOARD;
     }
 
-    if (hook_type == KSI_HOOK_MOUSE_LL) {
-        return KSI_CAP_HOOK_MOUSE;
+    if (hook_type == KSI_HOOK_MOUSE) {
+        return (uint32_t)KSI_OPERATION_HOOK_MOUSE;
     }
 
     return 0;
 }
 
-
-static uint32_t required_synthesis_capabilities(const ksi_input *inputs, size_t count)
-{
-    uint32_t required = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        if (inputs[i].type == KSI_INPUT_KEYBOARD) {
-            required |= KSI_CAP_SYNTH_KEYBOARD;
-        } else if (inputs[i].type == KSI_INPUT_MOUSE) {
-            required |= KSI_CAP_SYNTH_MOUSE;
-        }
-    }
-
-    return required;
-}
 
 static uint32_t active_hook_subscription_mask(const ksi_daemon_state *state)
 {
@@ -880,7 +874,7 @@ static bool any_matching_hook_subscriptions(const ksi_daemon_state *state, uint3
         return false;
     }
 
-    subscription_bit = hook_type_to_cap_bit(hook_type);
+    subscription_bit = hook_type_to_operation(hook_type);
 
     if (subscription_bit == 0) {
         return false;
@@ -901,7 +895,7 @@ static int update_grab_state(ksi_daemon_state *state)
 {
     uint32_t hook_mask = active_hook_subscription_mask(state);
     uint32_t block_mask = active_block_input_mask(state);
-    uint32_t available;
+    uint64_t ready;
     uint32_t effective_hook_mask;
     bool keyboard_grabbed;
     bool interception_active;
@@ -915,17 +909,17 @@ static int update_grab_state(ksi_daemon_state *state)
      * physical device and relies on the synth device to replay every passed event;
      * if that output is dead (write failure, torn-down uinput) an already-grabbed
      * keyboard/mouse would stay captured while every replay write() fails -- a
-     * fully dead device. So mask the hook portion of the grab by the capabilities
+     * fully dead device. Mask the hook portion of the grab by the operations
      * the backend can currently honor: when synth is down, get_available_
-     * capabilities() drops KSI_CAP_HOOK_* and the grab is released, letting raw
+     * readiness drops hook operations and the grab is released, letting raw
      * hardware pass through. The next update_grab_state (re-run by
      * run_backend_maintenance on the availability-change edge) restores the real
-     * mask once synth recovers. BlockInput is intentionally NOT gated this way:
+     * mask once synth recovers. Input blocking is not gated this way:
      * blocking only drops events and needs no synth, so its grab must persist. */
-    available = state->backend->get_available_capabilities != NULL
-        ? state->backend->get_available_capabilities()
-        : ~0u; /* no availability query -> assume everything honorable */
-    effective_hook_mask = hook_mask & available;
+    ready = state->backend->get_ready_operations != NULL
+        ? state->backend->get_ready_operations()
+        : KSI_OPERATION_ALL;
+    effective_hook_mask = hook_mask & (uint32_t)ready;
     interception_active = effective_hook_mask != 0u || block_mask != 0u;
 
     /* Idle tracking is an ordinary read-only observer and must not preempt the
@@ -943,7 +937,7 @@ static int update_grab_state(ksi_daemon_state *state)
             state->memory_locked = true;
         } else {
             fprintf(stderr,
-                "inputd: note: mlockall failed (%s); hook latency may degrade under "
+                "keysharp-input: note: mlockall failed (%s); hook latency may degrade under "
                 "memory pressure\n", strerror(errno));
         }
     }
@@ -956,7 +950,7 @@ static int update_grab_state(ksi_daemon_state *state)
         return result;
     }
 
-    /* Platforms without BlockInput support must not advertise KSI_CAP_BLOCK_INPUT.
+    /* Platforms without input-blocking support must not advertise the operation.
      * If a non-zero block mask somehow arrives on such a platform, fail so that
      * handle_set_block_input rolls back and reports an error rather than silently
      * accepting a mask that cannot be enforced. */
@@ -980,8 +974,8 @@ static int update_grab_state(ksi_daemon_state *state)
     /* Use the EFFECTIVE hook mask (post fail-open) so the held->released edge
      * fires -- and the stranded-key RELEASE_ALL below runs -- when a dead synth
      * drops the keyboard grab, not only on a client unsubscribe. */
-    keyboard_grabbed = (effective_hook_mask & KSI_CAP_HOOK_KEYBOARD) != 0
-        || (block_mask & KSI_BLOCK_INPUT_KEYBOARD) != 0;
+    keyboard_grabbed = (effective_hook_mask & KSI_OPERATION_HOOK_KEYBOARD) != 0
+        || (block_mask & KSI_BLOCK_KEYBOARD) != 0;
 
     if (state->keyboard_grab_active && !keyboard_grabbed) {
         /* Only consume the held->released edge once the release is actually queued.
@@ -992,7 +986,7 @@ static int update_grab_state(ksi_daemon_state *state)
         if (output_queue_push_release_all(&state->output_queue)) {
             state->keyboard_grab_active = false;
         } else {
-            fprintf(stderr, "inputd: failed to enqueue synthetic key release on keyboard ungrab; will retry\n");
+            fprintf(stderr, "keysharp-input: failed to enqueue synthetic key release on keyboard ungrab; will retry\n");
         }
     } else {
         state->keyboard_grab_active = keyboard_grabbed;
@@ -1008,7 +1002,7 @@ static int update_grab_state(ksi_daemon_state *state)
         if (munlockall() == 0) {
             state->memory_locked = false;
         } else {
-            fprintf(stderr, "inputd: note: munlockall failed: %s\n", strerror(errno));
+            fprintf(stderr, "keysharp-input: note: munlockall failed: %s\n", strerror(errno));
         }
     }
 
@@ -1074,18 +1068,18 @@ static void expire_client_leases(ksi_daemon_state *state)
         }
 
         fprintf(stderr,
-            "inputd: client fd=%d grab lease expired; failing open and disconnecting\n",
+            "keysharp-input: client fd=%d grab lease expired; failing open and disconnecting\n",
             client->fd);
 
         remove_client(state, index);
     }
 }
 
-/* Drops connections that never completed a CLIENT_HELLO within the handshake
+/* Drops connections that never completed HELLO within the handshake
  * window. A peer that connects and sends nothing otherwise keeps its slot forever
  * (leases arm only for hook/block clients), so N such peers could exhaust the
  * client table and deny the broker to everyone. Authenticated idle clients (e.g. a
- * query connection that sent a zero-capability hello) set hello_seen and are kept. */
+ * query connection that sent a zero-scope hello) completed HELLO and are kept. */
 static void expire_unauthenticated_clients(ksi_daemon_state *state)
 {
     uint64_t now;
@@ -1102,31 +1096,31 @@ static void expire_unauthenticated_clients(ksi_daemon_state *state)
 
         /* Capless-idle reaper: an authenticated connection holding no grants and
          * no hook/block subscriptions, idle past the timeout, is dropped so it
-         * cannot pin a per-uid slot forever. Guarded on READY + !pending_hello so
+         * cannot pin a per-uid slot forever. Guarded on idle ready state so
          * a client mid-identify or mid-prompt is never reaped; any message resets
          * last_activity_ms, so a live query channel that polls is kept. */
-        if (client->hello_seen
+        if (client->hello_complete
             && client->state == KSI_CLIENT_STATE_READY
-            && !client->pending_hello_valid
-            && client->granted_capabilities == 0u
+            && !client->pending_authorization
+            && client->granted_scopes == 0u
             && client->hook_subscriptions == 0u
             && client->block_input_mask == 0u
             && client->last_activity_ms != 0u
             && now >= client->last_activity_ms + KSI_CAPLESS_IDLE_TIMEOUT_MS) {
             fprintf(stderr,
-                "inputd: dropping client fd=%d: capability-less and idle for %u ms\n",
+                "keysharp-input: dropping client fd=%d: scope-less and idle for %u ms\n",
                 client->fd, (unsigned)KSI_CAPLESS_IDLE_TIMEOUT_MS);
             remove_client(state, index);
             continue;
         }
 
-        if (client->hello_seen || client->connected_at_ms == 0u
+        if (client->hello_complete || client->connected_at_ms == 0u
             || now < client->connected_at_ms + KSI_HANDSHAKE_TIMEOUT_MS) {
             continue;
         }
 
         fprintf(stderr,
-            "inputd: dropping client fd=%d: no CLIENT_HELLO within %u ms\n",
+            "keysharp-input: dropping client fd=%d: no HELLO within %u ms\n",
             client->fd, (unsigned)KSI_HANDSHAKE_TIMEOUT_MS);
         remove_client(state, index);
     }
@@ -1139,11 +1133,11 @@ static void apply_fail_open_if_requested(ksi_daemon_state *state)
     }
 
     fprintf(stderr,
-        "inputd: safety-critical command queue overflow; clearing hooks and BlockInput\n");
+        "keysharp-input: safety-critical command queue overflow; clearing hooks and BlockInput\n");
     clear_hook_state(state);
 
     if (update_grab_state(state) != 0) {
-        fprintf(stderr, "inputd: failed to release grabs during fail-open recovery\n");
+        fprintf(stderr, "keysharp-input: failed to release grabs during fail-open recovery\n");
     }
 }
 
@@ -1182,7 +1176,9 @@ static void retry_quarantined_hooks(ksi_daemon_state *state)
         ksi_client *client = &state->clients[i];
 
         for (size_t lane = 0u; lane < 2u; lane++) {
-            uint32_t bit = lane == 0u ? KSI_CAP_HOOK_KEYBOARD : KSI_CAP_HOOK_MOUSE;
+            uint32_t bit = lane == 0u
+                ? (uint32_t)KSI_OPERATION_HOOK_KEYBOARD
+                : (uint32_t)KSI_OPERATION_HOOK_MOUSE;
 
             if ((client->quarantined_hooks & bit) == 0u
                 || client->quarantine_rearm_after_ms[lane] == 0u
@@ -1198,7 +1194,7 @@ static void retry_quarantined_hooks(ksi_daemon_state *state)
     }
 
     if (changed && update_grab_state(state) != 0) {
-        fprintf(stderr, "inputd: failed to restore grabs after hook retry\n");
+        fprintf(stderr, "keysharp-input: failed to restore grabs after hook retry\n");
     }
 }
 
@@ -1213,6 +1209,7 @@ static void record_client_hook_failure(
     uint32_t retry_after_ms;
     uint64_t now;
     ksi_hook_quarantined_payload notification;
+    uint8_t wire_notification[KSI_HOOK_QUARANTINED_PAYLOAD_SIZE];
 
     if (state == NULL || index >= state->client_count) {
         return;
@@ -1225,7 +1222,9 @@ static void record_client_hook_failure(
     }
 
     lane_index = hook_type_to_lane_index(hook_type);
-    lane_bit = (lane_index == 1u) ? KSI_CAP_HOOK_MOUSE : KSI_CAP_HOOK_KEYBOARD;
+    lane_bit = (lane_index == 1u)
+        ? (uint32_t)KSI_OPERATION_HOOK_MOUSE
+        : (uint32_t)KSI_OPERATION_HOOK_KEYBOARD;
 
     if ((client->hook_subscriptions & lane_bit) == 0u
         || (client->quarantined_hooks & lane_bit) != 0u) {
@@ -1249,11 +1248,11 @@ static void record_client_hook_failure(
     client->quarantine_rearm_after_ms[lane_index] = now + retry_after_ms;
 
     fprintf(stderr,
-        "inputd: hook quarantined pid=%ld fd=%d hook=%u event=%llu depth=%u "
+        "keysharp-input: hook quarantined pid=%ld fd=%d hook=%u event=%llu depth=%u "
         "elapsed=%ums reason=%s strike=%u retry=%ums\n",
         (long)client->pid, client->fd, hook_type,
         (unsigned long long)event_id, nesting_depth, elapsed_ms,
-        reason == KSI_HOOK_QUARANTINE_REASON_TIMEOUT ? "timeout" : "transport",
+        reason == KSI_HOOK_QUARANTINE_TIMEOUT ? "timeout" : "transport",
         client->consecutive_hook_failures[lane_index], retry_after_ms);
 
     memset(&notification, 0, sizeof(notification));
@@ -1264,11 +1263,14 @@ static void record_client_hook_failure(
     notification.strike_count = client->consecutive_hook_failures[lane_index];
     notification.retry_after_ms = retry_after_ms;
 
-    (void)ipc_send_locked(client->fd, KSI_MESSAGE_HOOK_QUARANTINED, 0,
-        event_id, &notification, sizeof(notification));
+    (void)ksi_protocol_encode_hook_quarantined(
+        wire_notification, &notification);
+    (void)ipc_send_locked(client->fd, KSI_OPCODE_HOOK_QUARANTINED,
+        KSI_FRAME_FLAG_EVENT, 0u, wire_notification,
+        sizeof(wire_notification));
 
     if (update_grab_state(state) != 0) {
-        fprintf(stderr, "inputd: failed to update grabs after hook quarantine\n");
+        fprintf(stderr, "keysharp-input: failed to update grabs after hook quarantine\n");
     }
 
     if (client->consecutive_hook_failures[lane_index] < KSI_MAX_CONSECUTIVE_HOOK_FAILURES) {
@@ -1276,7 +1278,7 @@ static void record_client_hook_failure(
     }
 
     fprintf(stderr,
-        "inputd: invalidating hook session pid=%ld fd=%d after %u consecutive %s timeouts\n",
+        "keysharp-input: invalidating hook session pid=%ld fd=%d after %u consecutive %s timeouts\n",
         (long)client->pid, client->fd, KSI_MAX_CONSECUTIVE_HOOK_FAILURES,
         lane_index == 1u ? "mouse" : "keyboard");
 

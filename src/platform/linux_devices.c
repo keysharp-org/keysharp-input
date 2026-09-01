@@ -1,8 +1,8 @@
-#include "keysharp_inputd/linux_devices.h"
+#include "internal/linux_devices.h"
 
-#include "keysharp_inputd/globals.h"
-#include "keysharp_inputd/linux_synth.h"
-#include "keysharp_inputd/protocol.h"
+#include "internal/globals.h"
+#include "internal/linux_synth.h"
+#include "internal/protocol.h"
 #include "linux_device_filter.h"
 #include "vk_evdev.h"
 
@@ -247,7 +247,7 @@ static int open_event_fd(const char *path)
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 
     if (fd < 0) {
-        fprintf(stderr, "inputd: cannot open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot open %s: %s\n", path, strerror(errno));
         return -1;
     }
 
@@ -291,7 +291,7 @@ static int read_device_info(const char *path, ksi_linux_device_info *info)
     }
 
     if (ioctl(fd, EVIOCGBIT(0, sizeof(event_bits)), event_bits) < 0) {
-        fprintf(stderr, "inputd: cannot read capabilities for %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot read capabilities for %s: %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -301,19 +301,19 @@ static int read_device_info(const char *path, ksi_linux_device_info *info)
     info->has_absolute = test_bit(event_bits, EV_ABS);
 
     if (info->has_keys && ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
-        fprintf(stderr, "inputd: cannot read key capabilities for %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot read key capabilities for %s: %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
 
     if (info->has_relative && ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rel_bits)), rel_bits) < 0) {
-        fprintf(stderr, "inputd: cannot read relative-axis capabilities for %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot read relative-axis capabilities for %s: %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
 
     if (info->has_absolute && ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits) < 0) {
-        fprintf(stderr, "inputd: cannot read absolute-axis capabilities for %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot read absolute-axis capabilities for %s: %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -405,13 +405,13 @@ static bool admit_udev_event_device(struct udev_device *device, const char *path
 
     if (device == NULL || !metadata_initialized) {
         fprintf(stderr,
-            "inputd: %s %s ignored: udev metadata unavailable or not initialized "
+            "keysharp-input: %s %s ignored: udev metadata unavailable or not initialized "
             "(seat lookup failed closed)\n",
             reason,
             path);
     } else {
         fprintf(stderr,
-            "inputd: %s %s ignored: ID_SEAT=\"%s\" is outside seat0\n",
+            "keysharp-input: %s %s ignored: ID_SEAT=\"%s\" is outside seat0\n",
             reason,
             path,
             id_seat != NULL ? id_seat : "");
@@ -491,7 +491,7 @@ static bool is_mouse_block_candidate(const ksi_linux_device_info *info)
 
 static void log_device(const ksi_linux_device_info *info, const char *prefix)
 {
-    fprintf(stderr, "inputd: %s %s: \"%s\" candidate=%s%s%s%s%s%s%s\n",
+    fprintf(stderr, "keysharp-input: %s %s: \"%s\" candidate=%s%s%s%s%s%s%s\n",
         prefix,
         info->path,
         info->name,
@@ -573,7 +573,7 @@ static int open_tracked_device(ksi_linux_tracked_device *device)
     result = libevdev_new_from_fd(fd, &device->evdev);
 
     if (result < 0) {
-        fprintf(stderr, "inputd: cannot initialize libevdev for %s: %s\n",
+        fprintf(stderr, "keysharp-input: cannot initialize libevdev for %s: %s\n",
             device->path,
             strerror(-result));
         close(fd);
@@ -658,7 +658,7 @@ static int set_device_grab(ksi_linux_tracked_device *device, bool enabled)
         if (device->grabbed) {
             if (ioctl(device->fd, EVIOCGRAB, 0) != 0) {
                 fprintf(stderr,
-                    "inputd: EVIOCGRAB(off) failed for injected source %s: %s; closing device\n",
+                    "keysharp-input: EVIOCGRAB(off) failed for injected source %s: %s; closing device\n",
                     device->path,
                     strerror(errno));
                 close_tracked_device(device);
@@ -666,7 +666,7 @@ static int set_device_grab(ksi_linux_tracked_device *device, bool enabled)
             }
 
             device->grabbed = false;
-            fprintf(stderr, "inputd: ungrabbed injected source %s\n", device->path);
+            fprintf(stderr, "keysharp-input: ungrabbed injected source %s\n", device->path);
         }
 
         return 0;
@@ -689,14 +689,14 @@ static int set_device_grab(ksi_linux_tracked_device *device, bool enabled)
 
         if (any_bit_set(device->deferred_down_keys, sizeof(device->deferred_down_keys) / sizeof(device->deferred_down_keys[0]))) {
             device->grab_deferred = true;
-            fprintf(stderr, "inputd: deferred grab %s until active keys are released\n", device->path);
+            fprintf(stderr, "keysharp-input: deferred grab %s until active keys are released\n", device->path);
             return 0;
         }
     }
 
     if (ioctl(device->fd, EVIOCGRAB, value) != 0) {
         fprintf(stderr,
-            "inputd: EVIOCGRAB(%s) failed for %s: %s\n",
+            "keysharp-input: EVIOCGRAB(%s) failed for %s: %s\n",
             enabled ? "on" : "off",
             device->path,
             strerror(errno));
@@ -726,7 +726,7 @@ static int set_device_grab(ksi_linux_tracked_device *device, bool enabled)
      * the keyboard-grab held->released edge, which runs on the output sequencer thread.
      * Doing it here would race the sequencer's writes to uinput / synthesized_keys_down. */
 
-    fprintf(stderr, "inputd: %s %s\n", enabled ? "grabbed" : "ungrabbed", device->path);
+    fprintf(stderr, "keysharp-input: %s %s\n", enabled ? "grabbed" : "ungrabbed", device->path);
     return 0;
 }
 
@@ -781,12 +781,12 @@ static bool should_grab_device_for_masks(
         return false;
     }
 
-    return (((hook_mask & KSI_CAP_HOOK_KEYBOARD) != 0
-             || (block_mask & KSI_BLOCK_INPUT_KEYBOARD) != 0)
+    return (((hook_mask & KSI_OPERATION_HOOK_KEYBOARD) != 0
+             || (block_mask & KSI_BLOCK_KEYBOARD) != 0)
             && device->keyboard_candidate)
-        || ((hook_mask & KSI_CAP_HOOK_MOUSE) != 0
+        || ((hook_mask & KSI_OPERATION_HOOK_MOUSE) != 0
             && device->mouse_hook_candidate)
-        || ((block_mask & KSI_BLOCK_INPUT_MOUSE) != 0
+        || ((block_mask & KSI_BLOCK_MOUSE) != 0
             && device->mouse_block_candidate);
 }
 
@@ -849,7 +849,7 @@ static void track_device(const ksi_linux_device_info *info, const char *reason)
         target = &tracked_devices[existing_index];
     } else {
         if (tracked_device_count >= KSI_MAX_TRACKED_DEVICES) {
-            fprintf(stderr, "inputd: cannot track %s: device table is full\n", info->path);
+            fprintf(stderr, "keysharp-input: cannot track %s: device table is full\n", info->path);
             return;
         }
 
@@ -886,7 +886,7 @@ static void track_device(const ksi_linux_device_info *info, const char *reason)
          * (e.g. our interception target at hook install) are unaffected. */
         if (want_grab && is_new && our_output_is_grabbed()) {
             fprintf(stderr,
-                "inputd: not grabbing new device %s (\"%s\"): our output is grabbed "
+                "keysharp-input: not grabbing new device %s (\"%s\"): our output is grabbed "
                 "downstream; deferring to the tail interceptor\n",
                 target->path, target->name);
             want_grab = false;
@@ -918,7 +918,7 @@ static void untrack_device(const char *path)
 
     index = (size_t)existing_index;
 
-    fprintf(stderr, "inputd: remove %s: \"%s\"\n",
+    fprintf(stderr, "keysharp-input: remove %s: \"%s\"\n",
         tracked_devices[index].path,
         tracked_devices[index].name);
 
@@ -942,7 +942,7 @@ static void scan_existing_devices(void)
     dir = opendir(KSI_INPUT_DIR);
 
     if (dir == NULL) {
-        fprintf(stderr, "inputd: cannot open %s: %s\n", KSI_INPUT_DIR, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot open %s: %s\n", KSI_INPUT_DIR, strerror(errno));
         return;
     }
 
@@ -952,7 +952,7 @@ static void scan_existing_devices(void)
 
     if (scan_udev == NULL) {
         fprintf(stderr,
-            "inputd: cannot create udev context for seat0 filtering; skipping input devices\n");
+            "keysharp-input: cannot create udev context for seat0 filtering; skipping input devices\n");
         closedir(dir);
         return;
     }
@@ -968,7 +968,7 @@ static void scan_existing_devices(void)
         }
 
         if (snprintf(path, sizeof(path), "%s/%s", KSI_INPUT_DIR, entry->d_name) >= (int)sizeof(path)) {
-            fprintf(stderr, "inputd: skipping too-long input path for %s\n", entry->d_name);
+            fprintf(stderr, "keysharp-input: skipping too-long input path for %s\n", entry->d_name);
             continue;
         }
 
@@ -1006,7 +1006,7 @@ static void scan_existing_devices(void)
     udev_unref(scan_udev);
     closedir(dir);
 
-    fprintf(stderr, "inputd: scanned %d event devices, found %d user-input candidates\n",
+    fprintf(stderr, "keysharp-input: scanned %d event devices, found %d user-input candidates\n",
         devices_seen,
         candidates_seen);
 }
@@ -1034,14 +1034,14 @@ static int start_udev_monitor(void)
     udev_context = udev_new();
 
     if (udev_context == NULL) {
-        fprintf(stderr, "inputd: failed to create udev context\n");
+        fprintf(stderr, "keysharp-input: failed to create udev context\n");
         return -1;
     }
 
     udev_monitor = udev_monitor_new_from_netlink(udev_context, "udev");
 
     if (udev_monitor == NULL) {
-        fprintf(stderr, "inputd: failed to create udev monitor\n");
+        fprintf(stderr, "keysharp-input: failed to create udev monitor\n");
         stop_udev_monitor();
         return -1;
     }
@@ -1050,18 +1050,18 @@ static int start_udev_monitor(void)
             udev_monitor,
             "input",
             NULL) < 0) {
-        fprintf(stderr, "inputd: failed to install udev input filter\n");
+        fprintf(stderr, "keysharp-input: failed to install udev input filter\n");
         stop_udev_monitor();
         return -1;
     }
 
     if (udev_monitor_enable_receiving(udev_monitor) < 0) {
-        fprintf(stderr, "inputd: failed to enable udev monitor\n");
+        fprintf(stderr, "keysharp-input: failed to enable udev monitor\n");
         stop_udev_monitor();
         return -1;
     }
 
-    fprintf(stderr, "inputd: udev hotplug monitor enabled\n");
+    fprintf(stderr, "keysharp-input: udev hotplug monitor enabled\n");
     return 0;
 }
 
@@ -1086,7 +1086,7 @@ static void handle_device_add_or_change(
     apply_udev_device_metadata(&info, udev_device);
 
     if (!is_idle_candidate(&info)) {
-        fprintf(stderr, "inputd: %s %s ignored: not a user-input candidate\n", action, path);
+        fprintf(stderr, "keysharp-input: %s %s ignored: not a user-input candidate\n", action, path);
         return;
     }
 
@@ -1115,7 +1115,7 @@ int ksi_linux_devices_start(void)
      * physical device) is never recreated on a later replug to give the
      * monitor a second chance. */
     if (start_udev_monitor() != 0) {
-        fprintf(stderr, "inputd: warning: udev monitor unavailable; hotplug disabled\n");
+        fprintf(stderr, "keysharp-input: warning: udev monitor unavailable; hotplug disabled\n");
         /* Continue in degraded mode: existing devices are tracked but newly
          * plugged devices will not be detected at runtime. */
     }
@@ -1143,16 +1143,7 @@ static uint64_t monotonic_ms(void)
     return ((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u);
 }
 
-/* Called periodically (event-driven callers only ever retry on their own
- * event; nothing previously re-drove a grab attempt once time had simply
- * passed). Re-runs set_grab_masks() with the CURRENT masks whenever
- * grab_state_incomplete is set -- set_grab_masks()'s own short-circuit only
- * skips the per-device loop when the flag is clear, so this safely becomes a
- * cheap no-op once every device is resolved (grabbed, or intentionally
- * deferred-and-still-deferred). This is what lets a device that lost an
- * EVIOCGRAB race (against keyd, a stray second daemon instance, or any other
- * transient contention) get picked back up once the contention clears,
- * instead of being silently abandoned for the rest of the process's life. */
+/* Retries incomplete device grabs after transient contention clears. */
 void ksi_linux_devices_retry_incomplete_grabs(void)
 {
     uint64_t now;
@@ -1210,15 +1201,8 @@ static int set_grab_masks(uint32_t hook_mask, uint32_t block_mask)
         return 0;
     }
 
-    /* Mirror track_device()'s "only-the-tail-extends" guard here too. That
-     * guard previously applied only to a brand-new device appearing via
-     * hotplug; without it here, a hook/BlockInput mask change (or a retry of
-     * a device track_device() correctly deferred on) could still grab a
-     * device out from under a downstream cooperating interceptor (e.g. keyd),
-     * recreating the exact double-grab this mechanism exists to prevent.
-     * Only gates NEW grabs (see the !grabbed check below) -- a device already
-     * flowing is left alone, since un-grabbing it here would itself be a
-     * worse disruption than leaving it as-is. */
+    /* Avoid adding grabs while a downstream interceptor owns our output.
+     * Existing grabs remain in place to avoid disrupting an active stream. */
     if (hook_mask != 0 || block_mask != 0) {
         defer_new_grabs = our_output_is_grabbed();
     }
@@ -1235,7 +1219,7 @@ static int set_grab_masks(uint32_t hook_mask, uint32_t block_mask)
 
         if (should_grab && defer_new_grabs && !tracked_devices[i].grabbed) {
             fprintf(stderr,
-                "inputd: not grabbing %s (\"%s\"): our output is grabbed downstream; "
+                "keysharp-input: not grabbing %s (\"%s\"): our output is grabbed downstream; "
                 "deferring to the tail interceptor\n",
                 tracked_devices[i].path, tracked_devices[i].name);
             should_grab = false;
@@ -1261,7 +1245,7 @@ static int set_grab_masks(uint32_t hook_mask, uint32_t block_mask)
 
     if (grab_failures != 0) {
         fprintf(stderr,
-            "inputd: %zu device(s) could not be grabbed for hook_mask=0x%x block_mask=0x%x; "
+            "keysharp-input: %zu device(s) could not be grabbed for hook_mask=0x%x block_mask=0x%x; "
             "continuing with the devices that grabbed successfully\n",
             grab_failures, hook_mask, block_mask);
     }
@@ -1327,10 +1311,10 @@ static uint32_t evdev_key_to_vk(unsigned int code)
 static uint32_t evdev_key_to_message(const struct input_event *event)
 {
     if (event->value == 0) {
-        return KSI_WM_KEYUP;
+        return KSI_MESSAGE_KEY_UP;
     }
 
-    return KSI_WM_KEYDOWN;
+    return KSI_MESSAGE_KEY_DOWN;
 }
 
 static uint32_t evdev_key_to_flags(const struct input_event *event)
@@ -1352,14 +1336,14 @@ static uint32_t evdev_key_to_flags(const struct input_event *event)
         case KEY_RIGHT:
         case KEY_KPSLASH:
         case KEY_KPENTER:
-            flags |= KSI_LLKHF_EXTENDED;
+            flags |= KSI_KEYBOARD_HOOK_EXTENDED;
             break;
         default:
             break;
     }
 
     if (event->value == 0) {
-        flags |= KSI_LLKHF_UP;
+        flags |= KSI_KEYBOARD_HOOK_UP;
     }
 
     return flags;
@@ -1367,21 +1351,21 @@ static uint32_t evdev_key_to_flags(const struct input_event *event)
 
 static uint32_t keyboard_injected_flags(bool is_injected)
 {
-    return is_injected ? KSI_LLKHF_INJECTED : 0u;
+    return is_injected ? KSI_KEYBOARD_HOOK_INJECTED : 0u;
 }
 
 static uint32_t keyboard_indicator_flags(void)
 {
     uint32_t flags = 0;
-    if (current_caps_lock)   flags |= KSI_LLKHF_CAPS_LOCK_ON;
-    if (current_num_lock)    flags |= KSI_LLKHF_NUM_LOCK_ON;
-    if (current_scroll_lock) flags |= KSI_LLKHF_SCROLL_LOCK_ON;
+    if (current_caps_lock)   flags |= KSI_KEYBOARD_HOOK_CAPS_LOCK_ON;
+    if (current_num_lock)    flags |= KSI_KEYBOARD_HOOK_NUM_LOCK_ON;
+    if (current_scroll_lock) flags |= KSI_KEYBOARD_HOOK_SCROLL_LOCK_ON;
     return flags;
 }
 
 static uint32_t mouse_injected_flags(bool is_injected)
 {
-    return is_injected ? KSI_LLMHF_INJECTED : 0u;
+    return is_injected ? KSI_MOUSE_HOOK_INJECTED : 0u;
 }
 
 static bool should_dispatch_hook_input(const ksi_linux_tracked_device *device)
@@ -1397,19 +1381,19 @@ static bool evdev_button_to_mouse_message(unsigned int code, int value, uint32_t
 
     switch (code) {
         case BTN_LEFT:
-            *message = value != 0 ? KSI_WM_LBUTTONDOWN : KSI_WM_LBUTTONUP;
+            *message = value != 0 ? KSI_MESSAGE_LEFT_BUTTON_DOWN : KSI_MESSAGE_LEFT_BUTTON_UP;
             return true;
         case BTN_RIGHT:
-            *message = value != 0 ? KSI_WM_RBUTTONDOWN : KSI_WM_RBUTTONUP;
+            *message = value != 0 ? KSI_MESSAGE_RIGHT_BUTTON_DOWN : KSI_MESSAGE_RIGHT_BUTTON_UP;
             return true;
         case BTN_MIDDLE:
-            *message = value != 0 ? KSI_WM_MBUTTONDOWN : KSI_WM_MBUTTONUP;
+            *message = value != 0 ? KSI_MESSAGE_MIDDLE_BUTTON_DOWN : KSI_MESSAGE_MIDDLE_BUTTON_UP;
             return true;
         case BTN_SIDE:
         case BTN_BACK:
         case BTN_EXTRA:
         case BTN_FORWARD:
-            *message = value != 0 ? KSI_WM_XBUTTONDOWN : KSI_WM_XBUTTONUP;
+            *message = value != 0 ? KSI_MESSAGE_X_BUTTON_DOWN : KSI_MESSAGE_X_BUTTON_UP;
             return true;
         default:
             return false;
@@ -1450,8 +1434,8 @@ static void dispatch_keyboard_event(
     };
 
     if (g_verbose) {
-        printf("inputd: key %s vk=0x%02x scan=%u value=%d flags=0x%x time=%llu device=\"%s\"\n",
-            hook_event.message == KSI_WM_KEYUP ? "up" : "down",
+        printf("keysharp-input: key %s vk=0x%02x scan=%u value=%d flags=0x%x time=%llu device=\"%s\"\n",
+            hook_event.message == KSI_MESSAGE_KEY_UP ? "up" : "down",
             hook_event.vk_code,
             hook_event.scan_code,
             event->value,
@@ -1463,7 +1447,7 @@ static void dispatch_keyboard_event(
     if (hook_event_callback != NULL) {
         hook_event_callback(
             hook_event_context,
-            KSI_HOOK_KEYBOARD_LL,
+            KSI_HOOK_KEYBOARD,
             &hook_event,
             sizeof(hook_event));
     }
@@ -1498,7 +1482,7 @@ static void dispatch_mouse_button_event(
     };
 
     if (g_verbose) {
-        printf("inputd: mouse button message=0x%x data=0x%x time=%llu device=\"%s\"\n",
+        printf("keysharp-input: mouse button message=0x%x data=0x%x time=%llu device=\"%s\"\n",
             hook_event.message,
             hook_event.mouse_data,
             (unsigned long long)hook_event.time_ms,
@@ -1508,7 +1492,7 @@ static void dispatch_mouse_button_event(
     if (hook_event_callback != NULL) {
         hook_event_callback(
             hook_event_context,
-            KSI_HOOK_MOUSE_LL,
+            KSI_HOOK_MOUSE,
             &hook_event,
             sizeof(hook_event));
     }
@@ -1520,7 +1504,7 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
 
     if (device->has_pending_rel) {
         memset(&hook_event, 0, sizeof(hook_event));
-        hook_event.message = KSI_WM_MOUSEMOVE;
+        hook_event.message = KSI_MESSAGE_MOUSE_MOVE;
         hook_event.x = device->pending_rel_x;
         hook_event.y = device->pending_rel_y;
         hook_event.delta_x = hook_event.x;
@@ -1531,7 +1515,7 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
         hook_event.device_id = device->device_id;
 
         if (g_verbose && should_dispatch_hook_input(device)) {
-            printf("inputd: mouse move dx=%d dy=%d time=%llu device=\"%s\"\n",
+            printf("keysharp-input: mouse move dx=%d dy=%d time=%llu device=\"%s\"\n",
                 hook_event.x,
                 hook_event.y,
                 (unsigned long long)hook_event.time_ms,
@@ -1548,7 +1532,7 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
         if (should_dispatch_hook_input(device) && hook_event_callback != NULL) {
             hook_event_callback(
                 hook_event_context,
-                KSI_HOOK_MOUSE_LL,
+                KSI_HOOK_MOUSE,
                 &hook_event,
                 sizeof(hook_event));
         }
@@ -1556,19 +1540,19 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
 
     if (device->has_pending_abs) {
         memset(&hook_event, 0, sizeof(hook_event));
-        hook_event.message = KSI_WM_MOUSEMOVE;
+        hook_event.message = KSI_MESSAGE_MOUSE_MOVE;
         hook_event.x = device->current_abs_x;
         hook_event.y = device->current_abs_y;
         hook_event.delta_x = hook_event.x - device->pending_abs_start_x;
         hook_event.delta_y = hook_event.y - device->pending_abs_start_y;
-        hook_event.mouse_data = KSI_MOUSEEVENTF_ABSOLUTE;
+        hook_event.mouse_data = KSI_MOUSE_ABSOLUTE;
         hook_event.flags = mouse_injected_flags(device->pending_abs_injected);
         hook_event.time_ms = device->pending_abs_time_ms;
         hook_event.extra_info = device->pending_abs_extra_info;
         hook_event.device_id = device->device_id;
 
         if (g_verbose && should_dispatch_hook_input(device)) {
-            printf("inputd: mouse move abs x=%d y=%d dx=%d dy=%d time=%llu device=\"%s\"\n",
+            printf("keysharp-input: mouse move abs x=%d y=%d dx=%d dy=%d time=%llu device=\"%s\"\n",
                 hook_event.x, hook_event.y, hook_event.delta_x, hook_event.delta_y,
                 (unsigned long long)hook_event.time_ms,
                 device->name);
@@ -1582,7 +1566,7 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
         if (should_dispatch_hook_input(device) && hook_event_callback != NULL) {
             hook_event_callback(
                 hook_event_context,
-                KSI_HOOK_MOUSE_LL,
+                KSI_HOOK_MOUSE,
                 &hook_event,
                 sizeof(hook_event));
         }
@@ -1630,7 +1614,7 @@ static void dispatch_relative_event(
 
     if (event->code == REL_WHEEL || event->code == REL_HWHEEL) {
         ksi_mouse_hook_event hook_event = {
-            .message = event->code == REL_WHEEL ? KSI_WM_MOUSEWHEEL : KSI_WM_MOUSEHWHEEL,
+            .message = event->code == REL_WHEEL ? KSI_MESSAGE_MOUSE_WHEEL : KSI_MESSAGE_MOUSE_HORIZONTAL_WHEEL,
             /* Wheel events carry no cursor position; report the sentinel, not a bogus (0,0). */
             .x = KSI_MOUSE_COORD_UNSPECIFIED,
             .y = KSI_MOUSE_COORD_UNSPECIFIED,
@@ -1644,7 +1628,7 @@ static void dispatch_relative_event(
         dispatch_pending_mouse_move(device);
 
         if (g_verbose && should_dispatch_hook_input(device)) {
-            printf("inputd: mouse wheel message=0x%x delta=%d time=%llu device=\"%s\"\n",
+            printf("keysharp-input: mouse wheel message=0x%x delta=%d time=%llu device=\"%s\"\n",
                 hook_event.message,
                 event->value * 120,
                 (unsigned long long)hook_event.time_ms,
@@ -1654,7 +1638,7 @@ static void dispatch_relative_event(
         if (should_dispatch_hook_input(device) && hook_event_callback != NULL) {
             hook_event_callback(
                 hook_event_context,
-                KSI_HOOK_MOUSE_LL,
+                KSI_HOOK_MOUSE,
                 &hook_event,
                 sizeof(hook_event));
         }
@@ -2062,7 +2046,7 @@ static void process_device_events(ksi_linux_tracked_device *device)
             continue;
         }
 
-        fprintf(stderr, "inputd: failed reading %s: %s\n",
+        fprintf(stderr, "keysharp-input: failed reading %s: %s\n",
             device->path,
             strerror(-result));
         close_tracked_device(device);
@@ -2102,7 +2086,7 @@ static bool buffer_next_device_event(ksi_linux_tracked_device *device)
             continue;
         }
 
-        fprintf(stderr, "inputd: failed peeking %s: %s\n",
+        fprintf(stderr, "keysharp-input: failed peeking %s: %s\n",
             device->path,
             strerror(-result));
         close_tracked_device(device);

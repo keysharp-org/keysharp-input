@@ -1,163 +1,172 @@
+static void remember_authorization(
+    ksi_client *client,
+    uint16_t opcode,
+    uint16_t mode,
+    uint32_t scopes,
+    uint64_t request_id)
+{
+    client->pending_authorization = true;
+    client->pending_authorization_opcode = opcode;
+    client->pending_authorization_mode = mode;
+    client->pending_requested_scopes = scopes;
+    client->pending_request_id = request_id;
+}
+
+static void begin_authorization(
+    ksi_daemon_state *state,
+    ksi_client *client,
+    uint16_t opcode,
+    uint16_t mode,
+    uint32_t requested,
+    uint64_t request_id)
+{
+    uint32_t granted;
+    uint32_t missing = 0u;
+
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_authorization_status(client, opcode, request_id,
+            KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
+        return;
+    }
+    if (requested == 0u) {
+        finish_client_authorization(client, opcode, request_id, requested, 0u);
+        return;
+    }
+    if (client->pending_authorization
+        || client->state == KSI_CLIENT_STATE_AWAITING_PROMPT) {
+        send_authorization_status(client, opcode, request_id,
+            KSI_STATUS_BUSY, KSI_DETAIL_WRONG_STATE, 0u);
+        return;
+    }
+
+    remember_authorization(client, opcode, mode, requested, request_id);
+    if (!client->identity_attempted) {
+        client->identity_attempted = true;
+        client->state = KSI_CLIENT_STATE_IDENTIFYING;
+        if (!start_identify_task(state->commands, client->pid, client->uid,
+                client->start_time, client->fd, client->connection_id)) {
+            client->pending_authorization = false;
+            client->state = KSI_CLIENT_STATE_READY;
+            send_authorization_status(client, opcode, request_id,
+                KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE, 0u);
+        }
+        return;
+    }
+    if (client->state == KSI_CLIENT_STATE_IDENTIFYING) {
+        return;
+    }
+    if (!client->has_identity) {
+        client->pending_authorization = false;
+        send_authorization_status(client, opcode, request_id,
+            KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
+        return;
+    }
+
+    prepare_requested_scopes(state, requested);
+    granted = check_scopes_sync(state, client, requested, &missing);
+    if (missing != 0u && mode == KSI_AUTH_REQUEST
+        && state->permissions != NULL && !state->permission_monitor_failed) {
+        client->pending_permission_generation = state->permission_generation;
+        if (start_prompt_task(state->commands, state->permissions,
+                client->fd, client->connection_id, requested, missing,
+                client->exe_path, client->exe_hash, client->pid, client->uid,
+                client->start_time)) {
+            client->state = KSI_CLIENT_STATE_AWAITING_PROMPT;
+            return;
+        }
+        client->pending_authorization = false;
+        send_authorization_status(client, opcode, request_id,
+            KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE, 0u);
+        return;
+    }
+
+    client->pending_authorization = false;
+    finish_client_authorization(client, opcode, request_id, requested, granted);
+}
+
 static void handle_client_hello(
     ksi_daemon_state *state,
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-	const ksi_client_hello_payload *payload;
-	uint32_t requested = 0;
-	uint32_t flags = 0u;
-	uint32_t missing = 0u;
-	uint32_t granted;
+    ksi_client_hello_payload payload;
 
-    if (!input_owner_matches_uid(state, client->uid)) {
-        client->hello_seen = true;
-        send_hello_status(client, message->header->client_id,
-            message->header->correlation_id, -1, 0u);
+    if (client->hello_complete) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_WRONG_STATE);
+        return;
+    }
+    if (!ksi_protocol_decode_hello(message->payload, message->payload_size,
+            &payload)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (payload.reserved != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_RESERVED_NONZERO);
+        return;
+    }
+    if (payload.role != KSI_ROLE_RPC
+        && payload.role != KSI_ROLE_CALLBACK_STREAM
+        && payload.role != KSI_ROLE_AUTHORIZATION_LEASE) {
+        send_status(client->fd, message->header, KSI_STATUS_UNSUPPORTED,
+            KSI_DETAIL_WRONG_ROLE);
+        return;
+    }
+    if (payload.authorization_mode > KSI_AUTH_REQUEST) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_VALUE_RANGE);
+        return;
+    }
+    if ((payload.requested_scopes & ~KSI_INPUT_PERMISSION_SCOPES) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_UNKNOWN_SCOPE);
         return;
     }
 
-	if (message->payload_size != sizeof(*payload)) {
-		send_hello_status(client, message->header->client_id,
-			message->header->correlation_id, -1, 0u);
-		return;
-	}
-
-	payload = (const ksi_client_hello_payload *)(const void *)message->payload;
-	requested = payload->requested_capabilities & KSI_INPUT_CAPABILITIES;
-	flags = payload->flags;
-
-    if ((flags & (uint32_t)~KSI_CLIENT_HELLO_FLAG_CHECK_ONLY) != 0u) {
-        send_hello_status(client, message->header->client_id,
-            message->header->correlation_id, -1, 0u);
-        return;
-    }
-
-	if (payload->role > KSI_CONNECTION_HOOK_STREAM) {
-		send_hello_status(client, message->header->client_id,
-			message->header->correlation_id, -1, 0u);
-		return;
-	}
-
-	if (!client->role_initialized) {
-		client->connection_role = payload->role;
-		client->role_initialized = true;
-	} else if (client->connection_role != payload->role) {
-		send_hello_status(client, message->header->client_id,
-			message->header->correlation_id, -1, 0u);
-		return;
-	}
-
-	/* The client completed its handshake; it is no longer subject to the
-	 * unauthenticated-connection deadline. */
-	client->hello_seen = true;
-
-    /* Defer process hashing until the client actually asks for a privileged
-     * capability. Query-only and short-lived connections need no identity
-     * worker job. */
-    if (requested != 0u && client->state == KSI_CLIENT_STATE_READY
-        && !client->identity_attempted) {
-        client->pending_hello_valid = true;
-        client->pending_hello_requested = requested;
-        client->pending_hello_flags = flags;
-        client->pending_hello_correlation_id = message->header->correlation_id;
-        client->pending_hello_client_id = message->header->client_id;
-        client->identity_attempted = true;
-        client->state = KSI_CLIENT_STATE_IDENTIFYING;
-
-        if (!start_identify_task(state->commands, client->pid, client->fd, client->connection_id)) {
-            client->pending_hello_valid = false;
-            client->state = KSI_CLIENT_STATE_READY;
-            send_hello_status(client,
-                message->header->client_id, message->header->correlation_id, -1, 0u);
-        }
-
-        return;
-    }
-
-    /* If identification is still in progress, buffer the hello and defer. */
-    if (client->state == KSI_CLIENT_STATE_IDENTIFYING) {
-		client->pending_hello_valid = true;
-		client->pending_hello_requested = requested;
-		client->pending_hello_flags = flags;
-		client->pending_hello_correlation_id = message->header->correlation_id;
-		client->pending_hello_client_id = message->header->client_id;
-        return;
-    }
-
-    /* A status probe never waits for or modifies an unrelated in-flight prompt. */
-    if (client->state == KSI_CLIENT_STATE_AWAITING_PROMPT) {
-        if ((flags & KSI_CLIENT_HELLO_FLAG_CHECK_ONLY) != 0u) {
-            prepare_requested_capabilities(state, requested);
-            granted = check_capabilities_sync(state, client, requested, &missing);
-            finish_client_hello(client,
-                message->header->client_id,
-                message->header->correlation_id,
-                requested, flags, granted);
-            return;
-        }
-
-        send_hello_status(client, message->header->client_id, message->header->correlation_id, -1, 0);
-        return;
-    }
-
-    /* Identity is known. Check what is already granted without prompting. */
-	prepare_requested_capabilities(state, requested);
-	granted = check_capabilities_sync(state, client, requested, &missing);
-
-    /* If there are missing scopes and a permissions store is configured,
-     * start an async prompt. Response will be sent from process_client_prompt_done. */
-    if (missing != 0u && state->permissions != NULL
-        && !state->permission_monitor_failed
-        && (flags & KSI_CLIENT_HELLO_FLAG_CHECK_ONLY) == 0u) {
-        client->pending_hello_permission_generation =
-            state->permission_generation;
-        if (!start_prompt_task(state->commands, state->permissions,
-                               client->fd, client->connection_id, requested, missing,
-                               state->available_capabilities,
-                               client->exe_path, client->exe_hash,
-                               client->pid, client->uid, client->start_time)) {
-            send_hello_status(client, message->header->client_id, message->header->correlation_id, -1, granted);
-            return;
-        }
-
-		client->state = KSI_CLIENT_STATE_AWAITING_PROMPT;
-		client->pending_hello_valid = true;
-		client->pending_hello_requested = requested;
-		client->pending_hello_flags = flags;
-		client->pending_hello_correlation_id = message->header->correlation_id;
-		client->pending_hello_client_id = message->header->client_id;
-        return;
-    }
-
-    finish_client_hello(client,
-        message->header->client_id,
-        message->header->correlation_id,
-        requested, flags, granted);
+    client->connection_role = payload.role;
+    client->advertised_operations = state->available_operations;
+    client->hello_complete = true;
+    begin_authorization(state, client, KSI_OPCODE_HELLO,
+        payload.authorization_mode, payload.requested_scopes,
+        message->header->request_id);
 }
 
-static void handle_emergency_passthrough(
+static void handle_authorize(
     ksi_daemon_state *state,
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    /* This is a rescue path for hook owners. Do not let an arbitrary
-     * zero-capability hello on the public system socket clear other scripts. */
-    if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated
-        || (client->granted_capabilities
-            & (KSI_CAP_HOOK_KEYBOARD | KSI_CAP_HOOK_MOUSE)) == 0u) {
-        send_status(client->fd, message->header, KSI_MESSAGE_EMERGENCY_PASSTHROUGH, -1, 403);
+    ksi_authorize_payload payload;
+
+    if (!ksi_protocol_decode_authorize(message->payload, message->payload_size,
+            &payload)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (payload.reserved0 != 0u || payload.reserved1 != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_RESERVED_NONZERO);
+        return;
+    }
+    if (payload.authorization_mode > KSI_AUTH_REQUEST) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_VALUE_RANGE);
+        return;
+    }
+    if (payload.requested_scopes == 0u
+        || (payload.requested_scopes & ~KSI_INPUT_PERMISSION_SCOPES) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            payload.requested_scopes == 0u
+                ? KSI_DETAIL_VALUE_RANGE : KSI_DETAIL_UNKNOWN_SCOPE);
         return;
     }
 
-    clear_hook_state(state);
-
-    if (update_grab_state(state) != 0) {
-        send_status(client->fd, message->header, KSI_MESSAGE_EMERGENCY_PASSTHROUGH, -1, 1);
-        return;
-    }
-
-    send_status(client->fd, message->header, KSI_MESSAGE_EMERGENCY_PASSTHROUGH, 0, 0);
+    begin_authorization(state, client, KSI_OPCODE_AUTHORIZE,
+        payload.authorization_mode, payload.requested_scopes,
+        message->header->request_id);
 }
 
 static void handle_get_indicator_state(
@@ -165,9 +174,14 @@ static void handle_get_indicator_state(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated) {
-        send_status(client->fd, message->header, KSI_MESSAGE_INDICATOR_STATE_RESULT, -1, 403);
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
@@ -180,9 +194,14 @@ static void handle_get_pointer_position(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated) {
-        send_status(client->fd, message->header, KSI_MESSAGE_POINTER_POSITION_RESULT, -1, 403);
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
@@ -194,10 +213,15 @@ static void handle_get_pointer_buttons(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
     if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated
-        || (client->granted_capabilities & KSI_CAP_HOOK_MOUSE) == 0) {
-        send_status(client->fd, message->header, KSI_MESSAGE_POINTER_BUTTONS_RESULT, -1, 403);
+        || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
@@ -212,13 +236,14 @@ static void handle_idle_time(
 {
     ksi_idle_time_payload result;
 
-    /* Idle duration is presence metadata, not raw input content. Like desktop
-     * idle-monitor D-Bus APIs, it requires an authenticated peer but no hook or
-     * synthesis operation, and therefore never opens a permission prompt for an
-     * idle-time query. */
-    if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated) {
-        send_status(client->fd, message->header, KSI_MESSAGE_IDLE_TIME, -1, 403);
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
@@ -228,71 +253,13 @@ static void handle_idle_time(
         (void)backend->get_idle_time(&result);
     }
 
-    (void)ipc_send_locked(
-        client->fd,
-        KSI_MESSAGE_IDLE_TIME,
-        message->header->client_id,
-        message->header->correlation_id,
-        &result,
-        sizeof(result));
-}
-
-typedef struct ksi_list_permissions_context {
-    int client_fd;
-    uint32_t client_id;
-    uint64_t correlation_id;
-    bool send_failed;
-} ksi_list_permissions_context;
-
-static bool list_permissions_visitor(
-    const ksi_auth_entry *entry,
-    void *user_data)
-{
-    ksi_list_permissions_context *context = user_data;
-    uint8_t buffer[sizeof(ksi_list_permissions_entry_payload) + KSI_AUTH_MAX_PATH];
-    ksi_list_permissions_entry_payload *payload =
-        (ksi_list_permissions_entry_payload *)(void *)buffer;
-    size_t path_length = 0u;
-    size_t total_size;
-
-    if (context == NULL || entry == NULL) {
-        return false;
-    }
-
-    /* Only stream records that carry at least one input permission scope. */
-    if ((entry->allowed_scopes & KSP_INPUT_SCOPES) == 0u) {
-        return true;
-    }
-
-    if (entry->exe_path != NULL) {
-        path_length = strnlen(entry->exe_path, KSI_AUTH_MAX_PATH);
-    }
-
-    memset(payload, 0, sizeof(*payload));
-    payload->uid = (uint32_t)entry->uid;
-    payload->persistent_scopes = entry->allowed_scopes;
-    payload->path_length = (uint16_t)path_length;
-    payload->last_seen_utc = entry->granted_at_utc;
-    (void)snprintf(payload->exe_hash, sizeof(payload->exe_hash), "%s", entry->app_hash);
-
-    if (path_length > 0u) {
-        memcpy(buffer + sizeof(*payload), entry->exe_path, path_length);
-    }
-
-    total_size = sizeof(*payload) + path_length;
-
-    if (ipc_send_locked(
-            context->client_fd,
-            KSI_MESSAGE_LIST_PERMISSIONS_ENTRY,
-            context->client_id,
-            context->correlation_id,
-            buffer,
-            total_size) != 0) {
-        context->send_failed = true;
-        return false;
-    }
-
-    return true;
+    uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_IDLE_TIME_PAYLOAD_SIZE];
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    (void)ksi_protocol_encode_idle_time(response + KSI_STATUS_PAYLOAD_SIZE,
+        &result);
+    (void)ipc_send_locked(client->fd, KSI_OPCODE_GET_IDLE_TIME,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, sizeof(response));
 }
 
 static void handle_list_permissions(
@@ -300,30 +267,67 @@ static void handle_list_permissions(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    ksi_list_permissions_context context;
-    uid_t filter;
+    ksp_permission_entry *entries = NULL;
+    size_t count = 0u;
+    uint8_t buffer[KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE + KSP_PATH_CAPACITY];
 
-    if (state == NULL || client == NULL) {
+    if (client->connection_role != KSI_ROLE_RPC) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_WRONG_ROLE);
+        return;
+    }
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (state->permissions == NULL) {
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NONE);
+        return;
+    }
+    if (ksp_store_list(state->permissions, client->uid, &entries, &count) != 0) {
+        send_status(client->fd, message->header, KSI_STATUS_INTERNAL,
+            KSI_DETAIL_NONE);
         return;
     }
 
-    filter = (geteuid() == 0 && client->uid == 0) ? (uid_t)-1 : client->uid;
+    for (size_t i = 0u; i < count; i++) {
+        uint32_t scopes = entries[i].scopes & KSI_INPUT_PERMISSION_SCOPES;
+        size_t path_length;
 
-    context.client_fd = client->fd;
-    context.client_id = message->header->client_id;
-    context.correlation_id = message->header->correlation_id;
-    context.send_failed = false;
-
-    if (state->permissions != NULL) {
-        ksi_auth_store_for_each(state->permissions, filter, list_permissions_visitor, &context);
+        if (scopes == 0u || !ksp_hash_is_canonical(entries[i].app_hash)) {
+            continue;
+        }
+        path_length = strnlen(entries[i].executable, KSP_PATH_CAPACITY);
+        ksi_status_encode(buffer, KSI_STATUS_OK, KSI_DETAIL_NONE);
+        ksi_wire_write_u32(buffer + 8u, scopes);
+        ksi_wire_write_u32(buffer + 12u, (uint32_t)path_length);
+        ksi_wire_write_u64(buffer + 16u, entries[i].granted_at_utc);
+        ksi_protocol_encode_hash(entries[i].app_hash, buffer + 24u);
+        memcpy(buffer + KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE,
+            entries[i].executable, path_length);
+        if (ipc_send_locked(client->fd, KSI_OPCODE_PERMISSIONS_LIST,
+                KSI_FRAME_FLAG_RESPONSE | KSI_FRAME_FLAG_MORE,
+                message->header->request_id, buffer,
+                KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE + path_length) != 0) {
+            ksp_store_list_free(entries);
+            return;
+        }
     }
 
-    send_status(
-        client->fd,
-        message->header,
-        KSI_MESSAGE_LIST_PERMISSIONS_RESULT,
-        context.send_failed ? -1 : 0,
-        0u);
+    ksp_store_list_free(entries);
+    send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
+}
+
+static bool raw_hash_is_zero(const uint8_t hash[KSI_PERMISSION_HASH_SIZE])
+{
+    uint8_t combined = 0u;
+
+    for (size_t i = 0u; i < KSI_PERMISSION_HASH_SIZE; i++) {
+        combined |= hash[i];
+    }
+    return combined == 0u;
 }
 
 static void handle_revoke_permissions(
@@ -331,62 +335,78 @@ static void handle_revoke_permissions(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    const ksi_revoke_permissions_payload *payload;
-    uid_t target_uid;
-    uint32_t scopes;
-    char exe_hash[KSI_AUTH_HASH_HEX_LENGTH + 1u];
+    ksi_permissions_revoke_payload payload;
+    char exe_hash[KSP_HASH_HEX_LENGTH + 1u] = { 0 };
+    bool all;
 
     if (state == NULL || client == NULL) {
         return;
     }
 
+    if (client->connection_role != KSI_ROLE_RPC) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_WRONG_ROLE);
+        return;
+    }
+
     if (state->permissions == NULL) {
-        send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, -1, 500);
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NONE);
         return;
     }
 
-    if (message->payload_size < sizeof(*payload)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, -1, 400);
+    if (!ksi_protocol_decode_permissions_revoke(
+            message->payload, message->payload_size, &payload)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (payload.scopes == 0u
+        || (payload.scopes & ~KSI_INPUT_PERMISSION_SCOPES) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            payload.scopes == 0u
+                ? KSI_DETAIL_VALUE_RANGE : KSI_DETAIL_UNKNOWN_SCOPE);
+        return;
+    }
+    all = payload.target_kind == KSI_PERMISSION_TARGET_ALL;
+    if (payload.target_kind == KSI_PERMISSION_TARGET_HASH) {
+        if (payload.pid != 0u || raw_hash_is_zero(payload.hash)) {
+            send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+                KSI_DETAIL_VALUE_RANGE);
+            return;
+        }
+        (void)ksi_protocol_decode_hash(payload.hash, exe_hash);
+    } else if (payload.target_kind == KSI_PERMISSION_TARGET_PID) {
+        ksp_identity identity;
+
+        if (payload.pid == 0u || payload.pid > (uint64_t)INT_MAX
+            || !raw_hash_is_zero(payload.hash)
+            || ksp_identity_capture((pid_t)payload.pid, client->uid,
+                &identity) != 0) {
+            send_status(client->fd, message->header, KSI_STATUS_NOT_FOUND,
+                KSI_DETAIL_NONE);
+            return;
+        }
+        (void)snprintf(exe_hash, sizeof(exe_hash), "%s", identity.hash);
+    } else if (!all || payload.pid != 0u || !raw_hash_is_zero(payload.hash)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_VALUE_RANGE);
         return;
     }
 
-    payload = (const ksi_revoke_permissions_payload *)(const void *)message->payload;
-
-    target_uid = (payload->target_uid == KSI_REVOKE_PERMISSIONS_UID_SELF)
-        ? client->uid
-        : (uid_t)payload->target_uid;
-
-    /* Clamp to input scopes; the desktop broker manages its own domain. */
-    scopes = payload->scopes & KSP_INPUT_SCOPES;
-
-    if (scopes == 0u) {
-        send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, -1, 400);
+    int result = all
+        ? ksp_store_revoke_uid(state->permissions, client->uid, payload.scopes)
+        : ksp_store_revoke(state->permissions, client->uid, exe_hash,
+            payload.scopes);
+    if (result != 0) {
+        send_status(client->fd, message->header, KSI_STATUS_INTERNAL,
+            KSI_DETAIL_NONE);
         return;
     }
 
-    if (target_uid != client->uid && (geteuid() != 0 || client->uid != 0)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, -1, 403);
-        return;
-    }
-
-    (void)snprintf(exe_hash, sizeof(exe_hash), "%.*s",
-        (int)sizeof(payload->exe_hash) - 1,
-        payload->exe_hash);
-
-    if (exe_hash[0] == '\0') {
-        send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, -1, 400);
-        return;
-    }
-
-    if (ksi_auth_store_revoke(state->permissions, target_uid, exe_hash, scopes) != 0) {
-        send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, -1, 500);
-        return;
-    }
-
-    invalidate_connected_permissions(
-        state, target_uid, exe_hash, scopes);
-
-    send_status(client->fd, message->header, KSI_MESSAGE_REVOKE_PERMISSIONS, 0, 0u);
+    invalidate_connected_permissions(state, client->uid,
+        all ? NULL : exe_hash, all, payload.scopes);
+    send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
 }
 
 static void handle_hook_subscription(
@@ -394,44 +414,50 @@ static void handle_hook_subscription(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    const ksi_hook_subscription_payload *payload;
-    uint32_t capability;
+    ksi_hook_subscription_payload payload;
     uint32_t subscription_bit;
     uint32_t old_subscriptions;
     uint64_t old_ordinal;
     size_t lane_index;
 
-    if (client->connection_role != KSI_CONNECTION_HOOK_STREAM) {
-        send_status(client->fd, message->header, message->header->type, -1, 403);
+    if (client->connection_role != KSI_ROLE_CALLBACK_STREAM) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_WRONG_ROLE);
         return;
     }
 
-    if (message->payload_size != sizeof(*payload)) {
-        send_status(client->fd, message->header, message->header->type, -1, 1);
+    if (!ksi_protocol_decode_hook_subscription(
+            message->payload, message->payload_size, &payload)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
         return;
     }
-
-    payload = (const ksi_hook_subscription_payload *)(const void *)message->payload;
-    capability = subscription_bit = hook_type_to_cap_bit(payload->hook_type);
-
-    if (capability == 0 || subscription_bit == 0) {
-        send_status(client->fd, message->header, message->header->type, -1, 2);
+    subscription_bit = hook_type_to_operation(payload.hook_type);
+    if (payload.reserved != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_RESERVED_NONZERO);
         return;
     }
-
-    if (!client_has_capability(client, capability)) {
-        send_status(client->fd, message->header, message->header->type, -1, 403);
+    if (subscription_bit == 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_VALUE_RANGE);
         return;
     }
 
     old_subscriptions = client->hook_subscriptions;
-    lane_index = hook_type_to_lane_index(payload->hook_type);
+    lane_index = hook_type_to_lane_index(payload.hook_type);
     old_ordinal = client->hook_subscription_ordinal[lane_index];
 
-    if (message->header->type == KSI_MESSAGE_SUBSCRIBE_HOOK) {
-        if (!input_owner_matches_uid(state, client->uid)) {
-            send_status(client->fd, message->header,
-                message->header->type, -1, 403);
+    if (message->header->opcode == KSI_OPCODE_SUBSCRIBE_HOOK) {
+        if (!input_owner_matches_uid(state, client->uid)
+            || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+            send_status(client->fd, message->header, KSI_STATUS_DENIED,
+                KSI_DETAIL_NONE);
+            return;
+        }
+        if ((state->ready_operations & subscription_bit) == 0u) {
+            send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+                KSI_DETAIL_NONE);
             return;
         }
 
@@ -455,12 +481,18 @@ static void handle_hook_subscription(
         client->hook_subscriptions = old_subscriptions;
         client->hook_subscription_ordinal[lane_index] = old_ordinal;
         (void)update_grab_state(state);
-        send_status(client->fd, message->header, message->header->type, -1, 5);
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NONE);
         return;
     }
 
     renew_client_lease(client);
-    send_status(client->fd, message->header, message->header->type, 0, client->hook_subscriptions);
+    uint8_t response[KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE];
+    size_t response_size = ksi_protocol_encode_u32_result(
+        response, client->hook_subscriptions);
+    (void)ipc_send_locked(client->fd, message->header->opcode,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, response_size);
 }
 
 static void handle_set_block_input(
@@ -468,198 +500,167 @@ static void handle_set_block_input(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    const ksi_block_input_payload *payload;
+    ksi_block_input_payload payload;
     uint32_t old_mask;
 
-    if (message->payload_size != sizeof(*payload)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SET_BLOCK_INPUT, -1, 1);
+    if (!ksi_protocol_decode_block_input(
+            message->payload, message->payload_size, &payload)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (payload.reserved != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_RESERVED_NONZERO);
+        return;
+    }
+    if ((payload.block_mask
+            & (uint32_t)~(KSI_BLOCK_KEYBOARD | KSI_BLOCK_MOUSE)) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_VALUE_RANGE);
         return;
     }
 
-    payload = (const ksi_block_input_payload *)(const void *)message->payload;
-
-    if ((payload->block_mask & (uint32_t)~(KSI_BLOCK_INPUT_KEYBOARD | KSI_BLOCK_INPUT_MOUSE)) != 0u) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SET_BLOCK_INPUT, -1, 2);
+    if (payload.block_mask != 0u
+        && !client_has_scope(client, KSP_SCOPE_INPUT_CONTROL)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
-    if (payload->block_mask != 0u
-        && !client_has_capability(client, KSI_CAP_BLOCK_INPUT)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SET_BLOCK_INPUT, -1, 403);
-        return;
-    }
-
-    if (payload->block_mask != 0u
+    if (payload.block_mask != 0u
         && !input_owner_matches_uid(state, client->uid)) {
-        send_status(client->fd, message->header,
-            KSI_MESSAGE_SET_BLOCK_INPUT, -1, 403);
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
+        return;
+    }
+    if (payload.block_mask != 0u
+        && (state->ready_operations & KSI_OPERATION_BLOCK_INPUT) == 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NONE);
         return;
     }
 
     old_mask = client->block_input_mask;
-    client->block_input_mask = payload->block_mask;
+    client->block_input_mask = payload.block_mask;
 
     if (update_grab_state(state) != 0) {
         client->block_input_mask = old_mask;
         (void)update_grab_state(state);
-        send_status(client->fd, message->header, KSI_MESSAGE_SET_BLOCK_INPUT, -1, 5);
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NONE);
         return;
     }
 
     renew_client_lease(client);
-    send_status(client->fd, message->header, KSI_MESSAGE_SET_BLOCK_INPUT, 0, client->block_input_mask);
+    uint8_t response[KSI_BLOCK_INPUT_RESULT_PAYLOAD_SIZE];
+    size_t response_size = ksi_protocol_encode_u32_result(
+        response, client->block_input_mask);
+    (void)ipc_send_locked(client->fd, KSI_OPCODE_SET_BLOCK_INPUT,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, response_size);
 }
 
-static bool client_may_suppress_hook(const ksi_client *client)
-{
-    return client_has_capability(client, KSI_CAP_BLOCK_INPUT);
-}
-
-/* Validates the decision payload on the main thread, then routes it to the
- * lane that is currently processing the matching event_id.  The success ack is
- * written before the lane can observe the queued decision, preserving stream
- * order for clients which read HOOK_DECISION status before the next HOOK_EVENT. */
-static void handle_hook_decision(
+static bool handle_hook_decision(
     ksi_daemon_state *state,
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    const ksi_hook_decision_payload *payload;
+    ksi_status_payload status;
+    uint32_t decision_value;
+    uint32_t input_count;
     size_t expected_size;
     ksi_hook_lane *lane;
     ksi_lane_decision decision;
+    uint64_t required_operations = 0u;
 
-    if (message->payload_size < sizeof(*payload)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_PAYLOAD_TOO_SMALL);
-        return;
+    if (client->connection_role != KSI_ROLE_CALLBACK_STREAM
+        || message->payload_size < KSI_STATUS_PAYLOAD_SIZE) {
+        return false;
     }
-
-    payload = (const ksi_hook_decision_payload *)(const void *)message->payload;
-
-    if (payload->input_count > KSI_MAX_MODIFY_INPUTS) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_INPUT_COUNT_LIMIT);
-        return;
+    ksi_status_decode(message->payload, &status);
+    lane = lane_for_event_id(state, message->header->request_id);
+    if (lane == NULL
+        || atomic_load(&lane->current_responder_connection_id)
+            != client->connection_id) {
+        return false;
     }
-
-    expected_size = sizeof(*payload) + ((size_t)payload->input_count * sizeof(payload->inputs[0]));
-
-    if (message->payload_size != expected_size) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_PAYLOAD_SIZE_MISMATCH);
-        return;
-    }
-
-    if (payload->decision != KSI_HOOK_DECISION_PASS
-        && payload->decision != KSI_HOOK_DECISION_BLOCK
-        && payload->decision != KSI_HOOK_DECISION_MODIFY) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_INVALID_DECISION);
-        return;
-    }
-
-    if (payload->decision == KSI_HOOK_DECISION_MODIFY && payload->input_count == 0) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_EMPTY_MODIFY);
-        return;
-    }
-
-    if (state == NULL) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_STALE_OR_WRONG_RESPONDER);
-        return;
-    }
-
-    if (!input_owner_matches_uid(state, client->uid)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_STALE_OR_WRONG_RESPONDER);
-        return;
-    }
-
-    /* Locate the lane currently waiting on this event_id.  If neither lane
-     * has it as their current event, the decision is stale (timeout already
-     * fired or the lane already finalized via BLOCK/MODIFY from someone else). */
-    lane = lane_for_event_id(state, payload->event_id);
-
-    if (lane == NULL) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_STALE_OR_WRONG_RESPONDER);
-        return;
-    }
-
-    if (atomic_load(&lane->current_responder_connection_id) != client->connection_id) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_HOOK_DETAIL_STALE_OR_WRONG_RESPONDER);
-        return;
-    }
-
-    if ((payload->decision != KSI_HOOK_DECISION_PASS
-            && !client_may_suppress_hook(client))
-        || (payload->decision == KSI_HOOK_DECISION_MODIFY
-            && !client_has_capability(client,
-                required_synthesis_capabilities(
-                    payload->inputs, payload->input_count)))) {
-        /* Resolve this matching callback as PASS while reporting denial. A
-         * revoked or under-scoped client must not add a full callback timeout
-         * to each physical event before its connection is cleaned up. */
-        memset(&decision, 0, offsetof(ksi_lane_decision, inputs));
-        decision.event_id = payload->event_id;
-        decision.decision = KSI_HOOK_DECISION_PASS;
-        decision.responder_connection_id = client->connection_id;
-        if (!lane_decision_queue_push_with_ack(
-                &lane->decision_queue,
-                &decision,
-                client->hook_send_ref,
-                message->header,
-                -1,
-                KSI_DETAIL_PERMISSION_DENIED)) {
-            send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION,
-                -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
-        }
-        return;
-    }
-
-    /* Header only; the inputs tail is filled (bounded) by the memcpy below and
-     * only ever read up to input_count. */
     memset(&decision, 0, offsetof(ksi_lane_decision, inputs));
-    decision.event_id = payload->event_id;
-    decision.decision = payload->decision;
+    decision.event_id = message->header->request_id;
     decision.responder_connection_id = client->connection_id;
-    decision.input_count = payload->input_count;
 
-    if (payload->input_count > 0u) {
-        memcpy(decision.inputs, payload->inputs,
-            (size_t)payload->input_count * sizeof(payload->inputs[0]));
-    }
+    if (status.status != KSI_STATUS_OK) {
+        if (message->payload_size != KSI_STATUS_PAYLOAD_SIZE) {
+            uint32_t diagnostic_length;
 
-    if (!lane_decision_queue_push_with_ack(
-        &lane->decision_queue,
-        &decision,
-        client->hook_send_ref,
-        message->header,
-        0,
-        payload->decision)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_HOOK_DECISION, -1,
-            KSI_DETAIL_RESOURCE_EXHAUSTED);
-        return;
-    }
-
-    {
-        /* Resolve the responder under the connection_id guard so we don't
-         * credit success on a freshly-accepted client that happens to have
-         * inherited this fd from a prior disconnect. */
-        ssize_t resolved = find_client_index_by_fd(state, client->fd);
-
-        if (resolved >= 0
-            && state->clients[resolved].connection_id == client->connection_id) {
-            record_client_hook_success(state, (nfds_t)resolved, lane->hook_type);
-            renew_client_lease(&state->clients[resolved]);
+            if (message->payload_size < KSI_STATUS_PAYLOAD_SIZE + 4u) {
+                goto invalid_decision;
+            }
+            diagnostic_length = ksi_wire_read_u32(
+                message->payload + KSI_STATUS_PAYLOAD_SIZE);
+            if ((size_t)diagnostic_length
+                    != message->payload_size - KSI_STATUS_PAYLOAD_SIZE - 4u) {
+                goto invalid_decision;
+            }
         }
+        decision.decision = KSI_HOOK_PASS;
+        return lane_decision_queue_push(&lane->decision_queue, &decision);
+    }
+    if (!ksi_protocol_decode_hook_decision_prefix(message->payload,
+            message->payload_size, &decision_value, &input_count)
+        || input_count > KSI_MAX_MODIFY_INPUTS) {
+        goto invalid_decision;
+    }
+    expected_size = KSI_HOOK_DECISION_PREFIX_SIZE
+        + (size_t)input_count * KSI_INPUT_WIRE_SIZE;
+    if (message->payload_size != expected_size
+        || (decision_value != KSI_HOOK_PASS
+            && decision_value != KSI_HOOK_BLOCK
+            && decision_value != KSI_HOOK_MODIFY)
+        || (decision_value == KSI_HOOK_MODIFY && input_count == 0u)) {
+        goto invalid_decision;
+    }
+    if (!input_owner_matches_uid(state, client->uid)
+        || (decision_value != KSI_HOOK_PASS
+            && !client_has_scope(client, KSP_SCOPE_INPUT_CONTROL))) {
+        decision.decision = KSI_HOOK_PASS;
+        (void)lane_decision_queue_push(&lane->decision_queue, &decision);
+        return false;
+    }
+    decision.decision = decision_value;
+    decision.input_count = input_count;
+    for (uint32_t i = 0u; i < input_count; i++) {
+        if (!ksi_protocol_decode_input(
+                message->payload + KSI_HOOK_DECISION_PREFIX_SIZE
+                    + (size_t)i * KSI_INPUT_WIRE_SIZE,
+                &decision.inputs[i])) {
+            goto invalid_decision;
+        }
+        required_operations |= decision.inputs[i].type == KSI_INPUT_KEYBOARD
+            ? KSI_OPERATION_SYNTHESIZE_KEYBOARD
+            : KSI_OPERATION_SYNTHESIZE_MOUSE;
+    }
+    if ((required_operations & state->ready_operations) != required_operations
+        || !lane_decision_queue_push(&lane->decision_queue, &decision)) {
+        decision.decision = KSI_HOOK_PASS;
+        decision.input_count = 0u;
+        (void)lane_decision_queue_push(&lane->decision_queue, &decision);
+        return false;
     }
 
-    /* Success ack was sent by lane_decision_queue_push_with_ack before waking
-     * the lane, so no subsequent HOOK_EVENT can overtake it on this stream. */
+    ssize_t resolved = find_client_index_by_fd(state, client->fd);
+    if (resolved >= 0
+        && state->clients[resolved].connection_id == client->connection_id) {
+        record_client_hook_success(state, (nfds_t)resolved, lane->hook_type);
+        renew_client_lease(&state->clients[resolved]);
+    }
+    return true;
+
+invalid_decision:
+    decision.decision = KSI_HOOK_PASS;
+    decision.input_count = 0u;
+    (void)lane_decision_queue_push(&lane->decision_queue, &decision);
+    return false;
 }
 
 static void handle_synthesize_input(
@@ -667,58 +668,65 @@ static void handle_synthesize_input(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    const ksi_synthesize_input_payload *payload;
+    ksi_input inputs[KSI_MAX_SYNTH_INPUTS];
+    uint32_t count;
+    uint32_t synth_flags;
     size_t expected_size;
     uint64_t input_generation;
     uint64_t parent_hook_event_id;
+    uint64_t required_operations = 0u;
 
-    if (!input_owner_matches_uid(state, client->uid)) {
-        send_status(client->fd, message->header,
-            KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_PERMISSION_DENIED);
+    if (!input_owner_matches_uid(state, client->uid)
+        || !client_has_scope(client, KSP_SCOPE_INPUT_CONTROL)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
+        return;
+    }
+    if (!ksi_protocol_decode_synthesize_prefix(message->payload,
+            message->payload_size, &count, &synth_flags)) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (count > KSI_MAX_SYNTH_INPUTS
+        || (synth_flags & ~(uint32_t)KSI_SYNTH_BYPASS_HOOK) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_VALUE_RANGE);
+        return;
+    }
+    expected_size = KSI_SYNTHESIZE_PREFIX_SIZE
+        + (size_t)count * KSI_INPUT_WIRE_SIZE;
+    if (message->payload_size != expected_size) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    for (uint32_t i = 0u; i < count; i++) {
+        if (!ksi_protocol_decode_input(
+                message->payload + KSI_SYNTHESIZE_PREFIX_SIZE
+                    + (size_t)i * KSI_INPUT_WIRE_SIZE,
+                &inputs[i])) {
+            send_status(client->fd, message->header,
+                KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_VALUE_RANGE);
+            return;
+        }
+        required_operations |= inputs[i].type == KSI_INPUT_KEYBOARD
+            ? KSI_OPERATION_SYNTHESIZE_KEYBOARD
+            : KSI_OPERATION_SYNTHESIZE_MOUSE;
+    }
+    if ((required_operations & state->ready_operations) != required_operations) {
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NONE);
         return;
     }
 
     input_generation = current_input_generation(state);
-
-    if (message->payload_size < sizeof(*payload)) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, -1,
-            KSI_DETAIL_PAYLOAD_TOO_SMALL);
-        return;
-    }
-
-    payload = (const ksi_synthesize_input_payload *)(const void *)message->payload;
-
-    if (payload->count > KSI_MAX_SYNTH_INPUTS) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, -1,
-            KSI_DETAIL_INPUT_COUNT_LIMIT);
-        return;
-    }
-
-    expected_size = sizeof(*payload) + ((size_t)payload->count * sizeof(payload->inputs[0]));
-
-    if (message->payload_size != expected_size) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, -1,
-            KSI_DETAIL_PAYLOAD_SIZE_MISMATCH);
-        return;
-    }
-
-    if (!client_has_capability(
-            client,
-            required_synthesis_capabilities(payload->inputs, payload->count))) {
-        send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, -1,
-            KSI_DETAIL_PERMISSION_DENIED);
-        return;
-    }
-
-    /* BYPASS_HOOK is the only client-legal flag. BATCH_FRAGMENT/REPLAY/BATCH_START
-     * are daemon-internal (they gate the surrogate-reset); strip anything else a
-     * client sets so it cannot splice surrogate state or reach internal paths. */
-    uint32_t synth_flags = payload->flags & KSI_SYNTH_FLAG_BYPASS_HOOK;
-    parent_hook_event_id = client->connection_role == KSI_CONNECTION_HOOK_STREAM
-        ? message->header->correlation_id
+    parent_hook_event_id = client->connection_role
+            == KSI_ROLE_CALLBACK_STREAM
+        ? hook_send_ref_current_event_id(client->hook_send_ref)
         : 0u;
 
-    if (client->connection_role == KSI_CONNECTION_HOOK_STREAM) {
+    if (parent_hook_event_id != 0u) {
         ksi_hook_lane *active_lane = lane_for_event_id(
             state, parent_hook_event_id);
         ksi_nested_transaction *transaction = NULL;
@@ -726,27 +734,11 @@ static void handle_synthesize_input(
         size_t expanded_count = 0u;
         uint32_t depth;
 
-        if (parent_hook_event_id == 0u) {
-            send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_CALLBACK_TIMEOUT);
-            return;
-        }
-
         if (active_lane == NULL
             || atomic_load(&active_lane->current_responder_connection_id)
                 != client->connection_id) {
-            /* A late callback may still owe a modifier release. Preserve it, but
-             * never route stale work back into the now-idle HookStream. */
-            if (!output_queue_push_synth(&state->output_queue, payload->inputs,
-                    payload->count, synth_flags | KSI_SYNTH_FLAG_BYPASS_HOOK,
-                    input_generation)) {
-                send_status(client->fd, message->header,
-                    KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
-                return;
-            }
-
-            send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, 0, 0u);
+            send_status(client->fd, message->header, KSI_STATUS_TIMEOUT,
+                KSI_DETAIL_STALE_CALLBACK);
             return;
         }
 
@@ -754,28 +746,29 @@ static void handle_synthesize_input(
 
         if (depth > KSI_MAX_RECURSION_DEPTH) {
             send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_RECURSION_LIMIT);
+                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_RECURSION_LIMIT);
             return;
         }
 
-        if ((synth_flags & KSI_SYNTH_FLAG_BYPASS_HOOK) != 0u
-            || payload->count == 0u) {
-            if (!output_queue_push_synth(&state->output_queue, payload->inputs,
-                    payload->count, synth_flags, input_generation)) {
+        if ((synth_flags & KSI_SYNTH_BYPASS_HOOK) != 0u
+            || count == 0u) {
+            if (!output_queue_push_synth(&state->output_queue, inputs,
+                    count, synth_flags, input_generation)) {
                 send_status(client->fd, message->header,
-                    KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+                    KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
                 return;
             }
 
-            send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, 0, 0u);
+            send_status(client->fd, message->header, KSI_STATUS_OK,
+                KSI_DETAIL_NONE);
             return;
         }
 
-        if (!ksi_synthetic_hook_batch_count(payload->inputs, payload->count,
+        if (!ksi_synthetic_hook_batch_count(inputs, count,
                 KSI_MAX_SYNTH_HOOK_ACTIONS, &expanded_count)) {
             send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_EXPANDED_INPUT_LIMIT);
+                KSI_STATUS_RESOURCE_EXHAUSTED,
+                KSI_DETAIL_EXPANDED_INPUT_LIMIT);
             return;
         }
 
@@ -786,10 +779,11 @@ static void handle_synthesize_input(
 
         if (completion == NULL || transaction == NULL) {
             if (completion != NULL) {
-                synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+                synth_completion_fail(completion,
+                    KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             } else {
                 send_status(client->fd, message->header,
-                    KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+                    KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             }
 
             free(transaction);
@@ -806,17 +800,19 @@ static void handle_synthesize_input(
 
         if (!synth_completion_begin_recursive_synthesis(
                 completion, parent_hook_event_id)) {
-            synth_completion_fail(completion, -1, KSI_DETAIL_CALLBACK_TIMEOUT);
+            synth_completion_fail(completion, KSI_STATUS_TIMEOUT,
+                KSI_DETAIL_STALE_CALLBACK);
             transaction->completion = NULL;
             nested_transaction_destroy(transaction);
             return;
         }
 
-        for (uint32_t i = 0u, offset = 0u; i < payload->count; i++) {
+        for (uint32_t i = 0u, offset = 0u; i < count; i++) {
             ksi_input expanded[KSI_SYNTHETIC_HOOK_MAX_EXPANSION];
-            size_t count = ksi_synthetic_hook_expand_input(&payload->inputs[i], expanded);
+            size_t expanded_one_count = ksi_synthetic_hook_expand_input(
+                &inputs[i], expanded);
 
-            for (size_t j = 0u; j < count; j++) {
+            for (size_t j = 0u; j < expanded_one_count; j++) {
                 transaction->members[offset++].input = expanded[j];
             }
         }
@@ -827,7 +823,8 @@ static void handle_synthesize_input(
             if (!create_synthetic_lane_event(state, &member->input, i == 0u,
                     depth, NULL, &member->event,
                     input_generation)) {
-                synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+                synth_completion_fail(completion,
+                    KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
                 transaction->completion = NULL;
                 nested_transaction_destroy(transaction);
                 return;
@@ -837,7 +834,8 @@ static void handle_synthesize_input(
         synth_completion_begin_atomic(completion);
 
         if (!ksi_pipe_ring_push(&active_lane->nested_queue.ring, &transaction)) {
-            synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+            synth_completion_fail(completion,
+                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             transaction->completion = NULL;
             nested_transaction_destroy(transaction);
             return;
@@ -847,13 +845,14 @@ static void handle_synthesize_input(
         return;
     }
 
-    if (synth_batch_needs_hook_queue(state, payload->inputs, payload->count, synth_flags)) {
+    if (synth_batch_needs_hook_queue(state, inputs, count, synth_flags)) {
         size_t expanded_count = 0u;
 
-        if (!ksi_synthetic_hook_batch_count(payload->inputs, payload->count,
+        if (!ksi_synthetic_hook_batch_count(inputs, count,
                 KSI_MAX_SYNTH_HOOK_ACTIONS, &expanded_count)) {
             send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_EXPANDED_INPUT_LIMIT);
+                KSI_STATUS_RESOURCE_EXHAUSTED,
+                KSI_DETAIL_EXPANDED_INPUT_LIMIT);
             return;
         }
 
@@ -864,42 +863,43 @@ static void handle_synthesize_input(
             state, NULL, NULL);
 
         if (completion == NULL) {
-            send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, -1,
-                KSI_DETAIL_RESOURCE_EXHAUSTED);
+            send_status(client->fd, message->header,
+                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             return;
         }
 
         if (!synthetic_hook_queue_push(
                 &state->synthetic_hook_queue,
-                payload->inputs,
-                payload->count,
+                inputs,
+                count,
                 expanded_count,
                 monotonic_ns(),
                 completion,
                 input_generation)) {
-            synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+            synth_completion_fail(completion,
+                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             send_status(client->fd, message->header,
-                KSI_MESSAGE_SYNTHESIS_RESULT, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             return;
         }
 
-        send_status(client->fd, message->header,
-            KSI_MESSAGE_SYNTHESIS_RESULT, 0, 0u);
+        send_status(client->fd, message->header, KSI_STATUS_OK,
+            KSI_DETAIL_NONE);
         return;
     } else {
         if (!output_queue_push_synth(&state->output_queue,
-                payload->inputs, payload->count, synth_flags,
+                inputs, count, synth_flags,
                 input_generation)) {
-            send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, -1,
-                KSI_DETAIL_RESOURCE_EXHAUSTED);
+            send_status(client->fd, message->header,
+                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             return;
         }
     }
 
-    send_status(client->fd, message->header, KSI_MESSAGE_SYNTHESIS_RESULT, 0, 0);
+    send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
 }
 
-static void handle_binary_message(
+static bool handle_binary_message(
     const ksi_platform_backend *backend,
     ksi_daemon_state *state,
     ksi_client *client,
@@ -909,69 +909,84 @@ static void handle_binary_message(
     client->last_activity_ms = monotonic_ms();
 
     if (g_verbose) {
-        printf("client %d binary type=%u size=%u correlation=%llu\n",
+        printf("client %d opcode=%u size=%u request=%llu flags=0x%04x\n",
             client->fd,
-            message->header->type,
-            message->header->size,
-            (unsigned long long)message->header->correlation_id);
+            message->header->opcode,
+            message->header->payload_length,
+            (unsigned long long)message->header->request_id,
+            message->header->flags);
     }
 
-    switch (message->header->type) {
-        case KSI_MESSAGE_CLIENT_HELLO:
-            handle_client_hello(state, client, message);
-            return;
-        case KSI_MESSAGE_HEARTBEAT:
-            renew_client_lease(client);
+    if ((message->header->flags & KSI_FRAME_FLAG_EVENT) != 0u) {
+        return false;
+    }
+    if ((message->header->flags & KSI_FRAME_FLAG_RESPONSE) != 0u) {
+        return message->header->flags == KSI_FRAME_FLAG_RESPONSE
+            && message->header->opcode == KSI_OPCODE_HOOK_EVENT
+            && client->hello_complete
+            && handle_hook_decision(state, client, message);
+    }
+    if (!client->hello_complete && message->header->opcode != KSI_OPCODE_HELLO) {
+        return false;
+    }
 
-            /* The protocol permits one-way lease heartbeats on hook-reader
-             * connections. Correlation zero deliberately has no response. */
-            if (message->header->correlation_id != 0u) {
-                send_status(client->fd, message->header, KSI_MESSAGE_HEARTBEAT, 0, 0);
+    switch (message->header->opcode) {
+        case KSI_OPCODE_HELLO:
+            handle_client_hello(state, client, message);
+            return true;
+        case KSI_OPCODE_AUTHORIZE:
+            handle_authorize(state, client, message);
+            return true;
+        case KSI_OPCODE_PING:
+            if (message->payload_size != 0u) {
+                send_status(client->fd, message->header,
+                    KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE);
+                return true;
             }
-            return;
-        case KSI_MESSAGE_EMERGENCY_PASSTHROUGH:
-            handle_emergency_passthrough(state, client, message);
-            return;
-        case KSI_MESSAGE_SET_BLOCK_INPUT:
+            renew_client_lease(client);
+            if (message->header->request_id != 0u) {
+                send_status(client->fd, message->header, KSI_STATUS_OK,
+                    KSI_DETAIL_NONE);
+            }
+            return true;
+        case KSI_OPCODE_SET_BLOCK_INPUT:
             handle_set_block_input(state, client, message);
-            return;
-        case KSI_MESSAGE_GET_INDICATOR_STATE:
+            return true;
+        case KSI_OPCODE_GET_INDICATOR_STATE:
             handle_get_indicator_state(state, client, message);
-            return;
-        case KSI_MESSAGE_GET_POINTER_POSITION:
+            return true;
+        case KSI_OPCODE_GET_POINTER_POSITION:
             handle_get_pointer_position(state, client, message);
-            return;
-        case KSI_MESSAGE_GET_POINTER_BUTTONS:
+            return true;
+        case KSI_OPCODE_GET_POINTER_BUTTONS:
             handle_get_pointer_buttons(state, client, message);
-            return;
-        case KSI_MESSAGE_GET_KEY_STATE:
+            return true;
+        case KSI_OPCODE_GET_KEY_STATE:
             handle_get_key_state(state, client, message);
-            return;
-        case KSI_MESSAGE_IDLE_TIME:
+            return true;
+        case KSI_OPCODE_GET_IDLE_TIME:
             handle_idle_time(backend, state, client, message);
-            return;
-        case KSI_MESSAGE_MODIFIER_STATE:
+            return true;
+        case KSI_OPCODE_GET_MODIFIER_STATE:
             handle_get_modifier_state(state, client, message);
-            return;
-        case KSI_MESSAGE_LIST_PERMISSIONS:
+            return true;
+        case KSI_OPCODE_PERMISSIONS_LIST:
             handle_list_permissions(state, client, message);
-            return;
-        case KSI_MESSAGE_REVOKE_PERMISSIONS:
+            return true;
+        case KSI_OPCODE_PERMISSIONS_REVOKE:
             handle_revoke_permissions(state, client, message);
-            return;
-        case KSI_MESSAGE_SUBSCRIBE_HOOK:
-        case KSI_MESSAGE_UNSUBSCRIBE_HOOK:
+            return true;
+        case KSI_OPCODE_SUBSCRIBE_HOOK:
+        case KSI_OPCODE_UNSUBSCRIBE_HOOK:
             handle_hook_subscription(state, client, message);
-            return;
-        case KSI_MESSAGE_HOOK_DECISION:
-            handle_hook_decision(state, client, message);
-            return;
-        case KSI_MESSAGE_SYNTHESIZE_INPUT:
+            return true;
+        case KSI_OPCODE_SYNTHESIZE_INPUT:
             handle_synthesize_input(state, client, message);
-            return;
+            return true;
         default:
-            send_status(client->fd, message->header, message->header->type, -1, 404);
-            return;
+            send_status(client->fd, message->header, KSI_STATUS_UNSUPPORTED,
+                KSI_DETAIL_UNKNOWN_OPERATION);
+            return true;
     }
 }
 
@@ -979,14 +994,14 @@ static bool process_client_buffer_direct(ksi_daemon_state *state, ksi_client *cl
 {
     size_t offset = 0u;
 
-    while (client->rx_used - offset >= sizeof(ksi_message_header)) {
+    while (client->rx_used - offset >= KSI_FRAME_HEADER_SIZE) {
         ksi_message_header header;
         ksi_binary_message_view message;
+        size_t frame_size;
 
-        memcpy(&header, client->rx_buffer + offset, sizeof(header));
-
-        if (header.size < sizeof(header) || header.size > KSI_MAX_MESSAGE_SIZE) {
-            fprintf(stderr, "client %d sent invalid frame size %u\n", client->fd, header.size);
+        if (!ksi_frame_header_decode(client->rx_buffer + offset, &header)
+            || !ksi_protocol_frame_is_valid(&header)) {
+            fprintf(stderr, "client %d sent an invalid frame header\n", client->fd);
             return false;
         }
 
@@ -1005,26 +1020,18 @@ static bool process_client_buffer_direct(ksi_daemon_state *state, ksi_client *cl
             return false;
         }
 
-        if (!client->protocol_version_seen) {
-            client->protocol_minor = header.minor;
-            client->protocol_version_seen = true;
-            hook_send_ref_set_protocol_minor(client->hook_send_ref, header.minor);
-        } else if (header.minor != client->protocol_minor) {
-            fprintf(stderr,
-                "client %d changed negotiated protocol minor from %u to %u\n",
-                client->fd, client->protocol_minor, header.minor);
-            return false;
-        }
-
-        if (client->rx_used - offset < header.size) {
+        frame_size = KSI_FRAME_HEADER_SIZE + (size_t)header.payload_length;
+        if (client->rx_used - offset < frame_size) {
             break;
         }
 
-        message.header = (const ksi_message_header *)(const void *)(client->rx_buffer + offset);
-        message.payload = client->rx_buffer + offset + sizeof(header);
-        message.payload_size = header.size - sizeof(header);
-        handle_binary_message(state->backend, state, client, &message);
-        offset += header.size;
+        message.header = &header;
+        message.payload = client->rx_buffer + offset + KSI_FRAME_HEADER_SIZE;
+        message.payload_size = header.payload_length;
+        if (!handle_binary_message(state->backend, state, client, &message)) {
+            return false;
+        }
+        offset += frame_size;
     }
 
     if (offset > 0u) {
@@ -1085,6 +1092,7 @@ static int read_client_frames_direct(ksi_daemon_state *state, ksi_client *client
 static void send_indicator_state_result(int client_fd, const ksi_message_header *request)
 {
     ksi_indicator_state_payload result;
+    uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_INDICATOR_STATE_PAYLOAD_SIZE];
     bool caps = false;
     bool num = false;
     bool scroll = false;
@@ -1096,13 +1104,12 @@ static void send_indicator_state_result(int client_fd, const ksi_message_header 
     result.num_lock = num ? 1u : 0u;
     result.scroll_lock = scroll ? 1u : 0u;
 
-    (void)ipc_send_locked(
-        client_fd,
-        KSI_MESSAGE_INDICATOR_STATE_RESULT,
-        request->client_id,
-        request->correlation_id,
-        &result,
-        sizeof(result));
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    (void)ksi_protocol_encode_indicator_state(
+        response + KSI_STATUS_PAYLOAD_SIZE, &result);
+    (void)ipc_send_locked(client_fd, request->opcode,
+        KSI_FRAME_FLAG_RESPONSE, request->request_id,
+        response, sizeof(response));
 }
 
 static void handle_get_key_state(
@@ -1111,12 +1118,18 @@ static void handle_get_key_state(
     const ksi_binary_message_view *message)
 {
     ksi_key_state_payload result;
+    uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_KEY_STATE_PAYLOAD_SIZE];
     bool caps = false, num = false, scroll = false;
 
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
     if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated
-        || (client->granted_capabilities & KSI_CAP_HOOK_KEYBOARD) == 0) {
-        send_status(client->fd, message->header, KSI_MESSAGE_KEY_STATE_RESULT, -1, 403);
+        || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
@@ -1135,13 +1148,12 @@ static void handle_get_key_state(
     result.num_lock    = num    ? 1u : 0u;
     result.scroll_lock = scroll ? 1u : 0u;
 
-    (void)ipc_send_locked(
-        client->fd,
-        KSI_MESSAGE_KEY_STATE_RESULT,
-        message->header->client_id,
-        message->header->correlation_id,
-        &result,
-        sizeof(result));
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    (void)ksi_protocol_encode_key_state(
+        response + KSI_STATUS_PAYLOAD_SIZE, &result);
+    (void)ipc_send_locked(client->fd, message->header->opcode,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, sizeof(response));
 }
 
 static void handle_get_modifier_state(
@@ -1150,56 +1162,60 @@ static void handle_get_modifier_state(
     const ksi_binary_message_view *message)
 {
     ksi_modifier_state_payload result;
+    uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_MODIFIER_STATE_PAYLOAD_SIZE];
 
-    if (!input_owner_matches_uid(state, client->uid)
-        || !client->authenticated || message->payload_size != 0u) {
-        send_status(client->fd, message->header,
-            KSI_MESSAGE_MODIFIER_STATE, -1, 403);
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
+            KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED,
+            KSI_DETAIL_NONE);
         return;
     }
 
     ksi_linux_devices_refresh_indicator_state();
     memset(&result, 0, sizeof(result));
     (void)ksi_linux_devices_get_modifier_state(&result);
-    (void)ipc_send_locked(
-        client->fd,
-        KSI_MESSAGE_MODIFIER_STATE,
-        message->header->client_id,
-        message->header->correlation_id,
-        &result,
-        sizeof(result));
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    (void)ksi_protocol_encode_modifier_state(
+        response + KSI_STATUS_PAYLOAD_SIZE, &result);
+    (void)ipc_send_locked(client->fd, message->header->opcode,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, sizeof(response));
 }
 
 static void send_pointer_position_result(int client_fd, const ksi_message_header *request)
 {
     ksi_pointer_position_payload result;
+    uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_POINTER_POSITION_PAYLOAD_SIZE];
 
     memset(&result, 0, sizeof(result));
     (void)ksi_linux_devices_get_pointer_position(&result);
 
-    (void)ipc_send_locked(
-        client_fd,
-        KSI_MESSAGE_POINTER_POSITION_RESULT,
-        request->client_id,
-        request->correlation_id,
-        &result,
-        sizeof(result));
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    (void)ksi_protocol_encode_pointer_position(
+        response + KSI_STATUS_PAYLOAD_SIZE, &result);
+    (void)ipc_send_locked(client_fd, request->opcode,
+        KSI_FRAME_FLAG_RESPONSE, request->request_id,
+        response, sizeof(response));
 }
 
 static void send_pointer_buttons_result(int client_fd, const ksi_message_header *request)
 {
     ksi_pointer_buttons_payload result;
+    uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_POINTER_BUTTONS_PAYLOAD_SIZE];
 
     memset(&result, 0, sizeof(result));
     (void)ksi_linux_devices_get_pointer_buttons(&result);
 
-    (void)ipc_send_locked(
-        client_fd,
-        KSI_MESSAGE_POINTER_BUTTONS_RESULT,
-        request->client_id,
-        request->correlation_id,
-        &result,
-        sizeof(result));
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    (void)ksi_protocol_encode_pointer_buttons(
+        response + KSI_STATUS_PAYLOAD_SIZE, &result);
+    (void)ipc_send_locked(client_fd, request->opcode,
+        KSI_FRAME_FLAG_RESPONSE, request->request_id,
+        response, sizeof(response));
 }
 
 static ssize_t find_client_index_by_fd(const ksi_daemon_state *state, int client_fd)
@@ -1259,7 +1275,7 @@ static void add_client(
 
         if (same_uid >= KSI_MAX_CLIENTS_PER_UID) {
             fprintf(stderr,
-                "inputd: rejecting client fd=%d uid=%ld: per-uid connection limit (%u) reached\n",
+                "keysharp-input: rejecting client fd=%d uid=%ld: per-uid connection limit (%u) reached\n",
                 client_fd, (long)credentials->uid, (unsigned)KSI_MAX_CLIENTS_PER_UID);
             ksi_ipc_close_client(client_fd);
             return;
@@ -1279,7 +1295,7 @@ static void add_client(
     client->hook_send_ref = hook_send_ref_create(client_fd);
 
     if (client->hook_send_ref == NULL) {
-        fprintf(stderr, "inputd: failed to create hook send handle for client fd=%d: %s\n",
+        fprintf(stderr, "keysharp-input: failed to create hook send handle for client fd=%d: %s\n",
             client_fd, strerror(errno));
         free(client->rx_buffer);
         client->rx_buffer = NULL;
@@ -1296,14 +1312,12 @@ static void add_client(
     client->pid = credentials->pid;
     client->uid = credentials->uid;
     client->gid = credentials->gid;
-    /* Snapshot the process start time now; the identity worker re-reads it later
-     * and process_client_identified rejects the identity if it changed (pid
-     * recycled between accept and the /proc read). */
-    client->accept_start_time = ksi_auth_get_process_start_time(credentials->pid);
+    if (ksp_process_start_time(credentials->pid, &client->start_time) != 0) {
+        client->start_time = 0u;
+    }
     client->state = KSI_CLIENT_STATE_READY;
     client->connected_at_ms = monotonic_ms();
     client->last_activity_ms = client->connected_at_ms;
-    client->hello_seen = false;
     state->client_count++;
 
     if (g_verbose) {
@@ -1343,7 +1357,7 @@ static bool ensure_active_client_slot(ksi_daemon_state *state)
     for (nfds_t i = 0u; i < state->client_count; i++) {
         if (!input_owner_matches_uid(state, state->clients[i].uid)) {
             fprintf(stderr,
-                "inputd: evicting oldest inactive client fd=%d uid=%ld "
+                "keysharp-input: evicting oldest inactive client fd=%d uid=%ld "
                 "to admit active seat0 user\n",
                 state->clients[i].fd, (long)state->clients[i].uid);
             remove_client(state, i);
@@ -1391,7 +1405,7 @@ static bool accept_client(ksi_daemon_state *state, ksi_ipc_server *server, bool 
 
     if (!ensure_active_client_slot(state)) {
         fprintf(stderr,
-            "inputd: rejecting active client pid=%ld uid=%ld: global connection limit reached\n",
+            "keysharp-input: rejecting active client pid=%ld uid=%ld: global connection limit reached\n",
             (long)credentials.pid, (long)credentials.uid);
         ksi_ipc_close_client(client_fd);
         return true;

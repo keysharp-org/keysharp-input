@@ -1,23 +1,26 @@
+#define KSI_POLKIT_TIMEOUT_SECONDS 120u
+
+_Static_assert(KSI_POLKIT_TIMEOUT_SECONDS > 0u
+        && KSI_POLKIT_TIMEOUT_SECONDS <= 3600u,
+    "polkit timeout must satisfy the shared permission contract");
+
 typedef struct ksi_identify_task {
     ksi_daemon_command_queue *commands;
     pid_t pid;
+    uid_t uid;
+    uint64_t start_time;
     int client_fd;
     uint64_t connection_id;
 } ksi_identify_task;
 
 typedef struct ksi_prompt_task {
     ksi_daemon_command_queue *commands;
-    ksi_auth_store *permissions;
+    ksp_store *permissions;
     int client_fd;
     uint64_t connection_id;
-    uint32_t requested_capabilities;
+    uint32_t requested_scopes;
     uint32_t missing_scopes;
-    uint32_t available_capabilities_at_start;
-    char exe_path[KSI_AUTH_MAX_PATH];
-    char exe_hash[KSI_AUTH_HASH_HEX_LENGTH + 1u];
-    pid_t pid;
-    uid_t uid;
-    uint64_t start_time;
+    ksp_identity identity;
 } ksi_prompt_task;
 
 static void *identify_worker(void *arg)
@@ -29,11 +32,16 @@ static void *identify_worker(void *arg)
     result = calloc(1, sizeof(*result));
 
     if (result != NULL) {
-        result->has_identity = ksi_auth_identify_process(
-            task->pid,
-            result->exe_path, sizeof(result->exe_path),
-            result->exe_hash) == 0;
-        result->start_time = ksi_auth_get_process_start_time(task->pid);
+        ksp_identity identity;
+        result->has_identity = ksp_identity_identify(
+            task->pid, task->uid, task->start_time, &identity) == 0;
+        if (result->has_identity) {
+            (void)snprintf(result->exe_path, sizeof(result->exe_path),
+                "%s", identity.executable);
+            (void)snprintf(result->exe_hash, sizeof(result->exe_hash),
+                "%s", identity.hash);
+            result->start_time = identity.start_time;
+        }
     }
 
     memset(&command, 0, sizeof(command));
@@ -53,6 +61,8 @@ static void *identify_worker(void *arg)
 static bool start_identify_task(
     ksi_daemon_command_queue *commands,
     pid_t pid,
+    uid_t uid,
+    uint64_t start_time,
     int client_fd,
     uint64_t connection_id)
 {
@@ -65,6 +75,8 @@ static bool start_identify_task(
 
     task->commands = commands;
     task->pid = pid;
+    task->uid = uid;
+    task->start_time = start_time;
     task->client_fd = client_fd;
     task->connection_id = connection_id;
 
@@ -90,35 +102,43 @@ static void *prompt_worker(void *arg)
     command.client_fd = task->client_fd;
     command.connection_id = task->connection_id;
     command.data.prompt_done.prompt_lock_fd = -1;
-    prompt_lock_fd = ksi_auth_prompt_lock_acquire(
-        task->permissions, task->uid, task->exe_hash);
+    prompt_lock_fd = ksp_prompt_lock_acquire(
+        task->permissions, task->identity.uid, task->identity.hash,
+        permissions_cancelled, NULL);
 
     if (prompt_lock_fd < 0) {
-        command.data.prompt_done.decision = KSI_AUTH_UNAVAILABLE;
+        command.data.prompt_done.decision = KSP_POLKIT_UNAVAILABLE;
     } else {
         command.data.prompt_done.prompt_lock_fd = prompt_lock_fd;
         command.data.prompt_done.prompt_lock_held = true;
-        if (ksi_auth_store_get_allowed_at_generation(
-                task->permissions, task->uid, task->exe_hash,
-                &allowed, &generation) != 0) {
-            command.data.prompt_done.decision = KSI_AUTH_UNAVAILABLE;
+        if (ksp_store_check_at_generation(
+                task->permissions, task->identity.uid, task->identity.hash,
+                task->missing_scopes, &allowed, &generation) != 0) {
+            command.data.prompt_done.decision = KSP_POLKIT_UNAVAILABLE;
         } else {
             missing &= ~allowed;
             command.data.prompt_done.decision = missing == 0u
-                ? KSI_AUTH_GRANTED
-                : ksi_auth_request_polkit(
-                    task->pid, task->uid, task->start_time,
-                    task->exe_path, task->exe_hash, missing);
+                ? KSP_POLKIT_GRANTED
+                : ksp_polkit_authorize(
+                    &(ksp_polkit_config) {
+                        .pkcheck_path = KSI_PKCHECK_PATH,
+                        .action_id = "org.keysharp.input.grant",
+                        .scope_detail_key = "input.permissions",
+                        .scope_names_detail_key = "input.permission-names",
+                        .allowed_scopes = KSP_SCOPE_INPUT_MONITORING
+                            | KSP_SCOPE_INPUT_CONTROL,
+                        .timeout_seconds = KSI_POLKIT_TIMEOUT_SECONDS,
+                    },
+                    &task->identity, missing, permissions_cancelled, NULL);
         }
     }
-    command.data.prompt_done.requested_capabilities = task->requested_capabilities;
+    command.data.prompt_done.requested_scopes = task->requested_scopes;
     command.data.prompt_done.missing_scopes = missing;
     command.data.prompt_done.store_generation = generation;
-    command.data.prompt_done.available_capabilities_at_start = task->available_capabilities_at_start;
 
     if (!ksi_pipe_ring_push(&task->commands->ring, &command)
         && command.data.prompt_done.prompt_lock_held) {
-        close(command.data.prompt_done.prompt_lock_fd);
+        ksp_prompt_lock_release(command.data.prompt_done.prompt_lock_fd);
     }
     free(task);
     return NULL;
@@ -126,12 +146,11 @@ static void *prompt_worker(void *arg)
 
 static bool start_prompt_task(
     ksi_daemon_command_queue *commands,
-    ksi_auth_store *permissions,
+    ksp_store *permissions,
     int client_fd,
     uint64_t connection_id,
     uint32_t requested,
     uint32_t missing,
-    uint32_t available_capabilities_at_start,
     const char *exe_path,
     const char *exe_hash,
     pid_t pid,
@@ -149,14 +168,17 @@ static bool start_prompt_task(
     task->permissions = permissions;
     task->client_fd = client_fd;
     task->connection_id = connection_id;
-    task->requested_capabilities = requested;
+    task->requested_scopes = requested;
     task->missing_scopes = missing;
-    task->available_capabilities_at_start = available_capabilities_at_start;
-    (void)snprintf(task->exe_path, sizeof(task->exe_path), "%s", exe_path != NULL ? exe_path : "");
-    (void)snprintf(task->exe_hash, sizeof(task->exe_hash), "%s", exe_hash != NULL ? exe_hash : "");
-    task->pid = pid;
-    task->uid = uid;
-    task->start_time = start_time;
+    memset(&task->identity, 0, sizeof(task->identity));
+    task->identity.pid = pid;
+    task->identity.uid = uid;
+    task->identity.start_time = start_time;
+    (void)snprintf(task->identity.executable,
+        sizeof(task->identity.executable), "%s",
+        exe_path != NULL ? exe_path : "");
+    (void)snprintf(task->identity.hash, sizeof(task->identity.hash), "%s",
+        exe_hash != NULL ? exe_hash : "");
 
     if (!ksi_worker_pool_submit(&g_worker_pool, prompt_worker, free, task)) {
         free(task);

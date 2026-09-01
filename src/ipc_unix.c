@@ -1,4 +1,5 @@
-#include "keysharp_inputd/ipc.h"
+#include "internal/ipc.h"
+#include "protocol_codec.h"
 #include "util.h"
 
 #include <errno.h>
@@ -26,7 +27,7 @@ struct ksi_ipc_server {
  * can never strand a stale lock across a crash) to stop a second instance
  * from silently stealing this instance's socket path out from under it: the
  * old unlink()+bind() sequence below has no "am I alone" check at all, so a
- * manually-launched second `keysharp-inputd --foreground`/`--socket ...`
+ * manually launched second `keysharp-input daemon --foreground --socket ...`
  * hitting the same path would unlink the live listener's directory entry and
  * bind its own -- the first instance keeps running and accepting on its
  * already-open fd, but new connections silently go to the second instance,
@@ -61,7 +62,7 @@ static int acquire_single_instance_lock(const char *socket_path)
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
             fprintf(stderr,
-                "another keysharp-inputd instance already holds %s; refusing to start "
+                "another keysharp-input instance already holds %s; refusing to start "
                 "(starting anyway would silently steal the live socket at %s out from "
                 "under the running instance)\n",
                 lock_path, socket_path);
@@ -151,15 +152,13 @@ int ksi_ipc_server_open(const char *socket_path, ksi_ipc_server **server)
     /* lock_result == -1: best-effort skip, proceed without a lock (see
      * acquire_single_instance_lock's comment). */
 
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 
     if (fd < 0) {
         fprintf(stderr, "failed to create IPC socket: %s\n", strerror(errno));
         abandon_ipc_server(created, -1, socket_path, false);
         return -1;
     }
-
-    set_cloexec(fd);
 
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
@@ -181,12 +180,6 @@ int ksi_ipc_server_open(const char *socket_path, ksi_ipc_server **server)
 
     if (listen(fd, 64) != 0) {
         fprintf(stderr, "failed to listen on IPC socket %s: %s\n", socket_path, strerror(errno));
-        abandon_ipc_server(created, fd, socket_path, true);
-        return -1;
-    }
-
-    if (set_nonblock(fd) != 0) {
-        fprintf(stderr, "failed to set IPC server non-blocking: %s\n", strerror(errno));
         abandon_ipc_server(created, fd, socket_path, true);
         return -1;
     }
@@ -227,9 +220,7 @@ int ksi_ipc_server_from_fd(int fd, ksi_ipc_server **server)
      * (calloc's zero-init), or ksi_ipc_server_close() would later close fd 0. */
     created->lock_fd = -1;
 
-    set_cloexec(fd);
-
-    if (set_nonblock(fd) != 0) {
+    if (set_cloexec(fd) != 0 || set_nonblock(fd) != 0) {
         free(created);
         return -1;
     }
@@ -276,21 +267,13 @@ int ksi_ipc_accept_client(ksi_ipc_server *server)
         return -1;
     }
 
-    client_fd = accept(server->fd, NULL, NULL);
+    client_fd = accept4(server->fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
 
     if (client_fd < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             fprintf(stderr, "failed to accept IPC client: %s\n", strerror(errno));
         }
 
-        return -1;
-    }
-
-    set_cloexec(client_fd);
-
-    if (set_nonblock(client_fd) != 0) {
-        fprintf(stderr, "failed to set IPC client non-blocking: %s\n", strerror(errno));
-        close(client_fd);
         return -1;
     }
 
@@ -467,61 +450,75 @@ static int write_exact(int fd, const void *buffer, size_t length)
 
 int ksi_ipc_read_framed_message(int client_fd, uint8_t *buffer, size_t buffer_size, size_t *message_size)
 {
+    uint8_t wire_header[KSI_FRAME_HEADER_SIZE];
     ksi_message_header header;
+    size_t frame_size;
     int read_result;
 
-    if (buffer == NULL || message_size == NULL || buffer_size < sizeof(header)) {
+    if (buffer == NULL || message_size == NULL
+        || buffer_size < KSI_FRAME_HEADER_SIZE) {
         return -1;
     }
 
-    read_result = read_exact(client_fd, &header, sizeof(header));
+    read_result = read_exact(client_fd, wire_header, sizeof(wire_header));
 
     if (read_result <= 0) {
         return read_result;
     }
 
-    if (header.size < sizeof(header)
-        || header.size > KSI_MAX_MESSAGE_SIZE
-        || header.size > buffer_size) {
-        fprintf(stderr, "invalid IPC frame size: %u\n", header.size);
+    if (!ksi_frame_header_decode(wire_header, &header)
+        || !ksi_protocol_frame_is_valid(&header)) {
+        fprintf(stderr, "invalid IPC frame header\n");
         return -1;
     }
 
-    memcpy(buffer, &header, sizeof(header));
-    read_result = read_exact(client_fd, buffer + sizeof(header), header.size - sizeof(header));
+    frame_size = KSI_FRAME_HEADER_SIZE + (size_t)header.payload_length;
+    if (frame_size > buffer_size) {
+        fprintf(stderr, "IPC frame exceeds receive buffer\n");
+        return -1;
+    }
+
+    memcpy(buffer, wire_header, sizeof(wire_header));
+    read_result = read_exact(client_fd, buffer + KSI_FRAME_HEADER_SIZE,
+        header.payload_length);
 
     if (read_result <= 0) {
         return read_result;
     }
 
-    *message_size = header.size;
+    *message_size = frame_size;
     return 1;
 }
 
 int ksi_ipc_send_framed_message(
     int client_fd,
-    uint16_t protocol_minor,
-    uint32_t message_type,
-    uint32_t client_id,
-    uint64_t correlation_id,
+    uint16_t opcode,
+    uint16_t flags,
+    uint64_t request_id,
     const void *payload,
     size_t payload_size)
 {
+    uint8_t wire_header[KSI_FRAME_HEADER_SIZE];
     ksi_message_header header;
 
-    if (payload_size > KSI_MAX_MESSAGE_SIZE - sizeof(header)) {
+    if (payload_size > KSI_MAX_PAYLOAD_SIZE) {
         return -1;
     }
 
     memset(&header, 0, sizeof(header));
-    header.size = (uint32_t)(sizeof(header) + payload_size);
     header.major = KSI_PROTOCOL_MAJOR;
-    header.minor = protocol_minor;
-    header.type = message_type;
-    header.client_id = client_id;
-    header.correlation_id = correlation_id;
+    header.minor = KSI_PROTOCOL_MINOR;
+    header.opcode = opcode;
+    header.flags = flags;
+    header.payload_length = (uint32_t)payload_size;
+    header.request_id = request_id;
 
-    if (write_exact(client_fd, &header, sizeof(header)) != 0) {
+    if (!ksi_protocol_frame_is_valid(&header)) {
+        return -1;
+    }
+    ksi_frame_header_encode(wire_header, &header);
+
+    if (write_exact(client_fd, wire_header, sizeof(wire_header)) != 0) {
         return -1;
     }
 

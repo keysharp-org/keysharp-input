@@ -1,5 +1,5 @@
-#include "keysharp_inputd/daemon.h"
-#include "keysharp_inputd/protocol.h"
+#include "internal/daemon.h"
+#include "keysharp_input/client.h"
 #include "owned_text_file.h"
 
 int permissions_cli_main(int argc, char **argv);
@@ -15,8 +15,8 @@ int permissions_cli_main(int argc, char **argv);
 
 bool g_verbose = false;
 
-#define KSI_DEFAULT_SOCKET_DIR_NAME "keysharp"
-#define KSI_DEFAULT_SOCKET_NAME "keysharp-inputd.sock"
+#define KSI_DEFAULT_SOCKET_DIR_NAME "keysharp-input"
+#define KSI_DEFAULT_SOCKET_NAME "keysharp-input.sock"
 #define KSI_SOCKET_PATH_LENGTH 256
 
 #define KSI_SETUP_FILE_ERROR 1
@@ -88,10 +88,11 @@ static int run_trusted_program(const char *path, char *const argv[])
 
 /* Shared by install/remove so the two paths always agree on the file to manage.
  * Numbered 70- so it lexically precedes systemd's 73-seat-late.rules, which runs
- * the uaccess builtin — a tag added after that rule would have no effect. */
-#define KSI_UACCESS_RULES_PATH "/etc/udev/rules.d/70-keysharp-inputd-uaccess.rules"
-#define KSI_PACKAGED_UACCESS_RULES_PATH "/usr/lib/udev/rules.d/70-keysharp-inputd-uaccess.rules"
-#define KSI_LEGACY_UACCESS_RULES_PATH "/etc/udev/rules.d/99-keysharp-inputd.rules"
+ * the uaccess builtin; a tag added after that rule would have no effect. */
+#define KSI_UACCESS_RULES_PATH "/etc/udev/rules.d/70-keysharp-input-uaccess.rules"
+#define KSI_PACKAGED_UACCESS_RULES_PATH "/usr/lib/udev/rules.d/70-keysharp-input-uaccess.rules"
+/* Remove this exact known unsafe rule only when its contents also match. */
+#define KSI_LEGACY_INSECURE_UACCESS_RULES_PATH "/etc/udev/rules.d/99-keysharp-inputd.rules"
 
 /* uinput module auto-load config written by --install-input-access. Shared with
  * --remove-input-access so removal cleans up exactly what install created and the
@@ -157,37 +158,26 @@ static int build_default_socket_path(char *buffer, size_t buffer_size)
 
 static void print_usage(const char *argv0)
 {
-	fprintf(stderr,
-		"Usage: %s [--foreground] [--socket PATH] [--system-service] [--verbose] [--install-input-access] [--remove-input-access] [--version|--info]\n"
-		"       %s permissions <list|revoke> [options]\n"
-		"\n"
-		"Daemon options:\n"
-		"  --foreground   Run in the foreground. This is currently the default.\n"
-		"  --socket PATH  Unix domain socket path. Default: $XDG_RUNTIME_DIR/keysharp/keysharp-inputd.sock\n"
-		"  --system-service\n"
-		"                Use the systemd-activated socket passed as fd 3. Must be run by the system unit.\n"
-		"  --verbose      Enable per-event debug logging.\n"
-		"  --install-input-access\n"
-		"                Load uinput, install the uaccess udev rule for the virtual devices, and\n"
-		"                (re)enable the installed system service. Must be run as root.\n"
-		"  --remove-input-access\n"
-		"                Remove the uaccess udev rule and reload udev. Must be run as root.\n"
-		"  --version      Print product and protocol versions.\n"
-		"  --info         Print stable machine-readable component metadata.\n"
-		"\n"
-		"Permissions subcommand: run '%s permissions --help' for details.\n",
-		argv0, argv0, argv0);
+	printf(
+		"Usage: %s <command> [options]\n\n"
+		"Commands:\n"
+		"  version                 Print the product version.\n"
+		"  info                    Print static machine-readable metadata.\n"
+		"  probe [--socket PATH]   Check a running service.\n"
+		"  daemon [options]        Run or configure the service.\n"
+		"  permissions <command>   List or revoke permission grants.\n",
+		argv0);
 }
 
 /* Body of the uaccess udev rule written by --install-input-access.
- * keysharp-inputd grabs physical devices and re-emits passed events through its
+ * The broker grabs physical devices and re-emits passed events through its
  * uinput devices, so the active session's X/Wayland consumer needs read access
  * to those virtual event nodes. Matching their unique names avoids granting
  * access to unrelated input devices or keyd devices which share the vendor id.
  * ATTRS{} finds the parent input-device name while the tag remains on the event
  * node consumed by the uaccess builtin. */
 static const char KSI_UACCESS_RULES_CONTENTS[] =
-	"# Grants the active-session user an ACL on keysharp-inputd virtual devices.\n"
+	"# Grants the active-session user an ACL on the broker's virtual devices.\n"
 	"# Replayed events are then readable by the session's X/Wayland consumer.\n"
 	"ACTION!=\"add|change\", GOTO=\"keysharp_uaccess_end\"\n"
 	"SUBSYSTEM!=\"input\", GOTO=\"keysharp_uaccess_end\"\n"
@@ -197,7 +187,7 @@ static const char KSI_UACCESS_RULES_CONTENTS[] =
 	"\n"
 	"LABEL=\"keysharp_uaccess_end\"\n";
 
-static const char KSI_LEGACY_UACCESS_RULES_CONTENTS[] =
+static const char KSI_INSECURE_UACCESS_RULES_CONTENTS[] =
 	"KERNEL==\"event*\", SUBSYSTEM==\"input\", GROUP=\"input\", MODE=\"0660\"\n"
 	"KERNEL==\"uinput\", SUBSYSTEM==\"misc\", GROUP=\"input\", MODE=\"0660\", OPTIONS+=\"static_node=uinput\"\n";
 
@@ -280,10 +270,10 @@ static int install_input_access(void)
 		}
 	}
 
-	if (remove_owned_text_file(KSI_LEGACY_UACCESS_RULES_PATH,
-		KSI_LEGACY_UACCESS_RULES_CONTENTS) != 0) {
-		fprintf(stderr, "warning: failed to remove legacy rule %s: %s\n",
-			KSI_LEGACY_UACCESS_RULES_PATH, strerror(errno));
+	if (remove_owned_text_file(KSI_LEGACY_INSECURE_UACCESS_RULES_PATH,
+		KSI_INSECURE_UACCESS_RULES_CONTENTS) != 0) {
+		fprintf(stderr, "warning: failed to remove unsafe rule %s: %s\n",
+			KSI_LEGACY_INSECURE_UACCESS_RULES_PATH, strerror(errno));
 		status |= KSI_SETUP_FILE_ERROR;
 	}
 
@@ -322,7 +312,7 @@ static int install_input_access(void)
 
 	/* Replace any stale daemon: reload unit definitions, stop both halves of the
 	 * socket-activated service, then enable only the service and start it.  The
-	 * service's Requires= dependency starts keysharp-inputd.socket, so enabling
+	 * service's Requires= dependency starts the socket, so enabling
 	 * the socket separately only creates a redundant second boot symlink; it does
 	 * not create a second IPC endpoint.  Explicitly disabling the socket target
 	 * also cleans up that redundant symlink on upgrades from older installs.
@@ -330,7 +320,7 @@ static int install_input_access(void)
 	 * even when no client process is connected. Once started, the socket stays
 	 * available as the daemon's recovery activation path.
 	 * Tolerate systemctl being absent (e.g. non-systemd hosts): warn, do not
-	 * hard-fail — the udev/uinput setup above is still useful without it. */
+	 * hard-fail; the udev/uinput setup above is still useful without it. */
 	if (systemctl_path == NULL) {
 		/* Benign on non-systemd hosts: the udev/uinput setup above is the part
 		 * that actually fixes input access, so don't fail the whole command (and
@@ -339,13 +329,13 @@ static int install_input_access(void)
 	} else {
 		char *const reload_args[] = { "systemctl", "daemon-reload", NULL };
 		char *const stop_args[] = {
-			"systemctl", "stop", "keysharp-inputd.service", "keysharp-inputd.socket", NULL
+			"systemctl", "stop", "keysharp-input.service", "keysharp-input.socket", NULL
 		};
 		char *const disable_args[] = {
-			"systemctl", "disable", "keysharp-inputd.socket", NULL
+			"systemctl", "disable", "keysharp-input.socket", NULL
 		};
 		char *const enable_args[] = {
-			"systemctl", "enable", "--now", "keysharp-inputd.service", NULL
+			"systemctl", "enable", "--now", "keysharp-input.service", NULL
 		};
 
 		if (run_trusted_program(systemctl_path, reload_args) != 0) {
@@ -356,22 +346,22 @@ static int install_input_access(void)
 		/* Stopping inactive/absent units can exit non-zero on older systemd;
 		 * that's benign here because the service start below recreates the pair. */
 		if (run_trusted_program(systemctl_path, stop_args) != 0) {
-			fprintf(stderr, "notice: keysharp-inputd units were not running (nothing to stop)\n");
+			fprintf(stderr, "notice: keysharp-input units were not running (nothing to stop)\n");
 		}
 
 		if (run_trusted_program(systemctl_path, disable_args) != 0) {
-			fprintf(stderr, "warning: failed to remove redundant keysharp-inputd.socket boot enablement\n");
+			fprintf(stderr, "warning: failed to remove redundant keysharp-input.socket boot enablement\n");
 			status |= KSI_SETUP_LIVE_ERROR;
 		}
 
 		if (run_trusted_program(systemctl_path, enable_args) != 0) {
-			fprintf(stderr, "warning: failed to enable and start keysharp-inputd.service\n");
+			fprintf(stderr, "warning: failed to enable and start keysharp-input.service\n");
 			status |= KSI_SETUP_LIVE_ERROR;
 		}
 	}
 
 	if (status == 0) {
-		puts("keysharp-inputd input access setup complete.");
+		puts("keysharp-input input access setup complete.");
 	}
 	return status;
 }
@@ -412,7 +402,7 @@ static int remove_input_access(void)
 		}
 	}
 
-	puts("keysharp-inputd uaccess rule removed.");
+	puts("keysharp-input uaccess rule removed.");
 	return status;
 }
 
@@ -442,12 +432,85 @@ static int validate_systemd_socket_activation(void)
 	return 0;
 }
 
+static int probe_main(int argc, char **argv)
+{
+    ksi_connect_options options;
+    ksi_service_info info;
+    ksi_error error;
+    ksi_connection *connection = NULL;
+
+    ksi_connect_options_init(&options);
+    ksi_service_info_init(&info);
+    ksi_error_init(&error);
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
+            options.socket_path = argv[++i];
+        } else {
+            fprintf(stderr, "probe: unexpected argument: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    ksi_status status = ksi_connect(&options, &connection, &info, &error);
+    if (status != KSI_STATUS_OK) {
+        fprintf(stderr, "probe: %s\n",
+            error.message[0] == '\0' ? "service is unavailable" : error.message);
+        return 1;
+    }
+    printf("service_status=ready\n");
+    printf("granted_scopes=0x%08x\n", info.granted_scopes);
+    printf("available_operations=0x%016llx\n",
+        (unsigned long long)info.available_operations);
+    ksi_disconnect(connection);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    if (argc >= 2 && strcmp(argv[1], "permissions") == 0) {
+    if (argc == 1 || strcmp(argv[1], "help") == 0
+        || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        if (argc > 2) {
+            fprintf(stderr, "help: too many arguments\n");
+            return 2;
+        }
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (strcmp(argv[1], "version") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "version: no arguments are accepted\n");
+            return 2;
+        }
+        printf("%s %s\n", ksi_client_product_name(),
+            ksi_client_product_version());
+        return 0;
+    }
+    if (strcmp(argv[1], "info") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "info: no arguments are accepted\n");
+            return 2;
+        }
+		printf("product_name=%s\n", ksi_client_product_name());
+		printf("product_version=%s\n", ksi_client_product_version());
+		printf("client_abi_major=%u\n", ksi_client_abi_major());
+		printf("client_abi_minor=%u\n", ksi_client_abi_minor());
+        printf("permission_store_version=1\n");
+        printf("socket=%s\n", KSI_DEFAULT_SOCKET_PATH);
+        printf("service_scope=system\n");
+        printf("activation=systemd-socket\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "probe") == 0) {
+        return probe_main(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "permissions") == 0) {
         return permissions_cli_main(argc - 1, argv + 1);
+    }
+    if (strcmp(argv[1], "daemon") != 0) {
+        fprintf(stderr, "unknown command: %s\n", argv[1]);
+        print_usage(argv[0]);
+        return 2;
     }
 
     char default_socket_path[KSI_SOCKET_PATH_LENGTH];
@@ -457,12 +520,16 @@ int main(int argc, char **argv)
         .system_service = false,
     };
     bool socket_path_overridden = false;
+    bool daemon_option_seen = false;
+    int maintenance_action = 0;
 
-    for (int i = 1; i < argc; i++) {
+    for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--foreground") == 0) {
             options.foreground = true;
+            daemon_option_seen = true;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             g_verbose = true;
+			daemon_option_seen = true;
 		} else if (strcmp(argv[i], "--socket") == 0) {
 			if (i + 1 >= argc) {
 				fprintf(stderr, "--socket requires a path\n");
@@ -471,33 +538,43 @@ int main(int argc, char **argv)
 
 			options.socket_path = argv[++i];
 			socket_path_overridden = true;
+			daemon_option_seen = true;
 		} else if (strcmp(argv[i], "--system-service") == 0) {
 			options.system_service = true;
+			daemon_option_seen = true;
 		} else if (strcmp(argv[i], "--install-input-access") == 0) {
-			return install_input_access();
+			if (maintenance_action != 0) {
+				fprintf(stderr, "daemon: choose one maintenance action\n");
+				return 2;
+			}
+			maintenance_action = 1;
 		} else if (strcmp(argv[i], "--remove-input-access") == 0) {
-			return remove_input_access();
-        } else if (strcmp(argv[i], "--version") == 0) {
-            printf("keysharp-inputd %s\n", KSI_PRODUCT_VERSION);
-            printf("protocol %s %u.%u\n", KSI_PROTOCOL_NAME,
-                (unsigned)KSI_PROTOCOL_MAJOR, (unsigned)KSI_PROTOCOL_MINOR);
-            return 0;
-        } else if (strcmp(argv[i], "--info") == 0) {
-            printf("name=keysharp-inputd\n");
-            printf("version=%s\n", KSI_PRODUCT_VERSION);
-            printf("protocol-name=%s\n", KSI_PROTOCOL_NAME);
-            printf("protocol-major=%u\n", (unsigned)KSI_PROTOCOL_MAJOR);
-            printf("protocol-minor=%u\n", (unsigned)KSI_PROTOCOL_MINOR);
-            printf("socket=/run/keysharp-inputd/keysharp-inputd.sock\n");
-            return 0;
+			if (maintenance_action != 0) {
+				fprintf(stderr, "daemon: choose one maintenance action\n");
+				return 2;
+			}
+			maintenance_action = 2;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            if (argc != 3) {
+                fprintf(stderr, "daemon: help cannot be combined with options\n");
+                return 2;
+            }
             print_usage(argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "daemon: unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
             return 2;
         }
+    }
+
+    if (maintenance_action != 0) {
+        if (daemon_option_seen) {
+            fprintf(stderr, "daemon: maintenance actions cannot be combined with runtime options\n");
+            return 2;
+        }
+        return maintenance_action == 1
+            ? install_input_access() : remove_input_access();
     }
 
     if (options.system_service) {

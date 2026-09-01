@@ -4,7 +4,7 @@
 #include <sys/types.h>
 
 /* Runtime signature of sd_seat_get_active(3). Keeping the dependency behind a
- * function pointer lets keysharp-inputd build without libsystemd headers or an
+ * function pointer lets the service build without libsystemd headers or an
  * unversioned libsystemd linker name. */
 typedef int (*ksi_sd_seat_get_active_fn)(
     const char *seat, char **session, uid_t *uid);

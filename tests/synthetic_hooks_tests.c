@@ -1,4 +1,4 @@
-#include "keysharp_inputd/synthetic_hooks.h"
+#include "internal/synthetic_hooks.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,13 +23,13 @@ int main(void)
     mouse.type = KSI_INPUT_MOUSE;
     mouse.data.mouse.dx = 17;
     mouse.data.mouse.dy = -9;
-    mouse.data.mouse.flags = KSI_MOUSEEVENTF_MOVE
-        | KSI_MOUSEEVENTF_LEFTDOWN | KSI_MOUSEEVENTF_LEFTUP
-        | KSI_MOUSEEVENTF_WHEEL;
+    mouse.data.mouse.flags = KSI_MOUSE_MOVE
+        | KSI_MOUSE_LEFT_DOWN | KSI_MOUSE_LEFT_UP
+        | KSI_MOUSE_WHEEL;
 
     CHECK(ksi_synthetic_hook_input_count(&mouse) == 4u);
     CHECK(ksi_synthetic_hook_expand_input(&mouse, expanded) == 4u);
-    CHECK(expanded[0].data.mouse.flags == KSI_MOUSEEVENTF_MOVE);
+    CHECK(expanded[0].data.mouse.flags == KSI_MOUSE_MOVE);
     CHECK(expanded[1].data.mouse.dx == 0);
     CHECK(expanded[1].data.mouse.dy == 0);
 
@@ -43,7 +43,7 @@ int main(void)
     CHECK(ksi_synthetic_hook_batch_count(inputs, input_count,
         expansion_limit, &count));
     CHECK(count == expansion_limit);
-    inputs[0].data.mouse.flags |= KSI_MOUSEEVENTF_RIGHTDOWN;
+    inputs[0].data.mouse.flags |= KSI_MOUSE_RIGHT_DOWN;
     CHECK(!ksi_synthetic_hook_batch_count(inputs, input_count,
         expansion_limit, &count));
     free(inputs);

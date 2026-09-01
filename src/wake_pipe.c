@@ -15,18 +15,8 @@ int ksi_wake_pipe_open(int *read_fd, int *write_fd)
     *read_fd = -1;
     *write_fd = -1;
 
-    if (pipe(fds) != 0) {
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
         return -1;
-    }
-
-    for (int i = 0; i < 2; i++) {
-        int flags = fcntl(fds[i], F_GETFL);
-
-        if (flags < 0 || fcntl(fds[i], F_SETFL, flags | O_NONBLOCK) != 0) {
-            close(fds[0]);
-            close(fds[1]);
-            return -1;
-        }
     }
 
     *read_fd = fds[0];

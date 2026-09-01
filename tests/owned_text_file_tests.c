@@ -47,7 +47,7 @@ int main(void)
     char path[512];
     char target[512];
     char unsafe_parent[512];
-    char unsafe_path[512];
+    char unsafe_path[520];
     uid_t owner = geteuid();
     gid_t group = getegid();
     bool passed = true;

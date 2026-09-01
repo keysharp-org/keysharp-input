@@ -25,24 +25,24 @@ in {
       "d /run/keysharp-permissions 0755 root root - -"
     ];
 
-    systemd.sockets.keysharp-inputd = {
+    systemd.sockets.keysharp-input = {
       description = "Privileged Linux input broker socket";
       socketConfig = {
-        ListenStream = "/run/keysharp-inputd/keysharp-inputd.sock";
+        ListenStream = "/run/keysharp-input/keysharp-input.sock";
         SocketMode = "0666";
         DirectoryMode = "0755";
         Accept = false;
       };
     };
 
-    systemd.services.keysharp-inputd = {
+    systemd.services.keysharp-input = {
       description = "Privileged Linux input broker";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "keysharp-inputd.socket" ];
-      after = [ "keysharp-inputd.socket" "systemd-udevd.service" "keyd.service" ];
+      requires = [ "keysharp-input.socket" ];
+      after = [ "keysharp-input.socket" "systemd-udevd.service" "keyd.service" ];
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/keysharp-inputd --system-service";
+        ExecStart = "${cfg.package}/bin/keysharp-input daemon --system-service";
         Restart = "on-failure";
         RestartSec = 1;
         OOMScoreAdjust = -900;

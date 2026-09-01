@@ -1,666 +1,249 @@
-#include "keysharp_inputd/protocol.h"
-#include "keysharp_inputd/auth.h"
+#include "keysharp_input/client.h"
 
-#include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
-#define KSI_DEFAULT_SYSTEM_SOCKET "/run/keysharp-inputd/keysharp-inputd.sock"
-#define KSI_SOCKET_ENV "KEYSHARP_INPUTD_SOCKET"
+typedef struct list_context {
+    bool wrote_entry;
+} list_context;
 
-static const char *get_socket_path(const char *override)
+static void print_usage(FILE *stream)
 {
-    if (override != NULL && override[0] != '\0') {
-        return override;
-    }
-
-    const char *env = getenv(KSI_SOCKET_ENV);
-    return (env != NULL && env[0] != '\0') ? env : KSI_DEFAULT_SYSTEM_SOCKET;
+    fprintf(stream,
+        "Usage: keysharp-input permissions list [--socket PATH]\n"
+        "       keysharp-input permissions revoke "
+        "(--hash HASH | --pid PID | --all) "
+        "[input-monitoring|input-control|all] [--socket PATH]\n");
 }
 
-static int connect_daemon(const char *socket_path_override)
+static const char *scope_text(uint32_t scopes)
 {
-    struct sockaddr_un address;
-    const char *path = get_socket_path(socket_path_override);
-    size_t path_length = strlen(path);
-    int fd;
-
-    if (path_length >= sizeof(address.sun_path)) {
-        fprintf(stderr, "keysharp-inputd permissions: socket path too long: %s\n", path);
-        return -1;
+    switch (scopes & KSI_SCOPE_ALL) {
+        case KSI_SCOPE_INPUT_MONITORING:
+            return ksi_scope_name(KSI_SCOPE_INPUT_MONITORING);
+        case KSI_SCOPE_INPUT_CONTROL:
+            return ksi_scope_name(KSI_SCOPE_INPUT_CONTROL);
+        case KSI_SCOPE_ALL:
+            return "input-monitoring,input-control";
+        default:
+            return "none";
     }
-
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-
-    if (fd < 0) {
-        fprintf(stderr, "keysharp-inputd permissions: socket: %s\n", strerror(errno));
-        return -1;
-    }
-
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, path, path_length);
-
-    if (connect(fd, (const struct sockaddr *)&address, sizeof(address)) != 0) {
-        fprintf(stderr, "keysharp-inputd permissions: cannot connect to %s: %s\n", path, strerror(errno));
-        fprintf(stderr, "keysharp-inputd permissions: is keysharp-inputd installed and running?\n");
-        close(fd);
-        return -1;
-    }
-
-    return fd;
 }
 
-static int write_all(int fd, const void *data, size_t size)
+static void print_escaped(const char *value)
 {
-    const uint8_t *cursor = data;
-    size_t remaining = size;
-
-    while (remaining > 0u) {
-        ssize_t n = write(fd, cursor, remaining);
-
-        if (n > 0) {
-            cursor += (size_t)n;
-            remaining -= (size_t)n;
-            continue;
+    for (const unsigned char *cursor = (const unsigned char *)value;
+        *cursor != '\0'; cursor++) {
+        switch (*cursor) {
+            case '\\': fputs("\\\\", stdout); break;
+            case '\t': fputs("\\t", stdout); break;
+            case '\r': fputs("\\r", stdout); break;
+            case '\n': fputs("\\n", stdout); break;
+            default: fputc(*cursor, stdout); break;
         }
-
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-
-        return -1;
-    }
-
-    return 0;
-}
-
-static int read_all(int fd, void *data, size_t size)
-{
-    uint8_t *cursor = data;
-    size_t remaining = size;
-
-    while (remaining > 0u) {
-        ssize_t n = read(fd, cursor, remaining);
-
-        if (n > 0) {
-            cursor += (size_t)n;
-            remaining -= (size_t)n;
-            continue;
-        }
-
-        if (n == 0) {
-            return -1;
-        }
-
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-
-        return -1;
-    }
-
-    return 0;
-}
-
-static int send_frame(
-    int fd,
-    uint32_t type,
-    uint64_t correlation_id,
-    const void *payload,
-    size_t payload_size)
-{
-    ksi_message_header header;
-    uint32_t total_size = (uint32_t)(sizeof(header) + payload_size);
-
-    if (sizeof(header) + payload_size > KSI_MAX_MESSAGE_SIZE) {
-        return -1;
-    }
-
-    memset(&header, 0, sizeof(header));
-    header.size = total_size;
-    header.major = (uint16_t)KSI_PROTOCOL_MAJOR;
-    header.minor = (uint16_t)KSI_PROTOCOL_MINOR;
-    header.type = type;
-    header.correlation_id = correlation_id;
-
-    if (write_all(fd, &header, sizeof(header)) != 0) {
-        return -1;
-    }
-
-    if (payload_size > 0u && write_all(fd, payload, payload_size) != 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-static int recv_frame(
-    int fd,
-    ksi_message_header *header,
-    uint8_t *payload,
-    size_t payload_capacity,
-    size_t *payload_size)
-{
-    size_t body_size;
-
-    if (read_all(fd, header, sizeof(*header)) != 0) {
-        return -1;
-    }
-
-    if (header->size < sizeof(*header) || header->size > KSI_MAX_MESSAGE_SIZE) {
-        return -1;
-    }
-
-    if (header->major != KSI_PROTOCOL_MAJOR || header->minor != KSI_PROTOCOL_MINOR) {
-        return -1;
-    }
-
-    body_size = header->size - sizeof(*header);
-
-    if (body_size > payload_capacity) {
-        return -1;
-    }
-
-    if (body_size > 0u && read_all(fd, payload, body_size) != 0) {
-        return -1;
-    }
-
-    *payload_size = body_size;
-    return 0;
-}
-
-static int handshake(int fd)
-{
-    ksi_client_hello_payload hello;
-    ksi_message_header header;
-    uint8_t payload[256];
-    size_t payload_size;
-
-    memset(&hello, 0, sizeof(hello));
-    hello.requested_capabilities = 0u;
-    hello.flags = 0u;
-
-    if (send_frame(fd, KSI_MESSAGE_CLIENT_HELLO, 1u, &hello, sizeof(hello)) != 0) {
-        fprintf(stderr, "keysharp-inputd permissions: failed to send CLIENT_HELLO\n");
-        return -1;
-    }
-
-    if (recv_frame(fd, &header, payload, sizeof(payload), &payload_size) != 0
-        || header.type != KSI_MESSAGE_CLIENT_HELLO
-        || payload_size < sizeof(ksi_client_hello_result_payload)) {
-        fprintf(stderr, "keysharp-inputd permissions: unexpected CLIENT_HELLO response\n");
-        return -1;
-    }
-
-    return 0;
-}
-
-static void describe_scopes(uint32_t bits, char *buffer, size_t buffer_size)
-{
-    static const struct { uint32_t bit; const char *name; } caps[] = {
-        { KSP_SCOPE_INPUT_MONITORING, "input-monitoring" },
-        { KSP_SCOPE_INPUT_CONTROL,    "input-control" },
-    };
-    size_t n = sizeof(caps) / sizeof(caps[0]);
-    size_t offset = 0;
-    bool first = true;
-    size_t i;
-
-    if (buffer == NULL || buffer_size == 0) {
-        return;
-    }
-
-    buffer[0] = '\0';
-
-    if (bits == 0) {
-        (void)snprintf(buffer, buffer_size, "(none)");
-        return;
-    }
-
-    for (i = 0; i < n; i++) {
-        size_t name_len;
-
-        if ((bits & caps[i].bit) == 0) {
-            continue;
-        }
-
-        name_len = strlen(caps[i].name);
-
-        if (!first) {
-            if (offset + 2u + 1u >= buffer_size) {
-                break;
-            }
-
-            buffer[offset++] = ',';
-            buffer[offset++] = ' ';
-        }
-
-        if (offset + name_len + 1u >= buffer_size) {
-            break;
-        }
-
-        memcpy(buffer + offset, caps[i].name, name_len);
-        offset += name_len;
-        first = false;
-    }
-
-    buffer[offset] = '\0';
-}
-
-static void format_timestamp(uint64_t utc_seconds, char *buffer, size_t buffer_size)
-{
-    time_t when = (time_t)utc_seconds;
-    struct tm tm_value;
-
-    if (gmtime_r(&when, &tm_value) == NULL) {
-        (void)snprintf(buffer, buffer_size, "?");
-        return;
-    }
-
-    if (strftime(buffer, buffer_size, "%Y-%m-%d %H:%M UTC", &tm_value) == 0) {
-        (void)snprintf(buffer, buffer_size, "?");
     }
 }
 
-static int cmd_list(int fd)
+static bool print_entry(const ksi_permission_entry *entry, void *context)
 {
-    bool any = false;
+    list_context *state = context;
 
-    if (send_frame(fd, KSI_MESSAGE_LIST_PERMISSIONS, 2u, NULL, 0u) != 0) {
-        fprintf(stderr, "keysharp-inputd permissions: failed to send LIST_PERMISSIONS\n");
+    if (state->wrote_entry) {
+        putchar('\n');
+    }
+    state->wrote_entry = true;
+    printf("uid=%lu\n", (unsigned long)getuid());
+    printf("hash=%s\n", entry->hash);
+    printf("executable=");
+    print_escaped(entry->executable);
+    printf("\nscopes=%s\n", scope_text(entry->scopes));
+    printf("granted_at_utc=%" PRIu64 "\n", entry->granted_at_utc);
+    return true;
+}
+
+static int connect_service(
+    const char *socket_path,
+    ksi_connection **connection,
+    ksi_error *error)
+{
+    ksi_connect_options options;
+
+    ksi_connect_options_init(&options);
+    options.socket_path = socket_path;
+    ksi_status status = ksi_connect(&options, connection, NULL, error);
+    if (status != KSI_STATUS_OK) {
+        fprintf(stderr, "permissions: %s\n",
+            error->message[0] == '\0' ? ksi_status_name(status) : error->message);
         return 1;
     }
-
-    for (;;) {
-        ksi_message_header header;
-        uint8_t payload[sizeof(ksi_list_permissions_entry_payload) + KSI_AUTH_MAX_PATH];
-        size_t payload_size;
-
-        if (recv_frame(fd, &header, payload, sizeof(payload), &payload_size) != 0) {
-            return 1;
-        }
-
-        if (header.type == KSI_MESSAGE_LIST_PERMISSIONS_RESULT) {
-            if (!any) {
-                printf("No stored input permissions for this user.\n");
-            }
-
-            return 0;
-        }
-
-        if (header.type != KSI_MESSAGE_LIST_PERMISSIONS_ENTRY
-            || payload_size < sizeof(ksi_list_permissions_entry_payload)) {
-            fprintf(stderr, "keysharp-inputd permissions: unexpected response type=%u\n", header.type);
-            return 1;
-        }
-
-        const ksi_list_permissions_entry_payload *entry =
-            (const ksi_list_permissions_entry_payload *)(const void *)payload;
-        size_t path_length = entry->path_length;
-        char path_buffer[KSI_AUTH_MAX_PATH + 1u];
-        char allow_text[256];
-        char when_text[64];
-
-        if (path_length > KSI_AUTH_MAX_PATH
-            || sizeof(*entry) + path_length > payload_size) {
-            fprintf(stderr, "keysharp-inputd permissions: malformed entry\n");
-            return 1;
-        }
-
-        memcpy(path_buffer, (const uint8_t *)payload + sizeof(*entry), path_length);
-        path_buffer[path_length] = '\0';
-
-        describe_scopes(entry->persistent_scopes, allow_text, sizeof(allow_text));
-        format_timestamp(entry->last_seen_utc, when_text, sizeof(when_text));
-
-        if (any) {
-            printf("\n");
-        }
-
-        printf("uid:        %u\n", entry->uid);
-        printf("hash:       %s\n", entry->exe_hash);
-        printf("exe:        %s\n", path_buffer[0] != '\0' ? path_buffer : "(unknown)");
-        printf("allowed:    %s\n", allow_text);
-        printf("granted:    %s\n", when_text);
-
-        any = true;
-    }
-}
-
-typedef struct {
-    char (*hashes)[KSI_PROTOCOL_HASH_HEX_BUFFER];
-    size_t count;
-    size_t capacity;
-} hash_list;
-
-static int hash_list_append(hash_list *list, const char *hash)
-{
-    if (list->count >= list->capacity) {
-        size_t new_cap = list->capacity == 0u ? 8u : list->capacity * 2u;
-        void *resized = realloc(list->hashes, new_cap * sizeof(*list->hashes));
-
-        if (resized == NULL) {
-            return -1;
-        }
-
-        list->hashes = resized;
-        list->capacity = new_cap;
-    }
-
-    memcpy(list->hashes[list->count], hash, KSI_PROTOCOL_HASH_HEX_BUFFER);
-    list->count++;
     return 0;
 }
 
-static int collect_hashes(int fd, hash_list *list)
+static int list_main(int argc, char **argv)
 {
-    if (send_frame(fd, KSI_MESSAGE_LIST_PERMISSIONS, 2u, NULL, 0u) != 0) {
-        return -1;
-    }
+    const char *socket_path = NULL;
+    ksi_connection *connection = NULL;
+    ksi_error error;
+    list_context context = { 0 };
 
-    for (;;) {
-        ksi_message_header header;
-        uint8_t payload[sizeof(ksi_list_permissions_entry_payload) + KSI_AUTH_MAX_PATH];
-        size_t payload_size;
-
-        if (recv_frame(fd, &header, payload, sizeof(payload), &payload_size) != 0) {
-            return -1;
-        }
-
-        if (header.type == KSI_MESSAGE_LIST_PERMISSIONS_RESULT) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc
+            && socket_path == NULL) {
+            socket_path = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0 && argc == 1) {
+            print_usage(stdout);
             return 0;
-        }
-
-        if (header.type != KSI_MESSAGE_LIST_PERMISSIONS_ENTRY
-            || payload_size < sizeof(ksi_list_permissions_entry_payload)) {
-            return -1;
-        }
-
-        const ksi_list_permissions_entry_payload *entry =
-            (const ksi_list_permissions_entry_payload *)(const void *)payload;
-
-        if (hash_list_append(list, entry->exe_hash) != 0) {
-            return -1;
+        } else {
+            fprintf(stderr, "permissions list: unexpected argument: %s\n", argv[i]);
+            return 2;
         }
     }
+    ksi_error_init(&error);
+    if (connect_service(socket_path, &connection, &error) != 0) {
+        return 1;
+    }
+    ksi_status status = ksi_permissions_list(
+        connection, print_entry, &context, &error);
+    ksi_disconnect(connection);
+    if (status != KSI_STATUS_OK) {
+        fprintf(stderr, "permissions list: %s\n",
+            error.message[0] == '\0' ? ksi_status_name(status) : error.message);
+        return 1;
+    }
+    return 0;
 }
 
-static int revoke_one(int fd, const char *hash, uint32_t scopes)
+static uint32_t parse_scope(const char *value)
 {
-    ksi_revoke_permissions_payload payload;
-    ksi_message_header header;
-    uint8_t response[64];
-    size_t response_size;
-
-    memset(&payload, 0, sizeof(payload));
-    payload.target_uid = KSI_REVOKE_PERMISSIONS_UID_SELF;
-    payload.scopes = scopes;
-    (void)snprintf(payload.exe_hash, sizeof(payload.exe_hash), "%s", hash);
-
-    if (send_frame(fd, KSI_MESSAGE_REVOKE_PERMISSIONS, 3u, &payload, sizeof(payload)) != 0) {
-        return -1;
+    if (strcmp(value, "input-monitoring") == 0) {
+        return KSI_SCOPE_INPUT_MONITORING;
     }
-
-    if (recv_frame(fd, &header, response, sizeof(response), &response_size) != 0) {
-        return -1;
+    if (strcmp(value, "input-control") == 0) {
+        return KSI_SCOPE_INPUT_CONTROL;
     }
-
-    if (header.type != KSI_MESSAGE_REVOKE_PERMISSIONS
-        || response_size < sizeof(ksi_status_payload)) {
-        return -1;
-    }
-
-    const ksi_status_payload *status = (const ksi_status_payload *)(const void *)response;
-    return status->status;
-}
-
-static uint32_t parse_scope(const char *text)
-{
-    if (text == NULL || strcmp(text, "all") == 0) {
-        return KSP_INPUT_SCOPES;
-    }
-    if (strcmp(text, "input-monitoring") == 0) {
-        return KSP_SCOPE_INPUT_MONITORING;
-    }
-    if (strcmp(text, "input-control") == 0) {
-        return KSP_SCOPE_INPUT_CONTROL;
+    if (strcmp(value, "all") == 0) {
+        return KSI_SCOPE_ALL;
     }
     return 0u;
 }
 
-static int cmd_revoke(int fd, int argc, char **argv)
+static bool parse_pid(const char *value, uint64_t *pid)
 {
-    uint32_t scopes;
-    const char *hash_arg = NULL;
-    const char *scope_arg = NULL;
-    pid_t pid_arg = 0;
-    bool all = false;
-    char hash_buf[KSI_PROTOCOL_HASH_HEX_BUFFER];
-    int i;
+    char *end = NULL;
+    unsigned long long parsed;
 
-    for (i = 0; i < argc; i++) {
-        const char *arg = argv[i];
-
-        if (strcmp(arg, "--all") == 0) {
-            all = true;
-            continue;
-        }
-
-        if (strcmp(arg, "--pid") == 0 && i + 1 < argc) {
-            char *end;
-            unsigned long value;
-
-            errno = 0;
-            value = strtoul(argv[++i], &end, 10);
-
-            if (errno != 0 || *end != '\0' || value == 0u) {
-                fprintf(stderr, "keysharp-inputd permissions: invalid --pid value\n");
-                return 1;
-            }
-
-            pid_arg = (pid_t)value;
-            continue;
-        }
-
-        if (arg[0] == '-') {
-            fprintf(stderr, "keysharp-inputd permissions: unknown option %s\n", arg);
-            return 1;
-        }
-
-        if (hash_arg != NULL && scope_arg != NULL) {
-            fprintf(stderr, "keysharp-inputd permissions: too many arguments\n");
-            return 1;
-        }
-        if (hash_arg == NULL) {
-            hash_arg = arg;
-        } else {
-            scope_arg = arg;
-        }
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0u) {
+        return false;
     }
-
-    if (pid_arg != 0 && hash_arg != NULL && scope_arg == NULL) {
-        scope_arg = hash_arg;
-        hash_arg = NULL;
-    }
-
-    if (all && (hash_arg != NULL || pid_arg != 0)) {
-        fprintf(stderr, "keysharp-inputd permissions: --all cannot be combined with a hash or --pid\n");
-        return 1;
-    }
-
-    if (!all && hash_arg == NULL && pid_arg == 0) {
-        fprintf(stderr, "keysharp-inputd permissions: provide a hash, --pid <pid>, or --all\n");
-        return 1;
-    }
-
-    scopes = parse_scope(scope_arg);
-    if (scopes == 0u) {
-        fprintf(stderr,
-            "keysharp-inputd permissions: scope must be all, input-monitoring, or input-control\n");
-        return 1;
-    }
-
-    if (pid_arg != 0) {
-        char path[KSI_AUTH_MAX_PATH];
-        if (ksi_auth_identify_process(
-                pid_arg,
-                path, sizeof(path),
-                hash_buf) != 0) {
-            fprintf(stderr, "keysharp-inputd permissions: cannot identify pid %ld\n", (long)pid_arg);
-            return 1;
-        }
-
-        hash_arg = hash_buf;
-    } else if (!all) {
-        size_t hash_length = strlen(hash_arg);
-        size_t j;
-
-        if (hash_length != KSI_AUTH_HASH_HEX_LENGTH) {
-            fprintf(stderr, "keysharp-inputd permissions: hash must be %u hex characters\n",
-                (unsigned int)KSI_AUTH_HASH_HEX_LENGTH);
-            return 1;
-        }
-
-        for (j = 0; j < hash_length; j++) {
-            if (!isxdigit((unsigned char)hash_arg[j])) {
-                fprintf(stderr, "keysharp-inputd permissions: hash contains non-hex characters\n");
-                return 1;
-            }
-        }
-    }
-
-    if (all) {
-        hash_list list = { NULL, 0, 0 };
-        size_t j;
-        int rc = 0;
-
-        if (collect_hashes(fd, &list) != 0) {
-            fprintf(stderr, "keysharp-inputd permissions: failed to enumerate records\n");
-            free(list.hashes);
-            return 1;
-        }
-
-        for (j = 0; j < list.count; j++) {
-            if (revoke_one(fd, list.hashes[j], scopes) != 0) {
-                fprintf(stderr, "keysharp-inputd permissions: failed to revoke %s\n", list.hashes[j]);
-                rc = 1;
-            }
-        }
-
-        free(list.hashes);
-
-        if (rc == 0) {
-            printf("Cleared all input permissions for this user.\n");
-        }
-
-        return rc;
-    }
-
-    int status = revoke_one(fd, hash_arg, scopes);
-
-    if (status == 0) {
-        char scope_text[64];
-        describe_scopes(scopes, scope_text, sizeof(scope_text));
-        printf("Cleared %s permission%s for %s.\n", scope_text,
-            scopes == KSP_INPUT_SCOPES ? "s" : "", hash_arg);
-        printf("The next matching permission request will prompt again.\n");
-        return 0;
-    }
-
-    if (status == 403) {
-        fprintf(stderr, "keysharp-inputd permissions: not authorized to revoke this record\n");
-    } else {
-        fprintf(stderr, "keysharp-inputd permissions: revoke failed (status %d)\n", status);
-    }
-
-    return 1;
+    *pid = (uint64_t)parsed;
+    return true;
 }
 
-static void permissions_usage(FILE *stream)
+static bool hash_is_canonical(const char *hash)
 {
-    fprintf(stream,
-        "Usage: keysharp-inputd permissions <command> [options]\n"
-        "\n"
-        "Commands:\n"
-        "  list                              List input permission records for this user.\n"
-        "  revoke <hash> [scope]              Revoke grants by app identity hash.\n"
-        "  revoke --pid <pid> [scope]          Revoke grants for a running app.\n"
-        "  revoke --all                        Revoke all input grants for this user.\n"
-        "\n"
-        "Scope: all (default), input-monitoring, or input-control.\n"
-        "\n"
-        "Options:\n"
-        "  --socket PATH  Override daemon socket path (default: %s).\n"
-        "\n"
-        "Environment:\n"
-        "  %s  Override the daemon socket path.\n",
-        KSI_DEFAULT_SYSTEM_SOCKET,
-        KSI_SOCKET_ENV);
+    if (hash == NULL || strlen(hash) != 64u) {
+        return false;
+    }
+    for (size_t i = 0u; i < 64u; i++) {
+        if (!((hash[i] >= '0' && hash[i] <= '9')
+                || (hash[i] >= 'a' && hash[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int revoke_main(int argc, char **argv)
+{
+    const char *socket_path = NULL;
+    ksi_permission_revoke request;
+    ksi_connection *connection = NULL;
+    ksi_error error;
+    bool have_target = false;
+    bool have_scope = false;
+
+    ksi_permission_revoke_init(&request);
+    request.scopes = KSI_SCOPE_ALL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc
+            && socket_path == NULL) {
+            socket_path = argv[++i];
+        } else if (strcmp(argv[i], "--hash") == 0 && i + 1 < argc
+            && !have_target) {
+            const char *hash = argv[++i];
+            if (!hash_is_canonical(hash)) {
+                fprintf(stderr, "permissions revoke: HASH must be 64 lowercase hex characters\n");
+                return 2;
+            }
+            memcpy(request.hash, hash, 65u);
+            request.target_kind = KSI_PERMISSION_TARGET_HASH;
+            have_target = true;
+        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc
+            && !have_target) {
+            if (!parse_pid(argv[++i], &request.pid)) {
+                fprintf(stderr, "permissions revoke: PID must be a positive integer\n");
+                return 2;
+            }
+            request.target_kind = KSI_PERMISSION_TARGET_PID;
+            have_target = true;
+        } else if (strcmp(argv[i], "--all") == 0 && !have_target) {
+            request.target_kind = KSI_PERMISSION_TARGET_ALL;
+            have_target = true;
+        } else if (strcmp(argv[i], "--help") == 0 && argc == 1) {
+            print_usage(stdout);
+            return 0;
+        } else if (argv[i][0] != '-' && !have_scope) {
+            request.scopes = parse_scope(argv[i]);
+            if (request.scopes == 0u) {
+                fprintf(stderr, "permissions revoke: unknown scope: %s\n", argv[i]);
+                return 2;
+            }
+            have_scope = true;
+        } else {
+            fprintf(stderr, "permissions revoke: unexpected or conflicting argument: %s\n",
+                argv[i]);
+            return 2;
+        }
+    }
+    if (!have_target) {
+        fprintf(stderr, "permissions revoke: choose --hash, --pid, or --all\n");
+        return 2;
+    }
+    ksi_error_init(&error);
+    if (connect_service(socket_path, &connection, &error) != 0) {
+        return 1;
+    }
+    ksi_status status = ksi_permissions_revoke(connection, &request, &error);
+    ksi_disconnect(connection);
+    if (status != KSI_STATUS_OK) {
+        fprintf(stderr, "permissions revoke: %s\n",
+            error.message[0] == '\0' ? ksi_status_name(status) : error.message);
+        return 1;
+    }
+    printf("revoked_scopes=%s\n", scope_text(request.scopes));
+    return 0;
 }
 
 int permissions_cli_main(int argc, char **argv)
 {
-    const char *socket_override = NULL;
-    int i;
-    int cmd_argc;
-    char **cmd_argv;
-    int fd;
-    int rc;
-
-    if (argc >= 1 && strcmp(argv[0], "permissions") == 0) {
-        argc--;
-        argv++;
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "--help") == 0)) {
+        print_usage(stdout);
+        return 0;
     }
-
-    /* Extract --socket before dispatching. */
-    for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
-            socket_override = argv[i + 1];
-            /* Shift these two args out. */
-            memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 2) * sizeof(*argv));
-            argc -= 2;
-            i--;
-        }
+    if (strcmp(argv[1], "list") == 0) {
+        return list_main(argc - 2, argv + 2);
     }
-
-    if (argc < 1 || strcmp(argv[0], "-h") == 0 || strcmp(argv[0], "--help") == 0) {
-        permissions_usage(argc < 1 ? stderr : stdout);
-        return argc < 1 ? 2 : 0;
+    if (strcmp(argv[1], "revoke") == 0) {
+        return revoke_main(argc - 2, argv + 2);
     }
-
-    fd = connect_daemon(socket_override);
-
-    if (fd < 0) {
-        return 1;
-    }
-
-    if (handshake(fd) != 0) {
-        close(fd);
-        return 1;
-    }
-
-    cmd_argc = argc - 1;
-    cmd_argv = argv + 1;
-
-    if (strcmp(argv[0], "list") == 0) {
-        rc = cmd_list(fd);
-    } else if (strcmp(argv[0], "revoke") == 0) {
-        rc = cmd_revoke(fd, cmd_argc, cmd_argv);
-    } else {
-        fprintf(stderr, "keysharp-inputd permissions: unknown command '%s'\n", argv[0]);
-        permissions_usage(stderr);
-        rc = 2;
-    }
-
-    close(fd);
-    return rc;
+    fprintf(stderr, "permissions: unknown command: %s\n", argv[1]);
+    print_usage(stderr);
+    return 2;
 }

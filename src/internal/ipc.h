@@ -1,12 +1,12 @@
-#ifndef KEYSHARP_INPUTD_IPC_H
-#define KEYSHARP_INPUTD_IPC_H
+#ifndef KEYSHARP_INPUT_INTERNAL_IPC_H
+#define KEYSHARP_INPUT_INTERNAL_IPC_H
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
-#include "keysharp_inputd/protocol.h"
+#include "internal/protocol.h"
 
 typedef struct ksi_ipc_server ksi_ipc_server;
 
@@ -25,10 +25,9 @@ int ksi_ipc_get_peer_credentials(int client_fd, ksi_ipc_peer_credentials *creden
 int ksi_ipc_read_framed_message(int client_fd, uint8_t *buffer, size_t buffer_size, size_t *message_size);
 int ksi_ipc_send_framed_message(
     int client_fd,
-    uint16_t protocol_minor,
-    uint32_t message_type,
-    uint32_t client_id,
-    uint64_t correlation_id,
+    uint16_t opcode,
+    uint16_t flags,
+    uint64_t request_id,
     const void *payload,
     size_t payload_size);
 void ksi_ipc_close_client(int client_fd);

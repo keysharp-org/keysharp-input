@@ -1,0 +1,28 @@
+[Unit]
+Description=Privileged input broker
+Requires=keysharp-input.socket
+After=keysharp-input.socket systemd-udevd.service systemd-tmpfiles-setup.service keyd.service
+
+[Service]
+Type=simple
+ExecStartPre=+/usr/bin/systemd-tmpfiles --create @KEYSHARP_INPUT_TMPFILES_CONFIG@
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-input daemon --system-service
+Restart=on-failure
+RestartSec=1
+OOMScoreAdjust=-900
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/keysharp-permissions /run/keysharp-permissions
+UMask=0077
+DevicePolicy=closed
+DeviceAllow=char-input r
+DeviceAllow=/dev/uinput rw
+
+[Install]
+WantedBy=multi-user.target

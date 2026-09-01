@@ -6,9 +6,9 @@ static uint32_t hook_type_for_input(const ksi_input *input)
 
     switch (input->type) {
         case KSI_INPUT_KEYBOARD:
-            return KSI_HOOK_KEYBOARD_LL;
+            return KSI_HOOK_KEYBOARD;
         case KSI_INPUT_MOUSE:
-            return KSI_HOOK_MOUSE_LL;
+            return KSI_HOOK_MOUSE;
         default:
             return 0u;
     }
@@ -22,14 +22,14 @@ static bool synth_batch_needs_hook_queue(
 {
     uint32_t active_hooks;
 
-    if ((flags & KSI_SYNTH_FLAG_BYPASS_HOOK) != 0u || state == NULL || inputs == NULL) {
+    if ((flags & KSI_SYNTH_BYPASS_HOOK) != 0u || state == NULL || inputs == NULL) {
         return false;
     }
 
     active_hooks = active_hook_subscription_mask(state);
 
     for (uint32_t i = 0; i < count; i++) {
-        if ((hook_type_to_cap_bit(hook_type_for_input(&inputs[i])) & active_hooks) != 0u) {
+        if ((hook_type_to_operation(hook_type_for_input(&inputs[i])) & active_hooks) != 0u) {
             return true;
         }
     }
@@ -48,8 +48,8 @@ static bool enqueue_synth_direct(
      * state (the pending unicode high surrogate) must carry across to the next
      * fragment rather than being reset (see ksi_linux_synth_send_input).
      * BATCH_START on the first fragment re-arms that reset at the batch boundary. */
-    uint32_t flags = KSI_SYNTH_FLAG_BYPASS_HOOK | KSI_SYNTH_FLAG_BATCH_FRAGMENT
-        | (batch_start ? KSI_SYNTH_FLAG_BATCH_START : 0u);
+    uint32_t flags = KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_BATCH_FRAGMENT
+        | (batch_start ? KSI_INTERNAL_SYNTH_BATCH_START : 0u);
 
     return output_queue_push_synth(
         &state->output_queue, input, 1u, flags, input_generation);
@@ -69,7 +69,8 @@ static bool enqueue_synth_direct_complete(
         if (ok) {
             synth_completion_complete(completion);
         } else {
-            synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+            synth_completion_fail(completion, KSI_STATUS_RESOURCE_EXHAUSTED,
+                KSI_DETAIL_NONE);
         }
     }
 
@@ -93,8 +94,8 @@ static bool create_synthetic_lane_event(
     ksi_lane_egress egress = {
         .type = KSI_LANE_EGRESS_SYNTH,
         .synth_count = 1u,
-        .synth_flags = KSI_SYNTH_FLAG_BYPASS_HOOK | KSI_SYNTH_FLAG_BATCH_FRAGMENT
-            | (batch_start ? KSI_SYNTH_FLAG_BATCH_START : 0u),
+        .synth_flags = KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_BATCH_FRAGMENT
+            | (batch_start ? KSI_INTERNAL_SYNTH_BATCH_START : 0u),
     };
     size_t event_size = 0u;
 
@@ -124,13 +125,15 @@ static bool process_synthetic_hook_input(
     ksi_lane_event *event;
 
     if (state == NULL || input == NULL) {
-        synth_completion_fail(completion, -1, 1u);
+        synth_completion_fail(completion, KSI_STATUS_INTERNAL,
+            KSI_DETAIL_NONE);
         return false;
     }
 
     if (!create_synthetic_lane_event(state, input, batch_start, 0u,
             completion, &event, input_generation)) {
-        synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+        synth_completion_fail(completion, KSI_STATUS_RESOURCE_EXHAUSTED,
+            KSI_DETAIL_NONE);
         return false;
     }
 
@@ -164,7 +167,8 @@ static bool process_synthetic_hook_queue_one(ksi_daemon_state *state)
 
     if (input_generation != 0u
         && input_generation != current_input_generation(state)) {
-        synth_completion_fail(completion, -1, KSI_DETAIL_CANCELLED);
+        synth_completion_fail(completion, KSI_STATUS_CANCELLED,
+            KSI_DETAIL_NONE);
         return true;
     }
 
@@ -174,7 +178,7 @@ static bool process_synthetic_hook_queue_one(ksi_daemon_state *state)
 
     if (!process_synthetic_hook_input(
             state, &input, completion, batch_start, input_generation)) {
-        fprintf(stderr, "inputd: failed to route synthetic hook input\n");
+        fprintf(stderr, "keysharp-input: failed to route synthetic hook input\n");
     }
 
     return true;

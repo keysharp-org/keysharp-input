@@ -1,10 +1,10 @@
-#ifndef KEYSHARP_INPUTD_LINUX_DEVICES_H
-#define KEYSHARP_INPUTD_LINUX_DEVICES_H
+#ifndef KEYSHARP_INPUT_INTERNAL_LINUX_DEVICES_H
+#define KEYSHARP_INPUT_INTERNAL_LINUX_DEVICES_H
 
 #include <poll.h>
 #include <stdint.h>
 
-#include "keysharp_inputd/platform.h"
+#include "internal/platform.h"
 
 typedef void (*ksi_physical_key_event_callback)(void *context, uint32_t scan_code);
 

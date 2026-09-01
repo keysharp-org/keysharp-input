@@ -1,5 +1,5 @@
-#ifndef KEYSHARP_INPUTD_WORKER_POOL_H
-#define KEYSHARP_INPUTD_WORKER_POOL_H
+#ifndef KEYSHARP_INPUT_WORKER_POOL_H
+#define KEYSHARP_INPUT_WORKER_POOL_H
 
 #include <stdbool.h>
 #include <stddef.h>

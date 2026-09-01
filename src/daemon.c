@@ -2,24 +2,27 @@
 #define _GNU_SOURCE
 #endif
 
-#include "keysharp_inputd/daemon.h"
+#include "internal/daemon.h"
 
 #include "connection_ref.h"
 #include "active_session.h"
-#include "keysharp_inputd/auth.h"
-#include "keysharp_inputd/ipc.h"
-#include "keysharp_inputd/linux_devices.h"
-#include "keysharp_inputd/linux_synth.h"
-#include "keysharp_inputd/platform.h"
-#include "keysharp_inputd/protocol.h"
-#include "keysharp_inputd/synthetic_hooks.h"
+#include "internal/ipc.h"
+#include "internal/linux_devices.h"
+#include "internal/linux_synth.h"
+#include "internal/platform.h"
+#include "internal/protocol.h"
+#include "internal/synthetic_hooks.h"
 #include "pipe_ring.h"
+#include "protocol_codec.h"
+#include "protocol_internal.h"
 #include "worker_pool.h"
 #include "wake_pipe.h"
+#include "keysharp_permissions/permissions.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -41,7 +44,6 @@
 #define KSI_MAX_BACKEND_FDS 160
 #define KSI_MAX_POLL_FDS (4 + KSI_MAX_BACKEND_FDS + KSI_MAX_CLIENTS)
 #define KSI_MAX_PENDING_COMMANDS 256
-#define KSI_MAX_SYNTH_INPUTS 1024
 #define KSI_MAX_MODIFY_INPUTS KSI_MAX_SYNTH_INPUTS
 #define KSI_HOOK_DECISION_TIMEOUT_MS 1000u
 /* Per-lane consecutive hook failures before the client is disconnected. */
@@ -66,9 +68,9 @@
 #define KSI_MAX_RECURSION_DEPTH 32u
 #define KSI_SHUTDOWN_TIMEOUT_MS 5000u
 #define KSI_GRAB_LEASE_TIMEOUT_MS 15000u
-/* CLIENT_HELLO deadline; peers that connect and send nothing cannot pin slots. */
+/* Handshake deadline; peers that send nothing cannot pin slots. */
 #define KSI_HANDSHAKE_TIMEOUT_MS 10000u
-/* Idle deadline for authenticated-but-capability-less connections (no grants, no
+/* Idle deadline for authenticated scope-less connections (no grants, no
  * hook/block subscriptions). Reset by any message, so a live query channel that
  * polls within this window is never reaped; only truly-idle capless connections
  * that would otherwise pin a slot forever are dropped. */
@@ -78,6 +80,12 @@
 #define KSI_VK_LCONTROL 0xA2u
 
 static volatile sig_atomic_t keep_running = 1;
+
+static bool permissions_cancelled(void *user_data)
+{
+    (void)user_data;
+    return keep_running == 0;
+}
 
 /* Fail open if a safety-critical notification cannot reach the main thread.
  * Retaining a stale grab or BlockInput mask is worse than dropping hooks. */
@@ -91,19 +99,14 @@ static inline void wake_pipe_write(int fd)
     (void)written;
 }
 
-/* Two SEPARATE pools, not one shared pool, so a permission prompt -- which
- * blocks on the user for as long as they take to answer, potentially
- * indefinitely -- can never starve process-identity resolution for an
- * unrelated client out of a worker thread. Both connecting-client identity
- * resolution (fast, frequent) and permission prompts (slow, rare, blocks on a
- * human) used to share g_worker_pool's fixed thread count; two prompts alone
- * could fill it and stall every other client's CLIENT_HELLO indefinitely. */
+/* Permission prompts and identity lookups use separate pools so a user-facing
+ * prompt cannot starve new client identification. */
 static ksi_worker_pool g_worker_pool;
 static ksi_worker_pool g_identify_worker_pool;
 
 typedef enum ksi_client_state {
     KSI_CLIENT_STATE_IDENTIFYING,     /* process identity resolution running on worker thread */
-    KSI_CLIENT_STATE_READY,           /* identity known, waiting for or able to process CLIENT_HELLO */
+    KSI_CLIENT_STATE_READY,
     KSI_CLIENT_STATE_AWAITING_PROMPT, /* permission prompt running on worker thread */
 } ksi_client_state;
 
@@ -114,8 +117,6 @@ typedef struct ksi_client {
     uint8_t *rx_buffer;
     size_t rx_used;
     uint64_t connection_id;
-    uint16_t protocol_minor;
-    bool protocol_version_seen;
     pid_t pid;
     uid_t uid;
     gid_t gid;
@@ -123,17 +124,14 @@ typedef struct ksi_client {
     /* Process start time captured at accept, compared against the value the
      * identity worker reads later; a mismatch means the pid was recycled between
      * accept and identify, so /proc no longer describes the connecting process. */
-    uint64_t accept_start_time;
     ksi_client_state state;
     bool identity_attempted;
     bool has_identity;
-    bool authenticated;
-    bool role_initialized;
+    bool hello_complete;
     uint32_t connection_role;
-    /* Set by CLIENT_HELLO; missing handshakes are dropped after the deadline. */
-    bool hello_seen;
     uint64_t connected_at_ms;
-    uint32_t granted_capabilities;
+    uint32_t granted_scopes;
+    uint64_t advertised_operations;
     uint32_t hook_subscriptions;
     /* Windows installs each hook type independently at the chain head. A
      * disconnect/re-subscribe therefore gets a fresh per-type ordinal even if
@@ -147,17 +145,17 @@ typedef struct ksi_client {
     uint64_t last_hook_quarantine_ms[2];
     uint64_t lease_expires_ms;
     /* Last time any message was received; drives the capless-idle reaper so an
-     * authenticated but capability-less connection cannot pin a slot forever. */
+     * authenticated scope-less connection cannot pin a slot forever. */
     uint64_t last_activity_ms;
-    char exe_path[KSI_AUTH_MAX_PATH];
-    char exe_hash[KSI_AUTH_HASH_HEX_LENGTH + 1u];
-    /* Buffered CLIENT_HELLO waiting for identification or prompt to complete. */
-    bool pending_hello_valid;
-    uint32_t pending_hello_requested;
-    uint32_t pending_hello_flags;
-    uint64_t pending_hello_correlation_id;
-    uint32_t pending_hello_client_id;
-    uint64_t pending_hello_permission_generation;
+    char exe_path[KSP_PATH_CAPACITY];
+    char exe_hash[KSP_HASH_HEX_LENGTH + 1u];
+    /* Authorization request waiting for identification or a prompt. */
+    bool pending_authorization;
+    uint16_t pending_authorization_opcode;
+    uint16_t pending_authorization_mode;
+    uint32_t pending_requested_scopes;
+    uint64_t pending_request_id;
+    uint64_t pending_permission_generation;
     uint64_t permission_store_generation;
     bool permission_store_generation_valid;
 } ksi_client;
@@ -165,8 +163,8 @@ typedef struct ksi_client {
 /* Heap-allocated payload for KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED. */
 typedef struct ksi_client_identified_result {
     bool has_identity;
-    char exe_path[KSI_AUTH_MAX_PATH];
-    char exe_hash[KSI_AUTH_HASH_HEX_LENGTH + 1u];
+    char exe_path[KSP_PATH_CAPACITY];
+    char exe_hash[KSP_HASH_HEX_LENGTH + 1u];
     uint64_t start_time;
 } ksi_client_identified_result;
 
@@ -185,22 +183,15 @@ typedef struct ksi_daemon_command {
             ksi_client_identified_result *result; /* heap-allocated; freed by consumer */
         } identified;
         struct {
-            ksi_auth_result decision;
-            uint32_t requested_capabilities;
+            ksp_polkit_result decision;
+            uint32_t requested_scopes;
             uint32_t missing_scopes;
             uint64_t store_generation;
             int prompt_lock_fd;
             bool prompt_lock_held;
-            /* state->available_capabilities as it was WHEN THE PROMPT STARTED,
-             * not when it completes. A permission prompt can sit open for
-             * seconds; using the current (post-wait) availability here would
-             * let a transient hotplug during that window silently shrink what
-             * "success" means without ever surfacing an error. See
-             * process_client_prompt_done. */
-            uint32_t available_capabilities_at_start;
         } prompt_done;
         struct {
-            uint32_t hook_type; /* KSI_HOOK_KEYBOARD_LL / KSI_HOOK_MOUSE_LL */
+            uint32_t hook_type; /* KSI_HOOK_KEYBOARD / KSI_HOOK_MOUSE */
             uint64_t event_id;
             uint32_t nesting_depth;
             uint32_t elapsed_ms;
@@ -283,8 +274,7 @@ typedef struct ksi_output_queue {
 typedef struct ksi_synth_completion {
     ksi_hook_send_ref *send_ref;
     struct ksi_daemon_state *state;
-    uint32_t client_id;
-    uint64_t correlation_id;
+    uint64_t request_id;
     atomic_uint remaining;
     _Atomic uint64_t terminal_result;
     bool owns_atomic_transaction;
@@ -310,7 +300,7 @@ typedef struct ksi_synthetic_hook_item {
     uint64_t queued_at_ns;
     ksi_synth_completion *completion;
     uint64_t input_generation;
-    bool batch_start;  /* first node of a client batch; re-arms the surrogate reset */
+    bool batch_start;  /* marks the client-batch surrogate boundary */
 } ksi_synthetic_hook_item;
 
 typedef struct ksi_synthetic_hook_queue {
@@ -324,14 +314,15 @@ typedef struct ksi_synthetic_hook_queue {
 } ksi_synthetic_hook_queue;
 
 typedef struct ksi_lane_subscriber {
-    /* One HookStream is both transport and shared K/M hook-thread domain. */
+    /* One callback stream is the shared keyboard/mouse hook-thread domain. */
     ksi_hook_send_ref *send_ref;
     uint64_t connection_id;
     uint64_t subscription_ordinal;
 } ksi_lane_subscriber;
 
-/* Immutable hook event snapshot. Lanes never touch state->clients[]. The
- * flexible tail stores only the subscribers which actually receive this event. */
+struct ksi_hook_lane;
+
+/* Immutable hook event snapshot. Lanes never touch state->clients[]. */
 typedef struct ksi_lane_event {
     uint64_t event_id;
     uint32_t hook_type;
@@ -344,7 +335,9 @@ typedef struct ksi_lane_event {
     size_t subscriber_count;
     uint32_t nesting_depth;
     bool physical_input;
-    ksi_lane_subscriber subscribers[];
+    struct ksi_hook_lane *pool_owner;
+    struct ksi_lane_event *next_free;
+    ksi_lane_subscriber subscribers[KSI_MAX_CLIENTS];
 } ksi_lane_event;
 
 typedef struct ksi_nested_member {
@@ -413,12 +406,15 @@ typedef struct ksi_hook_lane {
     atomic_uint current_nesting_depth;
     /* Set by lane_shutdown to abort waits and drain promptly. */
     atomic_int shutting_down;
-    /* Incremented by EmergencyPassthrough. Events captured under an older
-     * generation skip subscriber callbacks and finalize immediately. */
+    /* Incremented by fail-open recovery. Older events skip callbacks. */
     atomic_uint flush_generation;
     ksi_lane_action_queue action_queue;
     ksi_lane_decision_queue decision_queue;
     ksi_nested_transaction_queue nested_queue;
+    pthread_mutex_t event_pool_mutex;
+    bool event_pool_mutex_initialized;
+    ksi_lane_event *event_pool;
+    ksi_lane_event *free_events;
     struct ksi_daemon_state *state;
 } ksi_hook_lane;
 
@@ -427,10 +423,11 @@ typedef struct ksi_daemon_state {
     ksi_client clients[KSI_MAX_CLIENTS];
     nfds_t client_count;
     ksi_daemon_command_queue *commands;
-    ksi_auth_store *permissions;
+    ksp_store *permissions;
     /* Control-plane epoch used to invalidate prompts which crossed a revoke. */
     uint64_t permission_generation;
-    uint32_t available_capabilities;
+    uint64_t available_operations;
+    uint64_t ready_operations;
     uint64_t next_connection_id;
     uint64_t next_event_id;
     uint64_t next_hook_subscription_ordinal[2];
@@ -478,7 +475,7 @@ typedef struct ksi_binary_message_view {
 } ksi_binary_message_view;
 
 static int update_grab_state(ksi_daemon_state *state);
-static void prepare_requested_capabilities(ksi_daemon_state *state, uint32_t requested);
+static void prepare_requested_scopes(ksi_daemon_state *state, uint32_t requested);
 static void clear_hook_state(ksi_daemon_state *state);
 static void record_client_hook_failure(
     ksi_daemon_state *state, nfds_t index, uint32_t hook_type,
@@ -494,13 +491,12 @@ static uint64_t advance_input_generation(ksi_daemon_state *state);
 /* Per-hook-type failure-counter slot: 0 keyboard, 1 mouse. */
 static size_t hook_type_to_lane_index(uint32_t hook_type)
 {
-    return hook_type == KSI_HOOK_MOUSE_LL ? 1u : 0u;
+    return hook_type == KSI_HOOK_MOUSE ? 1u : 0u;
 }
 static void send_status(
     int client_fd,
     const ksi_message_header *request,
-    uint32_t response_type,
-    int32_t status,
+    uint32_t status,
     uint32_t detail);
 static void remove_client(ksi_daemon_state *state, nfds_t index);
 static void send_indicator_state_result(int client_fd, const ksi_message_header *request);
@@ -575,7 +571,7 @@ static void free_daemon_command(ksi_daemon_command *command)
         command->data.identified.result = NULL;
     } else if (command->type == KSI_DAEMON_COMMAND_CLIENT_PROMPT_DONE
         && command->data.prompt_done.prompt_lock_held) {
-        close(command->data.prompt_done.prompt_lock_fd);
+        ksp_prompt_lock_release(command->data.prompt_done.prompt_lock_fd);
         command->data.prompt_done.prompt_lock_fd = -1;
         command->data.prompt_done.prompt_lock_held = false;
     }
@@ -669,7 +665,7 @@ static void set_active_input_owner(
      * grab without erasing stored subscriptions. */
     if (update_grab_state(state) != 0) {
         fprintf(stderr,
-            "inputd: failed to release grabs during seat0 owner transition\n");
+            "keysharp-input: failed to release grabs during seat0 owner transition\n");
     }
 
     /* Consume evdev/libevdev backlog while the owner gate is invalid. The
@@ -682,12 +678,12 @@ static void set_active_input_owner(
 
     if (!output_queue_push_release_all(&state->output_queue)) {
         fprintf(stderr,
-            "inputd: failed to enqueue release-all during seat0 owner transition\n");
+            "keysharp-input: failed to enqueue release-all during seat0 owner transition\n");
     }
 
     if (!valid) {
         fprintf(stderr,
-            "inputd: seat0 has no active input owner; input IPC is fail-closed\n");
+            "keysharp-input: seat0 has no active input owner; input IPC is fail-closed\n");
         return;
     }
 
@@ -706,11 +702,11 @@ static void set_active_input_owner(
 
     if (update_grab_state(state) != 0) {
         fprintf(stderr,
-            "inputd: failed to restore active seat0 user's grabs\n");
+            "keysharp-input: failed to restore active seat0 user's grabs\n");
     }
 
     fprintf(stderr,
-        "inputd: seat0 input owner uid=%ld generation=%llu\n",
+        "keysharp-input: seat0 input owner uid=%ld generation=%llu\n",
         (long)uid, (unsigned long long)generation);
 }
 
@@ -742,7 +738,7 @@ static void refresh_active_input_owner(
             state->next_active_session_resolver_retry_ms =
                 now + KSI_ACTIVE_SESSION_RESOLVER_RETRY_MS;
             fprintf(stderr,
-                "inputd: logind active-seat resolver unavailable (%s); "
+                "keysharp-input: logind active-seat resolver unavailable (%s); "
                 "input IPC remains fail-closed\n",
                 strerror(errno));
         }
@@ -762,15 +758,15 @@ static void refresh_active_input_owner(
  *   1. If the backend reports its synthetic-output device has failed, enqueue a
  *      recreate action so the stop+start runs on the OUTPUT SEQUENCER thread
  *      (not here on the main thread, which would race the sequencer's writes).
- *   2. If the set of honorable capabilities changed (hotplug, or synth
+ *   2. If the set of ready operations changed (hotplug, or synth
  *      dying/recovering), re-run update_grab_state so a dead synth releases its
  *      hook grabs (fail open) and a recovered one re-grabs. Gating on an actual
  *      availability change -- rather than every tick -- avoids thrashing grabs. */
 static void run_backend_maintenance(ksi_daemon_state *state)
 {
     const ksi_platform_backend *backend;
-    uint32_t previous_caps;
-    uint32_t new_caps;
+    uint64_t previous_operations;
+    uint64_t new_operations;
 
     if (state == NULL || (backend = state->backend) == NULL) {
         return;
@@ -785,15 +781,17 @@ static void run_backend_maintenance(ksi_daemon_state *state)
     if (backend->synth_needs_recovery != NULL
         && backend->synth_needs_recovery()
         && !output_queue_push_recreate_synth(&state->output_queue)) {
-        fprintf(stderr, "inputd: failed to enqueue synthetic output device recovery\n");
+        fprintf(stderr, "keysharp-input: failed to enqueue synthetic output device recovery\n");
     }
 
-    previous_caps = state->available_capabilities;
-    new_caps = daemon_available_capabilities(backend);
-    state->available_capabilities = new_caps;
+    previous_operations = state->ready_operations;
+    new_operations = backend->get_ready_operations != NULL
+        ? backend->get_ready_operations()
+        : state->available_operations;
+    state->ready_operations = new_operations;
 
-    if (new_caps != previous_caps && update_grab_state(state) != 0) {
-        fprintf(stderr, "inputd: failed to refresh grabs after capability change\n");
+    if (new_operations != previous_operations && update_grab_state(state) != 0) {
+        fprintf(stderr, "keysharp-input: failed to refresh grabs after operation readiness change\n");
     }
 }
 
@@ -801,7 +799,8 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 {
     ksi_ipc_server *server = NULL;
     const ksi_platform_backend *backend = ksi_platform_backend_get();
-    ksi_auth_store *permissions = NULL;
+    ksp_store *permissions = NULL;
+    ksp_store_config permission_config;
     ksi_daemon_command_queue command_queue;
 
     if (options == NULL || (!options->system_service && options->socket_path == NULL)) {
@@ -819,34 +818,38 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         return 1;
     }
 
-    /* Snapshot capabilities based on what the service opened successfully. */
-    uint32_t available_capabilities = daemon_available_capabilities(backend);
+    /* Snapshot operations based on what the service opened successfully. */
+    uint64_t available_operations = daemon_available_operations(backend);
 
-    if (ksi_auth_store_create(&permissions) != 0) {
+    ksp_store_config_init(&permission_config,
+        KSP_SCOPE_INPUT_MONITORING | KSP_SCOPE_INPUT_CONTROL);
+    if (ksp_store_create(&permissions, &permission_config) != 0
+        || ksp_store_prepare(permissions) != 0) {
         fprintf(stderr,
-            "inputd: warning: failed to initialize permissions store; "
-            "all capability requests will be denied\n");
+            "keysharp-input: warning: failed to initialize permissions store; "
+            "all permission requests will be denied\n");
+        ksp_store_destroy(permissions);
         permissions = NULL;
     }
 
     if ((options->system_service
             ? ksi_ipc_server_from_fd(3, &server)
             : ksi_ipc_server_open(options->socket_path, &server)) != 0) {
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
 
-    fprintf(stderr, "keysharp-inputd listening on %s using %s backend\n",
+    fprintf(stderr, "keysharp-input listening on %s using %s backend\n",
         options->system_service ? "systemd socket" : options->socket_path,
         backend->name);
 
     ksi_daemon_state *daemon_state = calloc(1, sizeof(*daemon_state));
 
     if (daemon_state == NULL) {
-        fprintf(stderr, "inputd: failed to allocate daemon state\n");
+        fprintf(stderr, "keysharp-input: failed to allocate daemon state\n");
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
@@ -854,7 +857,10 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     daemon_state->backend = backend;
     daemon_state->commands = &command_queue;
     daemon_state->permissions = permissions;
-    daemon_state->available_capabilities = available_capabilities;
+    daemon_state->available_operations = available_operations;
+    daemon_state->ready_operations = backend->get_ready_operations != NULL
+        ? backend->get_ready_operations()
+        : available_operations;
     daemon_state->next_connection_id = 1;
     daemon_state->next_event_id = 1;
     daemon_state->input_owner_enforced = options->system_service;
@@ -867,7 +873,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     if (command_queue_init(&command_queue) != 0) {
         free(daemon_state);
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
@@ -876,7 +882,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         command_queue_destroy(&command_queue);
         free(daemon_state);
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
@@ -886,7 +892,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         command_queue_destroy(&command_queue);
         free(daemon_state);
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
@@ -905,7 +911,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         command_queue_destroy(&command_queue);
         free(daemon_state);
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
@@ -914,11 +920,11 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 
     /* Initialize and start both hook lanes before the backend can start
      * delivering events.  Errors here unwind the sequencer thread cleanly. */
-    if (lane_init(&daemon_state->keyboard_lane, daemon_state, KSI_HOOK_KEYBOARD_LL) != 0
-        || lane_init(&daemon_state->mouse_lane, daemon_state, KSI_HOOK_MOUSE_LL) != 0
+    if (lane_init(&daemon_state->keyboard_lane, daemon_state, KSI_HOOK_KEYBOARD) != 0
+        || lane_init(&daemon_state->mouse_lane, daemon_state, KSI_HOOK_MOUSE) != 0
         || lane_start(&daemon_state->keyboard_lane) != 0
         || lane_start(&daemon_state->mouse_lane) != 0) {
-        fprintf(stderr, "inputd: failed to start hook lanes\n");
+        fprintf(stderr, "keysharp-input: failed to start hook lanes\n");
         (void)lane_shutdown(&daemon_state->keyboard_lane, 0u);
         (void)lane_shutdown(&daemon_state->mouse_lane, 0u);
         atomic_store(&daemon_state->sequencer_running, 0);
@@ -930,7 +936,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         command_queue_destroy(&command_queue);
         free(daemon_state);
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
@@ -944,7 +950,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 
     if (ksi_worker_pool_init(&g_worker_pool) != 0
         || ksi_worker_pool_init(&g_identify_worker_pool) != 0) {
-        fprintf(stderr, "inputd: failed to start worker pool\n");
+        fprintf(stderr, "keysharp-input: failed to start worker pool\n");
         ksi_worker_pool_destroy(&g_worker_pool);
         ksi_worker_pool_destroy(&g_identify_worker_pool);
 
@@ -965,14 +971,14 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         command_queue_destroy(&command_queue);
         free(daemon_state);
         ksi_ipc_server_close(server);
-        ksi_auth_store_destroy(permissions);
+        ksp_store_destroy(permissions);
         backend->stop();
         return 1;
     }
 
     if (permissions != NULL && permission_monitor_init(daemon_state) != 0) {
         fprintf(stderr,
-            "inputd: permission notifications unavailable; "
+            "keysharp-input: permission notifications unavailable; "
             "persistent input privileges are disabled\n");
         permission_monitor_fail_open(daemon_state);
     }
@@ -1107,8 +1113,8 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         (void)process_hook_ingress(daemon_state);
 
         /* Runs backend maintenance, requests synth recovery on the sequencer if
-         * needed, refreshes available_capabilities (hotplug can change physical
-         * hook/block capabilities) and re-applies grabs when availability changes. */
+         * needed, refreshes available operations (hotplug can change physical
+         * hook/block operations) and re-applies grabs when availability changes. */
         run_backend_maintenance(daemon_state);
 
         apply_fail_open_if_requested(daemon_state);
@@ -1130,7 +1136,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     clear_hook_state(daemon_state);
 
     if (update_grab_state(daemon_state) != 0) {
-        fprintf(stderr, "inputd: failed to release grabs before shutdown waits\n");
+        fprintf(stderr, "keysharp-input: failed to release grabs before shutdown waits\n");
     }
 
     uint64_t shutdown_deadline_ms = monotonic_ms() + KSI_SHUTDOWN_TIMEOUT_MS;
@@ -1138,13 +1144,12 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     /* Queued physical events finalize as PASS during lane shutdown. */
     if (!lane_shutdown(&daemon_state->keyboard_lane, shutdown_deadline_ms)
         || !lane_shutdown(&daemon_state->mouse_lane, shutdown_deadline_ms)) {
-        fprintf(stderr, "inputd: shutdown deadline exceeded waiting for hook lanes; terminating\n");
+        fprintf(stderr, "keysharp-input: shutdown deadline exceeded waiting for hook lanes; terminating\n");
         fflush(NULL);
         _exit(EXIT_FAILURE);
     }
 
     /* Abort in-progress prompts so worker threads exit promptly. */
-    ksi_auth_cancel();
     ksi_worker_pool_request_stop(&g_worker_pool);
     ksi_worker_pool_request_stop(&g_identify_worker_pool);
 
@@ -1153,7 +1158,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 
     if (!ksi_worker_pool_join_before(&g_worker_pool, shutdown_deadline_ms)
         || !ksi_worker_pool_join_before(&g_identify_worker_pool, shutdown_deadline_ms)) {
-        fprintf(stderr, "inputd: shutdown deadline exceeded waiting for worker pool; terminating\n");
+        fprintf(stderr, "keysharp-input: shutdown deadline exceeded waiting for worker pool; terminating\n");
         fflush(NULL);
         _exit(EXIT_FAILURE);
     }
@@ -1171,7 +1176,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         output_queue_wake(&daemon_state->output_queue);
 
         if (!join_thread_before(daemon_state->sequencer_thread, shutdown_deadline_ms)) {
-            fprintf(stderr, "inputd: shutdown deadline exceeded waiting for output sequencer; terminating\n");
+            fprintf(stderr, "keysharp-input: shutdown deadline exceeded waiting for output sequencer; terminating\n");
             fflush(NULL);
             _exit(EXIT_FAILURE);
         }
@@ -1187,7 +1192,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     command_queue_destroy(&command_queue);
     free(daemon_state);
     ksi_ipc_server_close(server);
-    ksi_auth_store_destroy(permissions);
+    ksp_store_destroy(permissions);
     backend->stop();
 
     return 0;

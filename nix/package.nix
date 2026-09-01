@@ -6,11 +6,12 @@
 , libevdev
 , systemd
 , polkit
+, keysharpPermissionsSource
 }:
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "keysharp-input";
-  version = "0.1.0";
+  version = "0.2.0";
 
   src = lib.cleanSource ../.;
 
@@ -18,10 +19,10 @@ stdenv.mkDerivation (finalAttrs: {
   buildInputs = [ libevdev systemd ];
 
   cmakeFlags = [
-    "-DKEYSHARP_INPUTD_PKCHECK_PATH=${polkit}/bin/pkcheck"
-    "-DKEYSHARP_INPUTD_POLKIT_ACTION_DIR=share/polkit-1/actions"
-    "-DKEYSHARP_INPUTD_SETUP_ON_INSTALL=OFF"
-    "-DKEYSHARP_INPUTD_BUILD_HOOKTEST=OFF"
+    "-DKEYSHARP_PERMISSIONS_SOURCE_DIR=${keysharpPermissionsSource}"
+    "-DKEYSHARP_INPUT_PKCHECK_PATH=${polkit}/bin/pkcheck"
+    "-DKEYSHARP_INPUT_POLKIT_ACTION_DIR=share/polkit-1/actions"
+    "-DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF"
   ];
 
   doCheck = true;
@@ -31,7 +32,7 @@ stdenv.mkDerivation (finalAttrs: {
     description = "Privileged Linux keyboard and mouse hook/synthesis broker";
     homepage = "https://github.com/keysharp-org/keysharp-input";
     license = lib.licenses.mit;
-    mainProgram = "keysharp-inputd";
+    mainProgram = "keysharp-input";
     platforms = lib.platforms.linux;
   };
 })

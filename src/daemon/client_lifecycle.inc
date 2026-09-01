@@ -17,7 +17,7 @@ static void remove_client(ksi_daemon_state *state, nfds_t index)
     (*count)--;
 
     if (update_grab_state(state) != 0) {
-        fprintf(stderr, "inputd: failed to update grab state after client removal\n");
+        fprintf(stderr, "keysharp-input: failed to update grab state after client removal\n");
     }
 
     /* If the last client just left, release any synthetic keys still held on the

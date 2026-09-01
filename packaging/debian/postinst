@@ -13,7 +13,7 @@ if [ "${1:-}" = configure ]; then
     /usr/bin/systemctl daemon-reload || true
 
     set +e
-    /usr/bin/keysharp-inputd --install-input-access
+    /usr/bin/keysharp-input daemon --install-input-access
     setup_status=$?
     set -e
 
@@ -21,7 +21,7 @@ if [ "${1:-}" = configure ]; then
         0) ;;
         2)
             echo "keysharp-input: files installed, but live device/service activation was incomplete." >&2
-            echo "Run 'sudo keysharp-inputd --install-input-access' after resolving the reported issue." >&2
+            echo "Run 'sudo keysharp-input daemon --install-input-access' after resolving the reported issue." >&2
             ;;
         *)
             echo "keysharp-input: persistent input-access setup failed (status $setup_status)." >&2

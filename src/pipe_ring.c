@@ -56,7 +56,7 @@ int ksi_pipe_ring_init(ksi_pipe_ring *ring, size_t element_size, size_t capacity
         return -1;
     }
 
-    if (pipe(pipe_fds) != 0) {
+    if (pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK) != 0) {
         pthread_mutex_destroy(&implementation->mutex);
         free(implementation->buffer);
         free(implementation);
@@ -67,18 +67,6 @@ int ksi_pipe_ring_init(ksi_pipe_ring *ring, size_t element_size, size_t capacity
     implementation->capacity = capacity;
     implementation->wake_read_fd = pipe_fds[0];
     implementation->wake_write_fd = pipe_fds[1];
-
-    {
-        int flags = fcntl(implementation->wake_read_fd, F_GETFL);
-        if (flags >= 0) {
-            (void)fcntl(implementation->wake_read_fd, F_SETFL, flags | O_NONBLOCK);
-        }
-
-        flags = fcntl(implementation->wake_write_fd, F_GETFL);
-        if (flags >= 0) {
-            (void)fcntl(implementation->wake_write_fd, F_SETFL, flags | O_NONBLOCK);
-        }
-    }
 
     ring->implementation = implementation;
     return 0;

@@ -1,7 +1,7 @@
-#ifndef KEYSHARP_INPUTD_LINUX_SYNTH_H
-#define KEYSHARP_INPUTD_LINUX_SYNTH_H
+#ifndef KEYSHARP_INPUT_INTERNAL_LINUX_SYNTH_H
+#define KEYSHARP_INPUT_INTERNAL_LINUX_SYNTH_H
 
-#include "keysharp_inputd/protocol.h"
+#include "internal/protocol.h"
 
 #include <stdbool.h>
 #include <stdint.h>

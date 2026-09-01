@@ -1,7 +1,8 @@
-#include "keysharp_inputd/platform.h"
+#include "internal/platform.h"
+#include "protocol_internal.h"
 
-#include "keysharp_inputd/linux_devices.h"
-#include "keysharp_inputd/linux_synth.h"
+#include "internal/linux_devices.h"
+#include "internal/linux_synth.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,14 +19,9 @@ static int linux_start(void)
     return 0;
 }
 
-static void linux_prepare_capabilities(uint32_t requested_capabilities)
+static void linux_prepare_scopes(uint32_t requested_scopes)
 {
-    const uint32_t privileged_input =
-        KSI_CAP_HOOK_KEYBOARD | KSI_CAP_HOOK_MOUSE
-        | KSI_CAP_SYNTH_KEYBOARD | KSI_CAP_SYNTH_MOUSE
-        | KSI_CAP_BLOCK_INPUT;
-
-    if ((requested_capabilities & privileged_input) == 0u
+    if ((requested_scopes & KSI_INPUT_PERMISSION_SCOPES) == 0u
         || ksi_linux_synth_is_started()) {
         return;
     }
@@ -42,20 +38,33 @@ static void linux_prepare_capabilities(uint32_t requested_capabilities)
     }
 }
 
-static uint32_t linux_get_available_capabilities(void)
+static uint64_t linux_get_available_operations(void)
 {
-    uint32_t caps = 0;
+    return KSI_OPERATION_ALL;
+}
+
+static uint64_t linux_get_ready_operations(void)
+{
+    uint64_t operations = KSI_OPERATION_QUERY_INDICATORS
+        | KSI_OPERATION_QUERY_POINTER_POSITION
+        | KSI_OPERATION_QUERY_IDLE_TIME
+        | KSI_OPERATION_QUERY_MODIFIERS;
     bool synth_available = ksi_linux_synth_is_available();
 
     if (synth_available) {
-        caps |= KSI_CAP_SYNTH_KEYBOARD | KSI_CAP_SYNTH_MOUSE;
+        operations |= KSI_OPERATION_SYNTHESIZE_KEYBOARD
+            | KSI_OPERATION_SYNTHESIZE_MOUSE;
     }
-
-    if (synth_available && ksi_linux_devices_has_candidates()) {
-        caps |= KSI_CAP_HOOK_KEYBOARD | KSI_CAP_HOOK_MOUSE | KSI_CAP_BLOCK_INPUT;
+    if (ksi_linux_devices_has_candidates()) {
+        operations |= KSI_OPERATION_QUERY_KEY_STATE
+            | KSI_OPERATION_QUERY_POINTER_BUTTONS;
+        if (synth_available) {
+            operations |= KSI_OPERATION_HOOK_KEYBOARD
+                | KSI_OPERATION_HOOK_MOUSE
+                | KSI_OPERATION_BLOCK_INPUT;
+        }
     }
-
-    return caps;
+    return operations;
 }
 
 static void linux_stop(void)
@@ -157,8 +166,9 @@ static const ksi_platform_backend linux_backend = {
     .name = "linux",
     .start = linux_start,
     .stop = linux_stop,
-    .prepare_capabilities = linux_prepare_capabilities,
-    .get_available_capabilities = linux_get_available_capabilities,
+    .prepare_scopes = linux_prepare_scopes,
+    .get_available_operations = linux_get_available_operations,
+    .get_ready_operations = linux_get_ready_operations,
     .poll_fds = linux_poll_fds,
     .process_fd = linux_process_fd,
     .get_idle_time = linux_get_idle_time,

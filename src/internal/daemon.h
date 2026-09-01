@@ -1,9 +1,9 @@
-#ifndef KEYSHARP_INPUTD_DAEMON_H
-#define KEYSHARP_INPUTD_DAEMON_H
+#ifndef KEYSHARP_INPUT_INTERNAL_DAEMON_H
+#define KEYSHARP_INPUT_INTERNAL_DAEMON_H
 
 #include <stdbool.h>
 
-#include "keysharp_inputd/globals.h"
+#include "internal/globals.h"
 
 typedef struct ksi_daemon_options {
     const char *socket_path;

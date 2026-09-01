@@ -1,4 +1,4 @@
-# Grant the active session access only to keysharp-inputd's virtual devices.
+# Grant the active session access only to the broker's virtual devices.
 ACTION!="add|change", GOTO="keysharp_uaccess_end"
 SUBSYSTEM!="input", GOTO="keysharp_uaccess_end"
 

@@ -1,5 +1,5 @@
-#ifndef KEYSHARP_INPUTD_PIPE_RING_H
-#define KEYSHARP_INPUTD_PIPE_RING_H
+#ifndef KEYSHARP_INPUT_PIPE_RING_H
+#define KEYSHARP_INPUT_PIPE_RING_H
 
 #include <stdbool.h>
 #include <stddef.h>

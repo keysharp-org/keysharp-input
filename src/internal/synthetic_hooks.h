@@ -1,7 +1,7 @@
-#ifndef KEYSHARP_INPUTD_SYNTHETIC_HOOKS_H
-#define KEYSHARP_INPUTD_SYNTHETIC_HOOKS_H
+#ifndef KEYSHARP_INPUT_INTERNAL_SYNTHETIC_HOOKS_H
+#define KEYSHARP_INPUT_INTERNAL_SYNTHETIC_HOOKS_H
 
-#include "keysharp_inputd/protocol.h"
+#include "internal/protocol.h"
 
 #include <stdbool.h>
 #include <stddef.h>

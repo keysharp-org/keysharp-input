@@ -1,6 +1,6 @@
 #include "connection_ref.h"
 
-#include "keysharp_inputd/ipc.h"
+#include "internal/ipc.h"
 
 #include <limits.h>
 #include <pthread.h>
@@ -22,7 +22,7 @@ typedef struct ksi_hook_call_frame {
     bool pumping;
 } ksi_hook_call_frame;
 
-/* One ref is one client hook stream, shared by its keyboard and mouse
+/* One ref is one callback stream, shared by its keyboard and mouse
  * subscriptions. The call stack is the complete serialization model:
  * ordinary callbacks enter only at depth zero; nested callbacks may enter
  * while the top callback is synchronously pumping Send. */
@@ -31,7 +31,6 @@ struct ksi_hook_send_ref {
     atomic_uint ref_count;
     atomic_bool valid;
     atomic_uint stalled_lanes;
-    atomic_uint protocol_minor;
     pthread_mutex_t send_mutex;
     pthread_mutex_t turn_mutex;
     pthread_cond_t turn_condition;
@@ -77,7 +76,6 @@ ksi_hook_send_ref *hook_send_ref_create(int client_fd)
     ref->fd = client_fd;
     atomic_init(&ref->ref_count, 1u);
     atomic_init(&ref->valid, true);
-    atomic_init(&ref->protocol_minor, KSI_PROTOCOL_MINOR);
 
     if (pthread_mutex_init(&ref->send_mutex, NULL) != 0) {
         free(ref);
@@ -112,13 +110,6 @@ ksi_hook_send_ref *hook_send_ref_create(int client_fd)
     registry = ref;
     pthread_mutex_unlock(&registry_mutex);
     return ref;
-}
-
-void hook_send_ref_set_protocol_minor(ksi_hook_send_ref *ref, uint16_t protocol_minor)
-{
-    if (ref != NULL) {
-        atomic_store(&ref->protocol_minor, protocol_minor);
-    }
 }
 
 bool hook_send_ref_acquire(ksi_hook_send_ref *ref)
@@ -187,9 +178,9 @@ void hook_send_ref_clear_stalled(ksi_hook_send_ref *ref, size_t lane_index)
 
 int hook_send_ref_send(
     ksi_hook_send_ref *ref,
-    uint32_t message_type,
-    uint32_t client_id,
-    uint64_t correlation_id,
+    uint16_t opcode,
+    uint16_t flags,
+    uint64_t request_id,
     const void *payload,
     size_t payload_size)
 {
@@ -203,8 +194,7 @@ int hook_send_ref_send(
 
     if (atomic_load(&ref->valid)) {
         result = ksi_ipc_send_framed_message(
-            ref->fd, (uint16_t)atomic_load(&ref->protocol_minor),
-            message_type, client_id, correlation_id, payload, payload_size);
+            ref->fd, opcode, flags, request_id, payload, payload_size);
     }
 
     pthread_mutex_unlock(&ref->send_mutex);
@@ -368,6 +358,21 @@ bool hook_send_ref_begin_pump(ksi_hook_send_ref *ref, uint64_t event_id)
     return ok;
 }
 
+uint64_t hook_send_ref_current_event_id(ksi_hook_send_ref *ref)
+{
+    uint64_t event_id = 0u;
+
+    if (ref == NULL || !atomic_load(&ref->valid)) {
+        return 0u;
+    }
+    pthread_mutex_lock(&ref->turn_mutex);
+    if (ref->call_depth != 0u) {
+        event_id = ref->calls[ref->call_depth - 1u].event_id;
+    }
+    pthread_mutex_unlock(&ref->turn_mutex);
+    return event_id;
+}
+
 bool hook_send_ref_end_pump(ksi_hook_send_ref *ref, uint64_t event_id)
 {
     size_t index;
@@ -430,9 +435,9 @@ void hook_send_ref_release(ksi_hook_send_ref *ref)
 
 int ipc_send_locked(
     int client_fd,
-    uint32_t message_type,
-    uint32_t client_id,
-    uint64_t correlation_id,
+    uint16_t opcode,
+    uint16_t flags,
+    uint64_t request_id,
     const void *payload,
     size_t payload_size)
 {
@@ -457,7 +462,7 @@ int ipc_send_locked(
     }
 
     result = hook_send_ref_send(
-        ref, message_type, client_id, correlation_id, payload, payload_size);
+        ref, opcode, flags, request_id, payload, payload_size);
     hook_send_ref_release(ref);
     return result;
 }

@@ -1,8 +1,9 @@
-#include "keysharp_inputd/linux_synth.h"
+#include "internal/linux_synth.h"
 
-#include "keysharp_inputd/globals.h"
-#include "keysharp_inputd/linux_devices.h"
+#include "internal/globals.h"
+#include "internal/linux_devices.h"
 #include "linux_device_filter.h"
+#include "../protocol_internal.h"
 #include "vk_evdev.h"
 
 #include <errno.h>
@@ -40,16 +41,12 @@
  * while preserving the same nominal throughput. Short sends never reach the
  * threshold and pay nothing, so the common case runs at full speed.
  *
- * The counter is SHARED across every output path that runs on the sequencer
- * thread -- bulk client synthesis AND single-event passthrough replay -- and
- * PERSISTS across back-to-back emits rather than resetting per batch. This is
- * what lets replay be paced: a passthrough replay is one event per call, so a
- * per-batch reset would keep it forever below the threshold, but a *sustained*
- * burst (mouse REL motion floods, key autorepeat, several grabbed devices
- * interleaving) is a stream of such calls arriving back-to-back on the one
- * sequencer thread and can overflow the consumer ring exactly like a long Send.
- * By carrying the counter across calls, that stream accumulates and paces the
- * same way synthesis does.
+ * The counter is shared across every output path on the sequencer thread: bulk
+ * client synthesis and single-event passthrough replay. It persists across
+ * back-to-back emits so a sustained replay burst reaches the pacing threshold
+ * even though each replay call contains only one event. Mouse motion floods,
+ * key autorepeat, and interleaved grabbed devices can overflow the consumer ring
+ * in the same way as a long Send, so both paths use the same pacing stream.
  *
  * Isolated input must stay free (no per-keystroke latency), so the counter is
  * reset whenever the gap since the previous emit exceeds KSI_SYNTH_PACE_IDLE_
@@ -57,9 +54,8 @@
  * drain, so nothing we sent is still in flight and the next event starts a
  * fresh chunk. A single passed keystroke (or one every few hundred ms) therefore
  * never accumulates toward the threshold and never sleeps, while a genuine
- * sub-millisecond flood does. The gap-based reset also spaces successive client
- * Sends: two Sends separated by human-scale time each start fresh, exactly as
- * the old per-batch reset did. */
+ * sub-millisecond flood does. Client Sends separated by human-scale time also
+ * begin with a fresh counter. */
 #define KSI_SYNTH_PACE_EVENTS 16
 #define KSI_SYNTH_PACE_SLEEP_NS (350L * 1000L) /* 0.35 ms */
 /* Idle gap after which the consumer is assumed fully drained (nothing of ours
@@ -181,15 +177,15 @@ static uint32_t keyboard_indicator_flags_for_hook(void)
     ksi_linux_devices_get_indicator_state(&caps_lock, &num_lock, &scroll_lock);
 
     if (caps_lock) {
-        flags |= KSI_LLKHF_CAPS_LOCK_ON;
+        flags |= KSI_KEYBOARD_HOOK_CAPS_LOCK_ON;
     }
 
     if (num_lock) {
-        flags |= KSI_LLKHF_NUM_LOCK_ON;
+        flags |= KSI_KEYBOARD_HOOK_NUM_LOCK_ON;
     }
 
     if (scroll_lock) {
-        flags |= KSI_LLKHF_SCROLL_LOCK_ON;
+        flags |= KSI_KEYBOARD_HOOK_SCROLL_LOCK_ON;
     }
 
     return flags;
@@ -248,10 +244,9 @@ static int emit_event_to(int fd, uint16_t type, uint16_t code, int32_t value)
         uint64_t now_ns = monotonic_ns();
 
         /* An idle gap this long means the consumer has drained everything we
-         * sent, so nothing is in flight: start a fresh chunk. This keeps
-         * isolated keystrokes free (they never accumulate to the threshold) and
-         * reproduces the old per-batch reset for Sends spaced by human time,
-         * while still letting a genuine sub-millisecond burst accumulate. */
+         * sent, so nothing is in flight and the next event starts a fresh chunk.
+         * Isolated keystrokes never reach the threshold, while a sustained
+         * sub-millisecond burst still accumulates. */
         if (last_emit_ns != 0 && now_ns != 0
             && now_ns - last_emit_ns >= KSI_SYNTH_PACE_IDLE_RESET_NS) {
             synth_pace_events = 0;
@@ -385,17 +380,17 @@ static void note_enqueued_synth_mouse(const ksi_mouseinput *input)
         return;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_LEFTDOWN) != 0)   note_enqueued_synth_mouse_button(BTN_LEFT, true);
-    if ((input->flags & KSI_MOUSEEVENTF_LEFTUP) != 0)     note_enqueued_synth_mouse_button(BTN_LEFT, false);
-    if ((input->flags & KSI_MOUSEEVENTF_RIGHTDOWN) != 0)  note_enqueued_synth_mouse_button(BTN_RIGHT, true);
-    if ((input->flags & KSI_MOUSEEVENTF_RIGHTUP) != 0)    note_enqueued_synth_mouse_button(BTN_RIGHT, false);
-    if ((input->flags & KSI_MOUSEEVENTF_MIDDLEDOWN) != 0) note_enqueued_synth_mouse_button(BTN_MIDDLE, true);
-    if ((input->flags & KSI_MOUSEEVENTF_MIDDLEUP) != 0)   note_enqueued_synth_mouse_button(BTN_MIDDLE, false);
+    if ((input->flags & KSI_MOUSE_LEFT_DOWN) != 0)   note_enqueued_synth_mouse_button(BTN_LEFT, true);
+    if ((input->flags & KSI_MOUSE_LEFT_UP) != 0)     note_enqueued_synth_mouse_button(BTN_LEFT, false);
+    if ((input->flags & KSI_MOUSE_RIGHT_DOWN) != 0)  note_enqueued_synth_mouse_button(BTN_RIGHT, true);
+    if ((input->flags & KSI_MOUSE_RIGHT_UP) != 0)    note_enqueued_synth_mouse_button(BTN_RIGHT, false);
+    if ((input->flags & KSI_MOUSE_MIDDLE_DOWN) != 0) note_enqueued_synth_mouse_button(BTN_MIDDLE, true);
+    if ((input->flags & KSI_MOUSE_MIDDLE_UP) != 0)   note_enqueued_synth_mouse_button(BTN_MIDDLE, false);
 
     xbutton = mouse_data_to_xbutton(input->mouse_data);
 
-    if ((input->flags & KSI_MOUSEEVENTF_XDOWN) != 0) note_enqueued_synth_mouse_button(xbutton, true);
-    if ((input->flags & KSI_MOUSEEVENTF_XUP) != 0)   note_enqueued_synth_mouse_button(xbutton, false);
+    if ((input->flags & KSI_MOUSE_X_DOWN) != 0) note_enqueued_synth_mouse_button(xbutton, true);
+    if ((input->flags & KSI_MOUSE_X_UP) != 0)   note_enqueued_synth_mouse_button(xbutton, false);
 }
 
 /* Update the enqueue-time logical synthetic key state for a batch that was just
@@ -504,14 +499,14 @@ static int send_unicode_input(uint32_t codepoint)
     int result = 0;
 
     if (codepoint == 0 || codepoint > 0x10FFFFu) {
-        fprintf(stderr, "inputd: unsupported unicode codepoint U+%x\n", codepoint);
+        fprintf(stderr, "keysharp-input: unsupported unicode codepoint U+%x\n", codepoint);
         return -1;
     }
 
     length = snprintf(hex, sizeof(hex), codepoint <= 0xFFFFu ? "%04x" : "%x", codepoint);
 
     if (length <= 0 || length >= (int)sizeof(hex)) {
-        fprintf(stderr, "inputd: failed to format unicode codepoint U+%x\n", codepoint);
+        fprintf(stderr, "keysharp-input: failed to format unicode codepoint U+%x\n", codepoint);
         return -1;
     }
 
@@ -534,7 +529,7 @@ static int send_unicode_input(uint32_t codepoint)
     }
 
     if (result != 0) {
-        fprintf(stderr, "inputd: failed to start unicode input sequence U+%x: %s\n", codepoint, strerror(errno));
+        fprintf(stderr, "keysharp-input: failed to start unicode input sequence U+%x: %s\n", codepoint, strerror(errno));
         return -1;
     }
 
@@ -542,17 +537,17 @@ static int send_unicode_input(uint32_t codepoint)
         int key_code = hex_digit_to_key(hex[i]);
 
         if (key_code < 0 || send_key_stroke(key_code) != 0) {
-            fprintf(stderr, "inputd: failed to emit unicode hex digit '%c' for U+%x: %s\n", hex[i], codepoint, strerror(errno));
+            fprintf(stderr, "keysharp-input: failed to emit unicode hex digit '%c' for U+%x: %s\n", hex[i], codepoint, strerror(errno));
             return -1;
         }
     }
 
     if (send_key_stroke(KEY_SPACE) != 0) {
-        fprintf(stderr, "inputd: failed to commit unicode input U+%x: %s\n", codepoint, strerror(errno));
+        fprintf(stderr, "keysharp-input: failed to commit unicode input U+%x: %s\n", codepoint, strerror(errno));
         return -1;
     }
 
-    if (g_verbose) printf("inputd: synth unicode U+%x via ctrl+shift+u\n", codepoint);
+    if (g_verbose) printf("keysharp-input: synth unicode U+%x via ctrl+shift+u\n", codepoint);
     return 0;
 }
 
@@ -570,7 +565,7 @@ static int send_unicode_utf16_unit(uint16_t unit)
         pending_high_surrogate = 0;
 
         if (high < 0xD800u || high > 0xDBFFu) {
-            fprintf(stderr, "inputd: low unicode surrogate 0x%x without preceding high surrogate\n", unit);
+            fprintf(stderr, "keysharp-input: low unicode surrogate 0x%x without preceding high surrogate\n", unit);
             return -1;
         }
 
@@ -585,7 +580,7 @@ static int send_unicode_utf16_unit(uint16_t unit)
 static int enable_event(int event_type)
 {
     if (ioctl(uinput_fd, UI_SET_EVBIT, event_type) < 0) {
-        fprintf(stderr, "inputd: uinput UI_SET_EVBIT(%d) failed: %s\n", event_type, strerror(errno));
+        fprintf(stderr, "keysharp-input: uinput UI_SET_EVBIT(%d) failed: %s\n", event_type, strerror(errno));
         return -1;
     }
 
@@ -595,7 +590,7 @@ static int enable_event(int event_type)
 static int enable_key(int key_code)
 {
     if (ioctl(uinput_fd, UI_SET_KEYBIT, key_code) < 0) {
-        fprintf(stderr, "inputd: uinput UI_SET_KEYBIT(%d) failed: %s\n", key_code, strerror(errno));
+        fprintf(stderr, "keysharp-input: uinput UI_SET_KEYBIT(%d) failed: %s\n", key_code, strerror(errno));
         return -1;
     }
 
@@ -605,7 +600,7 @@ static int enable_key(int key_code)
 static int enable_relative(int relative_code)
 {
     if (ioctl(uinput_fd, UI_SET_RELBIT, relative_code) < 0) {
-        fprintf(stderr, "inputd: uinput UI_SET_RELBIT(%d) failed: %s\n", relative_code, strerror(errno));
+        fprintf(stderr, "keysharp-input: uinput UI_SET_RELBIT(%d) failed: %s\n", relative_code, strerror(errno));
         return -1;
     }
 
@@ -715,12 +710,12 @@ static int configure_uinput_device(void)
     setup.id.version = KSI_SYNTH_DEVICE_VERSION;
 
     if (ioctl(uinput_fd, UI_DEV_SETUP, &setup) < 0) {
-        fprintf(stderr, "inputd: uinput UI_DEV_SETUP failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: uinput UI_DEV_SETUP failed: %s\n", strerror(errno));
         return -1;
     }
 
     if (ioctl(uinput_fd, UI_DEV_CREATE) < 0) {
-        fprintf(stderr, "inputd: uinput UI_DEV_CREATE failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: uinput UI_DEV_CREATE failed: %s\n", strerror(errno));
         return -1;
     }
 
@@ -736,18 +731,18 @@ static int configure_abs_uinput_device(void)
      * (like a drawing tablet in mouse mode), not a touchscreen or trackpad.
      * The compositor maps the ABS range [0, 65535] directly to screen area. */
     if (ioctl(uinput_abs_fd, UI_SET_PROPBIT, INPUT_PROP_POINTER) < 0) {
-        fprintf(stderr, "inputd: UI_SET_PROPBIT(INPUT_PROP_POINTER) failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: UI_SET_PROPBIT(INPUT_PROP_POINTER) failed: %s\n", strerror(errno));
         /* Non-fatal: proceed without the property; the device may still work
          * under xf86-input-evdev even if libinput classifies it differently. */
     }
 
     if (ioctl(uinput_abs_fd, UI_SET_EVBIT, EV_ABS) < 0) {
-        fprintf(stderr, "inputd: abs device UI_SET_EVBIT(EV_ABS) failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_SET_EVBIT(EV_ABS) failed: %s\n", strerror(errno));
         return -1;
     }
 
     if (ioctl(uinput_abs_fd, UI_SET_EVBIT, EV_KEY) < 0) {
-        fprintf(stderr, "inputd: abs device UI_SET_EVBIT(EV_KEY) failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_SET_EVBIT(EV_KEY) failed: %s\n", strerror(errno));
         return -1;
     }
 
@@ -761,13 +756,13 @@ static int configure_abs_uinput_device(void)
         || ioctl(uinput_abs_fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0
         || ioctl(uinput_abs_fd, UI_SET_KEYBIT, BTN_SIDE) < 0
         || ioctl(uinput_abs_fd, UI_SET_KEYBIT, BTN_EXTRA) < 0) {
-        fprintf(stderr, "inputd: abs device UI_SET_KEYBIT failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_SET_KEYBIT failed: %s\n", strerror(errno));
         return -1;
     }
 
     if (ioctl(uinput_abs_fd, UI_SET_ABSBIT, ABS_X) < 0
         || ioctl(uinput_abs_fd, UI_SET_ABSBIT, ABS_Y) < 0) {
-        fprintf(stderr, "inputd: abs device UI_SET_ABSBIT failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_SET_ABSBIT failed: %s\n", strerror(errno));
         return -1;
     }
 
@@ -779,7 +774,7 @@ static int configure_abs_uinput_device(void)
     setup.id.version = KSI_SYNTH_DEVICE_VERSION;
 
     if (ioctl(uinput_abs_fd, UI_DEV_SETUP, &setup) < 0) {
-        fprintf(stderr, "inputd: abs device UI_DEV_SETUP failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_DEV_SETUP failed: %s\n", strerror(errno));
         return -1;
     }
 
@@ -790,18 +785,18 @@ static int configure_abs_uinput_device(void)
 
     abs_setup.code = ABS_X;
     if (ioctl(uinput_abs_fd, UI_ABS_SETUP, &abs_setup) < 0) {
-        fprintf(stderr, "inputd: abs device UI_ABS_SETUP(ABS_X) failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_ABS_SETUP(ABS_X) failed: %s\n", strerror(errno));
         return -1;
     }
 
     abs_setup.code = ABS_Y;
     if (ioctl(uinput_abs_fd, UI_ABS_SETUP, &abs_setup) < 0) {
-        fprintf(stderr, "inputd: abs device UI_ABS_SETUP(ABS_Y) failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_ABS_SETUP(ABS_Y) failed: %s\n", strerror(errno));
         return -1;
     }
 
     if (ioctl(uinput_abs_fd, UI_DEV_CREATE) < 0) {
-        fprintf(stderr, "inputd: abs device UI_DEV_CREATE failed: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: abs device UI_DEV_CREATE failed: %s\n", strerror(errno));
         return -1;
     }
 
@@ -813,7 +808,7 @@ int ksi_linux_synth_start(void)
     uinput_fd = open(KSI_UINPUT_PATH, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 
     if (uinput_fd < 0) {
-        fprintf(stderr, "inputd: cannot open %s: %s\n", KSI_UINPUT_PATH, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot open %s: %s\n", KSI_UINPUT_PATH, strerror(errno));
         return 0;
     }
 
@@ -823,12 +818,12 @@ int ksi_linux_synth_start(void)
         return 0;
     }
 
-    puts("inputd: uinput relative mouse device created");
+    puts("keysharp-input: uinput relative mouse device created");
 
     uinput_abs_fd = open(KSI_UINPUT_PATH, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 
     if (uinput_abs_fd < 0) {
-        fprintf(stderr, "inputd: cannot open %s for abs device: %s\n", KSI_UINPUT_PATH, strerror(errno));
+        fprintf(stderr, "keysharp-input: cannot open %s for abs device: %s\n", KSI_UINPUT_PATH, strerror(errno));
         /* Non-fatal: absolute mouse moves won't work but everything else will. */
         return 0;
     }
@@ -836,11 +831,11 @@ int ksi_linux_synth_start(void)
     if (configure_abs_uinput_device() != 0) {
         close(uinput_abs_fd);
         uinput_abs_fd = -1;
-        fprintf(stderr, "inputd: failed to create absolute pointer device\n");
+        fprintf(stderr, "keysharp-input: failed to create absolute pointer device\n");
         return 0;
     }
 
-    puts("inputd: uinput absolute pointer device created");
+    puts("keysharp-input: uinput absolute pointer device created");
     return 0;
 }
 
@@ -852,14 +847,14 @@ void ksi_linux_synth_stop(void)
         (void)ioctl(uinput_fd, UI_DEV_DESTROY);
         close(uinput_fd);
         uinput_fd = -1;
-        puts("inputd: uinput relative mouse device destroyed");
+        puts("keysharp-input: uinput relative mouse device destroyed");
     }
 
     if (uinput_abs_fd >= 0) {
         (void)ioctl(uinput_abs_fd, UI_DEV_DESTROY);
         close(uinput_abs_fd);
         uinput_abs_fd = -1;
-        puts("inputd: uinput absolute pointer device destroyed");
+        puts("keysharp-input: uinput absolute pointer device destroyed");
     }
 }
 
@@ -916,7 +911,7 @@ bool ksi_linux_synth_needs_recovery(void)
  * daemon silently sitting on a dead synth output. */
 void ksi_linux_synth_recreate(void)
 {
-    fprintf(stderr, "inputd: synthetic output device write failed; recreating uinput devices\n");
+    fprintf(stderr, "keysharp-input: synthetic output device write failed; recreating uinput devices\n");
     ksi_linux_synth_stop();
     synth_write_failed = false;
     (void)ksi_linux_synth_start();
@@ -940,21 +935,21 @@ static int resolve_synth_key_code(const ksi_keybdinput *input, int *out_value)
     int key_code = -1;
 
     if (out_value != NULL) {
-        *out_value = (input->flags & KSI_KEYEVENTF_KEYUP) != 0 ? 0 : 1;
+        *out_value = (input->flags & KSI_KEY_UP) != 0 ? 0 : 1;
     }
 
-    if ((input->flags & KSI_KEYEVENTF_UNICODE) != 0) {
+    if ((input->flags & KSI_KEY_UNICODE) != 0) {
         return -1;
     }
 
-    if ((input->flags & KSI_KEYEVENTF_SCANCODE) != 0) {
-        bool extended = (input->flags & KSI_KEYEVENTF_EXTENDEDKEY) != 0;
+    if ((input->flags & KSI_KEY_SCANCODE) != 0) {
+        bool extended = (input->flags & KSI_KEY_EXTENDED) != 0;
         key_code = scan_to_evdev_key(input->scan, extended);
     }
 
     if (key_code < 0
         && input->vk == 0x0Du
-        && (input->flags & KSI_KEYEVENTF_EXTENDEDKEY) != 0) {
+        && (input->flags & KSI_KEY_EXTENDED) != 0) {
         key_code = KEY_KPENTER;
     }
 
@@ -977,23 +972,23 @@ static bool keyboard_input_to_hook_event(
     }
 
     memset(event, 0, sizeof(*event));
-    key_up = (input->flags & KSI_KEYEVENTF_KEYUP) != 0;
-    flags = KSI_LLKHF_INJECTED | keyboard_indicator_flags_for_hook();
+    key_up = (input->flags & KSI_KEY_UP) != 0;
+    flags = KSI_KEYBOARD_HOOK_INJECTED | keyboard_indicator_flags_for_hook();
 
     if (key_up) {
-        flags |= KSI_LLKHF_UP;
+        flags |= KSI_KEYBOARD_HOOK_UP;
     }
 
-    if ((input->flags & KSI_KEYEVENTF_EXTENDEDKEY) != 0) {
-        flags |= KSI_LLKHF_EXTENDED;
+    if ((input->flags & KSI_KEY_EXTENDED) != 0) {
+        flags |= KSI_KEYBOARD_HOOK_EXTENDED;
     }
 
-    event->message = key_up ? KSI_WM_KEYUP : KSI_WM_KEYDOWN;
+    event->message = key_up ? KSI_MESSAGE_KEY_UP : KSI_MESSAGE_KEY_DOWN;
     event->flags = flags;
     event->time_ms = synth_hook_time_ms(input->time);
     event->extra_info = input->extra_info;
 
-    if ((input->flags & KSI_KEYEVENTF_UNICODE) != 0) {
+    if ((input->flags & KSI_KEY_UNICODE) != 0) {
         event->vk_code = KSI_VK_PACKET;
         event->scan_code = input->scan;
         return true;
@@ -1031,17 +1026,17 @@ static bool mouse_input_to_hook_event(
     }
 
     memset(event, 0, sizeof(*event));
-    event->flags = KSI_LLMHF_INJECTED;
+    event->flags = KSI_MOUSE_HOOK_INJECTED;
     event->time_ms = synth_hook_time_ms(input->time);
     event->extra_info = input->extra_info;
 
-    if ((input->flags & KSI_MOUSEEVENTF_MOVE) != 0) {
-        event->message = KSI_WM_MOUSEMOVE;
+    if ((input->flags & KSI_MOUSE_MOVE) != 0) {
+        event->message = KSI_MESSAGE_MOUSE_MOVE;
         event->x = input->dx;
         event->y = input->dy;
 
-        if ((input->flags & KSI_MOUSEEVENTF_ABSOLUTE) != 0) {
-            event->mouse_data = KSI_MOUSEEVENTF_ABSOLUTE;
+        if ((input->flags & KSI_MOUSE_ABSOLUTE) != 0) {
+            event->mouse_data = KSI_MOUSE_ABSOLUTE;
         } else {
             event->delta_x = input->dx;
             event->delta_y = input->dy;
@@ -1050,56 +1045,56 @@ static bool mouse_input_to_hook_event(
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_WHEEL) != 0) {
-        event->message = KSI_WM_MOUSEWHEEL;
+    if ((input->flags & KSI_MOUSE_WHEEL) != 0) {
+        event->message = KSI_MESSAGE_MOUSE_WHEEL;
         event->mouse_data = input->mouse_data << 16;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_HWHEEL) != 0) {
-        event->message = KSI_WM_MOUSEHWHEEL;
+    if ((input->flags & KSI_MOUSE_HORIZONTAL_WHEEL) != 0) {
+        event->message = KSI_MESSAGE_MOUSE_HORIZONTAL_WHEEL;
         event->mouse_data = input->mouse_data << 16;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_LEFTDOWN) != 0) {
-        event->message = KSI_WM_LBUTTONDOWN;
+    if ((input->flags & KSI_MOUSE_LEFT_DOWN) != 0) {
+        event->message = KSI_MESSAGE_LEFT_BUTTON_DOWN;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_LEFTUP) != 0) {
-        event->message = KSI_WM_LBUTTONUP;
+    if ((input->flags & KSI_MOUSE_LEFT_UP) != 0) {
+        event->message = KSI_MESSAGE_LEFT_BUTTON_UP;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_RIGHTDOWN) != 0) {
-        event->message = KSI_WM_RBUTTONDOWN;
+    if ((input->flags & KSI_MOUSE_RIGHT_DOWN) != 0) {
+        event->message = KSI_MESSAGE_RIGHT_BUTTON_DOWN;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_RIGHTUP) != 0) {
-        event->message = KSI_WM_RBUTTONUP;
+    if ((input->flags & KSI_MOUSE_RIGHT_UP) != 0) {
+        event->message = KSI_MESSAGE_RIGHT_BUTTON_UP;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_MIDDLEDOWN) != 0) {
-        event->message = KSI_WM_MBUTTONDOWN;
+    if ((input->flags & KSI_MOUSE_MIDDLE_DOWN) != 0) {
+        event->message = KSI_MESSAGE_MIDDLE_BUTTON_DOWN;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_MIDDLEUP) != 0) {
-        event->message = KSI_WM_MBUTTONUP;
+    if ((input->flags & KSI_MOUSE_MIDDLE_UP) != 0) {
+        event->message = KSI_MESSAGE_MIDDLE_BUTTON_UP;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_XDOWN) != 0) {
-        event->message = KSI_WM_XBUTTONDOWN;
+    if ((input->flags & KSI_MOUSE_X_DOWN) != 0) {
+        event->message = KSI_MESSAGE_X_BUTTON_DOWN;
         event->mouse_data = input->mouse_data;
         return true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_XUP) != 0) {
-        event->message = KSI_WM_XBUTTONUP;
+    if ((input->flags & KSI_MOUSE_X_UP) != 0) {
+        event->message = KSI_MESSAGE_X_BUTTON_UP;
         event->mouse_data = input->mouse_data;
         return true;
     }
@@ -1124,7 +1119,7 @@ bool ksi_linux_synth_input_to_hook_event(
             return false;
         }
 
-        *hook_type = KSI_HOOK_KEYBOARD_LL;
+        *hook_type = KSI_HOOK_KEYBOARD;
         event->hook_type = *hook_type;
         *event_size = sizeof(event->event.keyboard);
         return true;
@@ -1135,7 +1130,7 @@ bool ksi_linux_synth_input_to_hook_event(
             return false;
         }
 
-        *hook_type = KSI_HOOK_MOUSE_LL;
+        *hook_type = KSI_HOOK_MOUSE;
         event->hook_type = *hook_type;
         *event_size = sizeof(event->event.mouse);
         return true;
@@ -1149,8 +1144,8 @@ static int send_keyboard_input(const ksi_keybdinput *input)
     int key_code;
     int value;
 
-    if ((input->flags & KSI_KEYEVENTF_UNICODE) != 0) {
-        if ((input->flags & KSI_KEYEVENTF_KEYUP) != 0) {
+    if ((input->flags & KSI_KEY_UNICODE) != 0) {
+        if ((input->flags & KSI_KEY_UP) != 0) {
             return 0;
         }
 
@@ -1160,7 +1155,7 @@ static int send_keyboard_input(const ksi_keybdinput *input)
     key_code = resolve_synth_key_code(input, &value);
 
     if (key_code < 0) {
-        fprintf(stderr, "inputd: unsupported keyboard input vk=0x%x scan=%u flags=0x%x\n",
+        fprintf(stderr, "keysharp-input: unsupported keyboard input vk=0x%x scan=%u flags=0x%x\n",
             input->vk,
             input->scan,
             input->flags);
@@ -1170,12 +1165,12 @@ static int send_keyboard_input(const ksi_keybdinput *input)
     /* SendInput/keybd_event semantics are explicit transitions only. Do not
      * emit EV_KEY value 2: that marks autorepeat from a held physical key. */
     if (send_key_code(key_code, value) != 0) {
-        fprintf(stderr, "inputd: failed to emit keyboard input: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: failed to emit keyboard input: %s\n", strerror(errno));
         return -1;
     }
 
     if (g_verbose) {
-        printf("inputd: synth key vk=0x%x scan=%u evdev=%d %s\n",
+        printf("keysharp-input: synth key vk=0x%x scan=%u evdev=%d %s\n",
             input->vk,
             input->scan,
             key_code,
@@ -1200,7 +1195,7 @@ void ksi_linux_synth_release_all(void)
         }
 
         if (emit_event(EV_KEY, (uint16_t)key_code, 0) == 0) {
-            if (g_verbose) printf("inputd: release synthetic key evdev=%d\n", key_code);
+            if (g_verbose) printf("keysharp-input: release synthetic key evdev=%d\n", key_code);
             emitted = true;
         }
 
@@ -1208,7 +1203,7 @@ void ksi_linux_synth_release_all(void)
     }
 
     if (emitted && emit_sync() != 0) {
-        fprintf(stderr, "inputd: failed to sync synthetic key release: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: failed to sync synthetic key release: %s\n", strerror(errno));
     }
 }
 
@@ -1301,10 +1296,10 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
     bool rel_pending = false; /* relative-device events awaiting a SYN */
     bool abs_pending = false; /* absolute-device button events awaiting a SYN */
 
-    if ((input->flags & KSI_MOUSEEVENTF_MOVE) != 0) {
-        if ((input->flags & KSI_MOUSEEVENTF_ABSOLUTE) != 0) {
+    if ((input->flags & KSI_MOUSE_MOVE) != 0) {
+        if ((input->flags & KSI_MOUSE_ABSOLUTE) != 0) {
             if (uinput_abs_fd < 0) {
-                fprintf(stderr, "inputd: absolute mouse move dropped: abs device unavailable\n");
+                fprintf(stderr, "keysharp-input: absolute mouse move dropped: abs device unavailable\n");
             } else if (emit_abs_event(ABS_X, input->dx) != 0
                        || emit_abs_event(ABS_Y, input->dy) != 0
                        || emit_abs_sync() != 0) {
@@ -1332,7 +1327,7 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
         }
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_WHEEL) != 0) {
+    if ((input->flags & KSI_MOUSE_WHEEL) != 0) {
         int32_t delta = (int32_t)input->mouse_data / 120;
 
         if (delta == 0 && input->mouse_data != 0) {
@@ -1346,7 +1341,7 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
         rel_pending = true;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_HWHEEL) != 0) {
+    if ((input->flags & KSI_MOUSE_HORIZONTAL_WHEEL) != 0) {
         int32_t delta = (int32_t)input->mouse_data / 120;
 
         if (delta == 0 && input->mouse_data != 0) {
@@ -1368,39 +1363,39 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
      * absolute device. Each call marks the device it actually used SYN-pending. */
     abs_move_active = batch_used_abs_move != NULL && *batch_used_abs_move && uinput_abs_fd >= 0;
 
-    if ((input->flags & KSI_MOUSEEVENTF_LEFTDOWN) != 0 && route_mouse_button(BTN_LEFT, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    if ((input->flags & KSI_MOUSE_LEFT_DOWN) != 0 && route_mouse_button(BTN_LEFT, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
         return -1;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_LEFTUP) != 0 && route_mouse_button(BTN_LEFT, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    if ((input->flags & KSI_MOUSE_LEFT_UP) != 0 && route_mouse_button(BTN_LEFT, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
         return -1;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_RIGHTDOWN) != 0 && route_mouse_button(BTN_RIGHT, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    if ((input->flags & KSI_MOUSE_RIGHT_DOWN) != 0 && route_mouse_button(BTN_RIGHT, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
         return -1;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_RIGHTUP) != 0 && route_mouse_button(BTN_RIGHT, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    if ((input->flags & KSI_MOUSE_RIGHT_UP) != 0 && route_mouse_button(BTN_RIGHT, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
         return -1;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_MIDDLEDOWN) != 0 && route_mouse_button(BTN_MIDDLE, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    if ((input->flags & KSI_MOUSE_MIDDLE_DOWN) != 0 && route_mouse_button(BTN_MIDDLE, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
         return -1;
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_MIDDLEUP) != 0 && route_mouse_button(BTN_MIDDLE, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    if ((input->flags & KSI_MOUSE_MIDDLE_UP) != 0 && route_mouse_button(BTN_MIDDLE, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
         return -1;
     }
 
     xbutton = mouse_data_to_xbutton(input->mouse_data);
 
-    if ((input->flags & KSI_MOUSEEVENTF_XDOWN) != 0) {
+    if ((input->flags & KSI_MOUSE_X_DOWN) != 0) {
         if (xbutton == 0 || route_mouse_button(xbutton, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
             return -1;
         }
     }
 
-    if ((input->flags & KSI_MOUSEEVENTF_XUP) != 0) {
+    if ((input->flags & KSI_MOUSE_X_UP) != 0) {
         if (xbutton == 0 || route_mouse_button(xbutton, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
             return -1;
         }
@@ -1409,17 +1404,17 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
     /* Commit each device that actually received events with its own SYN. The
      * absolute move above already emitted its own abs SYN. */
     if (rel_pending && emit_sync() != 0) {
-        fprintf(stderr, "inputd: failed to emit mouse input: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: failed to emit mouse input: %s\n", strerror(errno));
         return -1;
     }
 
     if (abs_pending && emit_abs_sync() != 0) {
-        fprintf(stderr, "inputd: failed to emit absolute mouse button: %s\n", strerror(errno));
+        fprintf(stderr, "keysharp-input: failed to emit absolute mouse button: %s\n", strerror(errno));
         return -1;
     }
 
     if (g_verbose) {
-        printf("inputd: synth mouse dx=%d dy=%d data=%u flags=0x%x\n",
+        printf("keysharp-input: synth mouse dx=%d dy=%d data=%u flags=0x%x\n",
             input->dx,
             input->dy,
             input->mouse_data,
@@ -1434,41 +1429,25 @@ int ksi_linux_synth_send_input(const ksi_input *inputs, size_t count, uint32_t f
     int result = 0;
 
     if (uinput_fd < 0) {
-        fprintf(stderr, "inputd: synthesis unavailable; %s could not be opened\n", KSI_UINPUT_PATH);
+        fprintf(stderr, "keysharp-input: synthesis unavailable; %s could not be opened\n", KSI_UINPUT_PATH);
         return -1;
     }
 
-    /* pending_high_surrogate is a single process-global (see its declaration):
-     * it must never carry an unpaired high surrogate left over from a
-     * previous, unrelated batch (e.g. one client's malformed/truncated
-     * SendText ending mid-surrogate) into THIS batch, where it could splice
-     * with an unrelated leading low surrogate and emit the wrong codepoint.
-     * Each top-level CLIENT batch is expected to be well-formed UTF-16 on its
-     * own, so starting every client batch with a clean slate is correct.
-     *
-     * A BATCH_FRAGMENT push is NOT a client batch: it is one event of an
-     * already-received batch that the synthetic-hook routing re-emits
-     * individually (hook_ingress.inc), so a surrogate pair legitimately spans
-     * two fragment calls. Resetting between fragments discarded the high half
-     * and silently dropped every astral character (emoji) whenever a keyboard
-     * hook was installed — so fragments keep the pending state. */
-    /* Reset the pending high surrogate at genuine client-batch boundaries only.
-     * Skip the reset for: a physical replay (REPLAY — carries no surrogate state
-     * and may be interleaved between a pair's two fragments), and a non-first
-     * fragment of a batch (BATCH_FRAGMENT without BATCH_START — the pair spans
-     * fragments). DO reset for a plain top-level client batch (no flags) and for
-     * the FIRST fragment of a batch (BATCH_START), which re-arms the boundary. */
-    if ((flags & KSI_SYNTH_FLAG_REPLAY) == 0u
-            && ((flags & KSI_SYNTH_FLAG_BATCH_FRAGMENT) == 0u
-                || (flags & KSI_SYNTH_FLAG_BATCH_START) != 0u)) {
+    /* A top-level client batch begins with clean surrogate state so an unpaired
+     * high surrogate cannot combine with an unrelated batch's leading low
+     * surrogate. A surrogate pair may span two fragment calls, so fragments
+     * retain the pending high-surrogate state. Physical replay carries no
+     * surrogate state and may occur between those fragments. */
+    if ((flags & KSI_INTERNAL_SYNTH_REPLAY) == 0u
+            && ((flags & KSI_INTERNAL_SYNTH_BATCH_FRAGMENT) == 0u
+                || (flags & KSI_INTERNAL_SYNTH_BATCH_START) != 0u)) {
         pending_high_surrogate = 0;
     }
 
-    /* Enable per-event pacing for this batch (see emit_event_to). The chunk
-     * counter is deliberately NOT reset here: it is shared and persists across
-     * calls so a burst of single-event passthrough replays paces like one long
-     * synthesis batch. emit_event_to resets it after an idle gap instead, which
-     * keeps isolated Sends/keystrokes free without a per-batch reset. */
+    /* Enable per-event pacing for this batch. The shared counter persists across
+     * calls so a burst of single-event passthrough replays is paced like one long
+     * synthesis batch. emit_event_to starts a fresh chunk after an idle gap,
+     * which keeps isolated Sends and keystrokes free. */
     synth_pacing_active = true;
 
     /* Per-batch: once any input performs an absolute MouseMove, subsequent
@@ -1483,7 +1462,7 @@ int ksi_linux_synth_send_input(const ksi_input *inputs, size_t count, uint32_t f
         } else if (inputs[i].type == KSI_INPUT_MOUSE) {
             result = send_mouse_input(&inputs[i].data.mouse, &used_abs_move);
         } else {
-            fprintf(stderr, "inputd: unsupported input type %u\n", inputs[i].type);
+            fprintf(stderr, "keysharp-input: unsupported input type %u\n", inputs[i].type);
             result = -1;
         }
 
@@ -1515,14 +1494,14 @@ static int replay_keyboard_hook_event(const ksi_keyboard_hook_event *event)
     input.type = KSI_INPUT_KEYBOARD;
     input.data.keyboard.vk = (uint16_t)event->vk_code;
     input.data.keyboard.scan = (uint16_t)event->scan_code;
-    input.data.keyboard.flags = KSI_KEYEVENTF_SCANCODE;
+    input.data.keyboard.flags = KSI_KEY_SCANCODE;
 
-    if ((event->flags & KSI_LLKHF_UP) != 0) {
-        input.data.keyboard.flags |= KSI_KEYEVENTF_KEYUP;
+    if ((event->flags & KSI_KEYBOARD_HOOK_UP) != 0) {
+        input.data.keyboard.flags |= KSI_KEY_UP;
     }
 
     return ksi_linux_synth_send_input(&input, 1,
-        KSI_SYNTH_FLAG_BYPASS_HOOK | KSI_SYNTH_FLAG_REPLAY);
+        KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_REPLAY);
 }
 
 static int replay_mouse_hook_event(const ksi_mouse_hook_event *event)
@@ -1533,57 +1512,57 @@ static int replay_mouse_hook_event(const ksi_mouse_hook_event *event)
     input.type = KSI_INPUT_MOUSE;
 
     switch (event->message) {
-        case KSI_WM_MOUSEMOVE:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_MOVE;
+        case KSI_MESSAGE_MOUSE_MOVE:
+            input.data.mouse.flags = KSI_MOUSE_MOVE;
 
-            if ((event->mouse_data & KSI_MOUSEEVENTF_ABSOLUTE) != 0) {
-                input.data.mouse.flags |= KSI_MOUSEEVENTF_ABSOLUTE;
+            if ((event->mouse_data & KSI_MOUSE_ABSOLUTE) != 0) {
+                input.data.mouse.flags |= KSI_MOUSE_ABSOLUTE;
             }
 
             input.data.mouse.dx = event->x;
             input.data.mouse.dy = event->y;
             break;
-        case KSI_WM_LBUTTONDOWN:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_LEFTDOWN;
+        case KSI_MESSAGE_LEFT_BUTTON_DOWN:
+            input.data.mouse.flags = KSI_MOUSE_LEFT_DOWN;
             break;
-        case KSI_WM_LBUTTONUP:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_LEFTUP;
+        case KSI_MESSAGE_LEFT_BUTTON_UP:
+            input.data.mouse.flags = KSI_MOUSE_LEFT_UP;
             break;
-        case KSI_WM_RBUTTONDOWN:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_RIGHTDOWN;
+        case KSI_MESSAGE_RIGHT_BUTTON_DOWN:
+            input.data.mouse.flags = KSI_MOUSE_RIGHT_DOWN;
             break;
-        case KSI_WM_RBUTTONUP:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_RIGHTUP;
+        case KSI_MESSAGE_RIGHT_BUTTON_UP:
+            input.data.mouse.flags = KSI_MOUSE_RIGHT_UP;
             break;
-        case KSI_WM_MBUTTONDOWN:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_MIDDLEDOWN;
+        case KSI_MESSAGE_MIDDLE_BUTTON_DOWN:
+            input.data.mouse.flags = KSI_MOUSE_MIDDLE_DOWN;
             break;
-        case KSI_WM_MBUTTONUP:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_MIDDLEUP;
+        case KSI_MESSAGE_MIDDLE_BUTTON_UP:
+            input.data.mouse.flags = KSI_MOUSE_MIDDLE_UP;
             break;
-        case KSI_WM_MOUSEWHEEL:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_WHEEL;
+        case KSI_MESSAGE_MOUSE_WHEEL:
+            input.data.mouse.flags = KSI_MOUSE_WHEEL;
             input.data.mouse.mouse_data = (uint32_t)((int32_t)event->mouse_data >> 16);
             break;
-        case KSI_WM_MOUSEHWHEEL:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_HWHEEL;
+        case KSI_MESSAGE_MOUSE_HORIZONTAL_WHEEL:
+            input.data.mouse.flags = KSI_MOUSE_HORIZONTAL_WHEEL;
             input.data.mouse.mouse_data = (uint32_t)((int32_t)event->mouse_data >> 16);
             break;
-        case KSI_WM_XBUTTONDOWN:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_XDOWN;
+        case KSI_MESSAGE_X_BUTTON_DOWN:
+            input.data.mouse.flags = KSI_MOUSE_X_DOWN;
             input.data.mouse.mouse_data = event->mouse_data;
             break;
-        case KSI_WM_XBUTTONUP:
-            input.data.mouse.flags = KSI_MOUSEEVENTF_XUP;
+        case KSI_MESSAGE_X_BUTTON_UP:
+            input.data.mouse.flags = KSI_MOUSE_X_UP;
             input.data.mouse.mouse_data = event->mouse_data;
             break;
         default:
-            fprintf(stderr, "inputd: unsupported mouse hook replay message=0x%x\n", event->message);
+            fprintf(stderr, "keysharp-input: unsupported mouse hook replay message=0x%x\n", event->message);
             return -1;
     }
 
     return ksi_linux_synth_send_input(&input, 1,
-        KSI_SYNTH_FLAG_BYPASS_HOOK | KSI_SYNTH_FLAG_REPLAY);
+        KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_REPLAY);
 }
 
 int ksi_linux_synth_replay_hook_event(uint32_t hook_type, const ksi_hook_event_payload *event)
@@ -1594,9 +1573,9 @@ int ksi_linux_synth_replay_hook_event(uint32_t hook_type, const ksi_hook_event_p
         return -1;
     }
 
-    if (hook_type == KSI_HOOK_KEYBOARD_LL) {
+    if (hook_type == KSI_HOOK_KEYBOARD) {
         result = replay_keyboard_hook_event(&event->event.keyboard);
-    } else if (hook_type == KSI_HOOK_MOUSE_LL) {
+    } else if (hook_type == KSI_HOOK_MOUSE) {
         result = replay_mouse_hook_event(&event->event.mouse);
     } else {
         result = -1;

@@ -31,7 +31,8 @@ static void complete_hook_dispatch_fallback(
         if (ok) {
             synth_completion_complete(completion);
         } else {
-            synth_completion_fail(completion, -1, KSI_DETAIL_RESOURCE_EXHAUSTED);
+            synth_completion_fail(completion, KSI_STATUS_RESOURCE_EXHAUSTED,
+                KSI_DETAIL_NONE);
         }
 
         synthetic_hook_queue_complete_inflight(state);
@@ -66,7 +67,7 @@ static ksi_lane_event *create_hook_lane_event(
         return NULL;
     }
 
-    subscription_bit = hook_type_to_cap_bit(hook_type);
+    subscription_bit = hook_type_to_operation(hook_type);
 
     if (subscription_bit == 0u) {
         return NULL;
@@ -114,8 +115,11 @@ static ksi_lane_event *create_hook_lane_event(
         candidate_count++;
     }
 
-    lane_event = calloc(1,
-        sizeof(*lane_event) + candidate_count * sizeof(lane_event->subscribers[0]));
+    lane_event = lane_event_pool_acquire(lane);
+
+    if (lane_event == NULL) {
+        lane_event = calloc(1, sizeof(*lane_event));
+    }
 
     if (lane_event == NULL) {
         return NULL;
@@ -132,12 +136,10 @@ static ksi_lane_event *create_hook_lane_event(
         lane_event->egress = *egress;
     }
 
-    lane_event->payload.event_id = event_id;
     lane_event->payload.hook_type = hook_type;
     memcpy(&lane_event->payload.event, event, event_size);
     lane_event->payload_size =
-        sizeof(lane_event->payload.event_id)
-        + sizeof(lane_event->payload.hook_type)
+        sizeof(lane_event->payload.hook_type)
         + sizeof(lane_event->payload.reserved)
         + event_size;
 
@@ -145,7 +147,7 @@ static ksi_lane_event *create_hook_lane_event(
         ksi_lane_subscriber candidate = candidates[i];
 
         if (!hook_send_ref_acquire(candidate.send_ref)) {
-            fprintf(stderr, "inputd: hook subscriber has no send handle\n");
+            fprintf(stderr, "keysharp-input: hook subscriber has no send handle\n");
             continue;
         }
 
@@ -170,7 +172,7 @@ static void enqueue_hook_lane_event(ksi_daemon_state *state, ksi_lane_event *eve
             request_fail_open(state);
         }
 
-        fprintf(stderr, "inputd: hook lane queue full; bypassed hook event %llu\n",
+        fprintf(stderr, "keysharp-input: hook lane queue full; bypassed hook event %llu\n",
             (unsigned long long)event->event_id);
         lane_event_release_send_refs(event);
 
@@ -182,14 +184,14 @@ static void enqueue_hook_lane_event(ksi_daemon_state *state, ksi_lane_event *eve
             if (egress_ok) {
                 synth_completion_complete(event->synthetic_completion);
             } else {
-                synth_completion_fail(event->synthetic_completion, -1,
-                    KSI_DETAIL_RESOURCE_EXHAUSTED);
+                synth_completion_fail(event->synthetic_completion,
+                    KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             }
 
             synthetic_hook_queue_complete_inflight(state);
         }
 
-        free(event);
+        lane_event_dispose(event);
     }
 }
 
@@ -245,11 +247,11 @@ static void daemon_handle_physical_key_event(void *context, uint32_t scan_code)
         return;
     }
 
-    fprintf(stderr, "inputd: physical input panic chord activated\n");
+    fprintf(stderr, "keysharp-input: physical input panic chord activated\n");
     clear_hook_state(state);
 
     if (update_grab_state(state) != 0) {
-        fprintf(stderr, "inputd: panic chord failed to release grabs\n");
+        fprintf(stderr, "keysharp-input: panic chord failed to release grabs\n");
     }
 }
 
@@ -260,7 +262,7 @@ static void daemon_handle_hook_event(
     size_t event_size)
 {
     ksi_daemon_state *state = context;
-    uint32_t subscription_bit = hook_type_to_cap_bit(hook_type);
+    uint32_t subscription_bit = hook_type_to_operation(hook_type);
     uint32_t block_bit;
     bool is_injected;
 
@@ -271,25 +273,21 @@ static void daemon_handle_hook_event(
         return;
     }
 
-    block_bit = hook_type == KSI_HOOK_KEYBOARD_LL
-        ? KSI_BLOCK_INPUT_KEYBOARD
-        : KSI_BLOCK_INPUT_MOUSE;
-    is_injected = hook_type == KSI_HOOK_KEYBOARD_LL
-        ? ((((const ksi_keyboard_hook_event *)event)->flags & KSI_LLKHF_INJECTED) != 0)
-        : ((((const ksi_mouse_hook_event *)event)->flags & KSI_LLMHF_INJECTED) != 0);
+    block_bit = hook_type == KSI_HOOK_KEYBOARD
+        ? KSI_BLOCK_KEYBOARD
+        : KSI_BLOCK_MOUSE;
+    is_injected = hook_type == KSI_HOOK_KEYBOARD
+        ? ((((const ksi_keyboard_hook_event *)event)->flags & KSI_KEYBOARD_HOOK_INJECTED) != 0)
+        : ((((const ksi_mouse_hook_event *)event)->flags & KSI_MOUSE_HOOK_INJECTED) != 0);
 
-    /* BlockInput suppresses delivery to APPLICATIONS, not to the owning hook.
-     * On Windows BlockInput() is independent of the LL hook chain: hooks (and
-     * therefore hotkeys/InputHooks, including the one that will turn BlockInput
-     * back off) keep firing on physical input while it is active. So do NOT drop
-     * the event here; dispatch it to the hook as usual but force egress to NONE
-     * below so it is never replayed to apps regardless of the PASS decision. */
+    /* Input blocking suppresses application delivery while the owning hook
+     * continues to receive events so it can turn blocking off. Dispatch the
+     * event normally, then suppress egress regardless of its hook decision. */
     bool block_active = !is_injected && (active_block_input_mask(state) & block_bit) != 0;
 
     if (!any_matching_hook_subscriptions(state, hook_type)) {
-        /* Mixed devices may be grabbed for the other input class. When BlockInput
-         * is active with no hook subscribed, keep the old behavior of dropping the
-         * event from apps (no replay). */
+        /* Mixed devices may be grabbed for the other input class. BlockInput with
+         * no matching hook subscription drops the event from applications. */
         if (!is_injected && !block_active) {
             ksi_hook_event_payload payload;
             memset(&payload, 0, sizeof(payload));
@@ -298,7 +296,7 @@ static void daemon_handle_hook_event(
 
             if (!output_queue_push_replay(&state->output_queue, hook_type, &payload,
                     current_input_generation(state))) {
-                fprintf(stderr, "inputd: replay enqueue of unhooked grabbed input failed\n");
+                fprintf(stderr, "keysharp-input: replay enqueue of unhooked grabbed input failed\n");
                 request_fail_open(state);
             }
         }

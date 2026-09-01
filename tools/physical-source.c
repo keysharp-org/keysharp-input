@@ -44,13 +44,13 @@ static int parse_key(const char *text)
 int main(int argc, char **argv)
 {
     struct uinput_setup setup;
-    const char *acknowledgement = getenv("KEYSHARP_INPUTD_PHYSICAL_TEST");
+    const char *acknowledgement = getenv("KEYSHARP_INPUT_PHYSICAL_TEST");
     int fd;
     int result = 0;
 
     if (argc < 2 || acknowledgement == NULL || strcmp(acknowledgement, "I_UNDERSTAND") != 0) {
         fprintf(stderr,
-            "Usage: KEYSHARP_INPUTD_PHYSICAL_TEST=I_UNDERSTAND %s FKEY [FKEY ...]\n"
+            "Usage: KEYSHARP_INPUT_PHYSICAL_TEST=I_UNDERSTAND %s FKEY [FKEY ...]\n"
             "FKEY must be 13..18. This privileged manual-test tool creates a virtual\n"
             "keyboard which the daemon intentionally treats as a physical source.\n",
             argv[0]);
@@ -90,7 +90,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Let udev publish the node and inputd discover/grab it before emitting. */
+    /* Let udev publish the node and the service grab it before emitting. */
     sleep(2);
 
     for (int i = 1; i < argc; i++) {

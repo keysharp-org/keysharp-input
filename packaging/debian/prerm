@@ -5,6 +5,6 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 if [ "$1" = remove ]; then
-    /usr/bin/systemctl disable --now keysharp-inputd.service keysharp-inputd.socket || true
-    /usr/bin/keysharp-inputd --remove-input-access || true
+    /usr/bin/systemctl disable --now keysharp-input.service keysharp-input.socket || true
+    /usr/bin/keysharp-input daemon --remove-input-access || true
 fi

@@ -188,7 +188,7 @@ static void close_ref(ksi_hook_send_ref *ref, int peer_fd)
     close(peer_fd);
 }
 
-static bool test_one_hook_stream_serializes_keyboard_and_mouse(void)
+static bool test_one_callback_stream_serializes_keyboard_and_mouse(void)
 {
     int sockets[2];
     pthread_t first_thread;
@@ -224,7 +224,7 @@ static bool test_one_hook_stream_serializes_keyboard_and_mouse(void)
     return true;
 }
 
-static bool test_separate_hook_streams_run_in_parallel(void)
+static bool test_separate_callback_streams_run_in_parallel(void)
 {
     int first_sockets[2];
     int second_sockets[2];
@@ -424,8 +424,8 @@ int main(void)
         const char *name;
         bool (*run)(void);
     } tests[] = {
-        { "one HookStream serializes keyboard and mouse", test_one_hook_stream_serializes_keyboard_and_mouse },
-        { "separate HookStreams run in parallel", test_separate_hook_streams_run_in_parallel },
+        { "one callback stream serializes keyboard and mouse", test_one_callback_stream_serializes_keyboard_and_mouse },
+        { "separate callback streams run in parallel", test_separate_callback_streams_run_in_parallel },
         { "Send recursively re-enters before queued roots", test_send_pump_reenters_recursively_before_queued_root },
         { "nested Sends unwind LIFO", test_nested_sends_unwind_lifo },
         { "closing parent waits for entered descendant", test_closing_parent_waits_for_entered_descendant },

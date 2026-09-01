@@ -5,14 +5,14 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-portable_binary=/usr/local/bin/keysharp-inputd
-package_binary=/usr/bin/keysharp-inputd
-portable_service=/etc/systemd/system/keysharp-inputd.service
-portable_socket=/etc/systemd/system/keysharp-inputd.socket
-package_service=/usr/lib/systemd/system/keysharp-inputd.service
-package_socket=/usr/lib/systemd/system/keysharp-inputd.socket
-alternate_package_service=/lib/systemd/system/keysharp-inputd.service
-alternate_package_socket=/lib/systemd/system/keysharp-inputd.socket
+portable_binary=/usr/local/bin/keysharp-input
+package_binary=/usr/bin/keysharp-input
+portable_service=/etc/systemd/system/keysharp-input.service
+portable_socket=/etc/systemd/system/keysharp-input.socket
+package_service=/usr/lib/systemd/system/keysharp-input.service
+package_socket=/usr/lib/systemd/system/keysharp-input.socket
+alternate_package_service=/lib/systemd/system/keysharp-input.service
+alternate_package_socket=/lib/systemd/system/keysharp-input.socket
 
 path_present() {
     [ -e "$1" ] || [ -L "$1" ]
@@ -51,6 +51,19 @@ portable_socket_conflicts() {
         "$package_socket" "$alternate_package_socket"
 }
 
+portable_library_conflicts() {
+    portable_library=$1
+    shift
+    path_present "$portable_library" || return 1
+    portable_resolved=$(canonical_path "$portable_library") || return 0
+    for package_library in "$@"; do
+        package_resolved=$(canonical_path "$package_library") \
+            || package_resolved=$package_library
+        [ "$portable_resolved" = "$package_resolved" ] && return 1
+    done
+    return 0
+}
+
 case "${1:-}" in
     install|upgrade) ;;
     *) exit 0 ;;
@@ -66,6 +79,19 @@ fi
 if portable_socket_conflicts; then
     conflicts="${conflicts} ${portable_socket}"
 fi
+for portable_library in \
+    /usr/local/lib/libkeysharp-input.so.0 \
+    /usr/local/lib64/libkeysharp-input.so.0 \
+    /usr/local/lib/x86_64-linux-gnu/libkeysharp-input.so.0 \
+    /usr/local/lib/aarch64-linux-gnu/libkeysharp-input.so.0; do
+    if portable_library_conflicts "$portable_library" \
+        /usr/lib/libkeysharp-input.so.0 \
+        /usr/lib64/libkeysharp-input.so.0 \
+        /usr/lib/x86_64-linux-gnu/libkeysharp-input.so.0 \
+        /usr/lib/aarch64-linux-gnu/libkeysharp-input.so.0; then
+        conflicts="${conflicts} ${portable_library}"
+    fi
+done
 
 if [ -n "$conflicts" ]; then
     printf '%s\n' \

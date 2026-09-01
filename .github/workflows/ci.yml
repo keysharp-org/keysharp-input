@@ -14,19 +14,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Detect reviewed Nix lock
-        id: nix-lock
-        run: |
-          if test -f flake.lock; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping Nix validation until a reviewed flake.lock is committed."
-          fi
       - uses: cachix/install-nix-action@v31
-        if: steps.nix-lock.outputs.enabled == 'true'
       - run: nix flake check --no-write-lock-file
-        if: steps.nix-lock.outputs.enabled == 'true'
 
   build:
     strategy:
@@ -42,6 +31,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install build dependencies
         run: |
@@ -54,7 +45,8 @@ jobs:
         run: >-
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DKEYSHARP_INPUTD_SETUP_ON_INSTALL=OFF
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
 
       - name: Build
         run: cmake --build build --parallel
@@ -64,22 +56,32 @@ jobs:
 
       - name: Verify metadata and install tree
         run: |
-          ./build/keysharp-inputd --version
-          ./build/keysharp-inputd --info
+          ./build/keysharp-input version
+          ./build/keysharp-input info
           DESTDIR="$RUNNER_TEMP/install-root" cmake --install build
-          test -x "$RUNNER_TEMP/install-root/usr/local/bin/keysharp-inputd"
-          test -f "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-inputd.service"
-          test -f "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-inputd.socket"
-          grep -Fq 'ExecStart=/usr/local/bin/keysharp-inputd --system-service' \
-            "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-inputd.service"
+          test -x "$RUNNER_TEMP/install-root/usr/local/bin/keysharp-input"
+          test -f "$RUNNER_TEMP/install-root/usr/local/lib/libkeysharp-input.so.0"
+          test -f "$RUNNER_TEMP/install-root/usr/local/include/keysharp_input/client.h"
+          test -f "$RUNNER_TEMP/install-root/usr/local/include/keysharp_input/constants.h"
+          test -f "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-input.service"
+          test -f "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-input.socket"
+          grep -Fq 'ExecStart=/usr/local/bin/keysharp-input daemon --system-service' \
+            "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-input.service"
           test -f "$RUNNER_TEMP/install-root/usr/share/polkit-1/actions/org.keysharp.input.policy"
           test -f "$RUNNER_TEMP/install-root/usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf"
-          test ! -e "$RUNNER_TEMP/install-root/usr/local/lib/systemd/system/keysharp-inputd.service"
-          test ! -e "$RUNNER_TEMP/install-root/usr/local/lib/udev/rules.d/70-keysharp-inputd-uaccess.rules"
+          test ! -e "$RUNNER_TEMP/install-root/usr/local/lib/systemd/system/keysharp-input.service"
+          test ! -e "$RUNNER_TEMP/install-root/usr/local/lib/udev/rules.d/70-keysharp-input-uaccess.rules"
+          cmake -S tests/install-consumer -B "$RUNNER_TEMP/consumer-build" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/install-root/usr/local"
+          cmake --build "$RUNNER_TEMP/consumer-build"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/install-root/usr/local/lib" \
+            "$RUNNER_TEMP/consumer-build/keysharp-input-install-consumer"
 
   shellcheck:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - name: Check lifecycle scripts
         run: shellcheck packaging/install.sh packaging/uninstall.sh packaging/debian/*

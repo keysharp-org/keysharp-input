@@ -2,8 +2,12 @@
   description = "Privileged Linux input broker";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/e5bdc4a41d4c072fe1e3787eaa0320a384741d44";
+  inputs.permissions = {
+    url = "github:keysharp-org/keysharp-permissions/ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13";
+    flake = false;
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, permissions }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -11,7 +15,9 @@
       packages = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
         in {
-          default = pkgs.callPackage ./nix/package.nix { };
+          default = pkgs.callPackage ./nix/package.nix {
+            keysharpPermissionsSource = permissions;
+          };
           keysharp-input = self.packages.${system}.default;
         });
 
