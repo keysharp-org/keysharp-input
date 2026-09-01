@@ -40,13 +40,19 @@ For local development against a sibling checkout, pass
 
 ## Install
 
-Prefer a distribution package. A release archive can be installed independently:
+Prefer a distribution package.
+
+`./install.sh` in this checkout configures, builds, and installs under
+`/usr/local`, then finishes input-access setup. `PREFIX` and `BUILD_DIR`
+override the destination and the build directory.
 
 ```bash
 sudo ./install.sh
 ```
 
-An application installer may avoid replacing a compatible system installation:
+A release archive carries its own `install.sh`, which installs the prebuilt
+payload rather than building it. An application installer may use it to leave a
+compatible system installation in place:
 
 ```bash
 sudo ./install.sh --skip-if-compatible

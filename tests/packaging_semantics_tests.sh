@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 sed -n '/^is_root_protected_chain() {$/,/^archive_dir=/p' \
-    "$source_dir/packaging/install.sh" | sed '$d' \
+    "$source_dir/packaging/install-release.sh" | sed '$d' \
     > "$temporary/install-functions.sh"
 expected_client_abi_major=0
 expected_client_abi_minor=1

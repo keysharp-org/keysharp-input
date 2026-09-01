@@ -1,7 +1,8 @@
 foreach(path
     CMakeLists.txt
-    packaging/install.sh
-    packaging/uninstall.sh
+    install.sh
+    packaging/install-release.sh
+    uninstall.sh
     packaging/debian/postinst
     packaging/debian/prerm
     systemd/keysharp-input.service.in
@@ -31,7 +32,7 @@ if(cmake_source MATCHES "keysharp-input-protocol-[0-9]")
     message(FATAL_ERROR "CMake packaging exposes the private service protocol")
 endif()
 
-file(READ "${SOURCE_DIR}/packaging/install.sh" installer)
+file(READ "${SOURCE_DIR}/packaging/install-release.sh" installer)
 foreach(required
     "expected_version=0.2.0"
     "expected_client_abi_major=0"

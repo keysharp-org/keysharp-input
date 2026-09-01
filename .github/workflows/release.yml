@@ -56,7 +56,7 @@ jobs:
             echo "Release tag $RELEASE_TAG does not exactly match CMake project version ${version:-<missing>}." >&2
             exit 1
           fi
-          installer_version=$(sed -n 's/^expected_version=\([0-9.]*\)$/\1/p' packaging/install.sh)
+          installer_version=$(sed -n 's/^expected_version=\([0-9.]*\)$/\1/p' packaging/install-release.sh)
           nix_version=$(sed -n 's/^[[:space:]]*version = "\([0-9.]*\)";$/\1/p' nix/package.nix)
           if [[ "$installer_version" != "$version" || "$nix_version" != "$version" ]]; then
             echo "Release version is inconsistent across CMake, the portable installer, and Nix packaging." >&2
@@ -153,8 +153,8 @@ jobs:
             "$root/udev/70-keysharp-input-uaccess.rules"
           install -d -m 0755 "$root/docs"
           install -m 0644 docs/*.md "$root/docs/"
-          install -m 0755 packaging/install.sh "$root/install.sh"
-          install -m 0755 packaging/uninstall.sh "$root/uninstall.sh"
+          install -m 0755 packaging/install-release.sh "$root/install.sh"
+          install -m 0755 uninstall.sh "$root/uninstall.sh"
           install -m 0644 LICENSE README.md PROVENANCE.md "$root/"
           mkdir -p dist
           commit_epoch=$(git log -1 --format=%ct)

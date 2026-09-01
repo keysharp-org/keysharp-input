@@ -221,7 +221,7 @@ install(DIRECTORY docs/
         GROUP_READ GROUP_EXECUTE
         WORLD_READ WORLD_EXECUTE)
 if(KEYSHARP_INPUT_NORMALIZED_PREFIX STREQUAL "/usr/local")
-    install(PROGRAMS packaging/uninstall.sh
+    install(PROGRAMS uninstall.sh
         DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input)
 endif()
 
