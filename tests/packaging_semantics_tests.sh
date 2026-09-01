@@ -36,14 +36,17 @@ if is_root_protected_file "$temporary/ordinary"; then
     exit 1
 fi
 
-# A sandbox carries only /bin/sh, so locate the one binary this needs (a process that
-# stays alive across its own replacement) on PATH and write the replacement here.
+# A sandbox carries only /bin/sh, so locate on PATH the one binary this needs: a process
+# that stays alive across its own replacement. The copy keeps the name "sleep" because a
+# multi-call coreutils, which is what a sandbox usually supplies, picks its program from
+# argv[0] and refuses to run under any other name. The replacement is written here.
 sleep_binary=$(command -v sleep)
 [ -x "$sleep_binary" ]
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$temporary/replacement"
 chmod 0755 "$temporary/replacement"
 
-live_executable=$temporary/live-executable
+mkdir "$temporary/live"
+live_executable=$temporary/live/sleep
 cp "$sleep_binary" "$live_executable"
 chmod 0755 "$live_executable"
 old_inode=$(stat -c '%i' "$live_executable")
