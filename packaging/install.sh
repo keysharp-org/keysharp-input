@@ -380,7 +380,7 @@ installation_complete_for_channel() {
         && udev_configuration_matches "$udev"
 }
 
-archive_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+archive_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 for required in \
     bin/keysharp-input \
     lib/libkeysharp-input.so.0.2.0 \

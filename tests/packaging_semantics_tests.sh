@@ -21,20 +21,35 @@ expected_client_abi_minor=1
 # shellcheck source=/dev/null
 . "$temporary/install-functions.sh"
 
-is_root_protected_file /etc/os-release
+# A build sandbox maps every uid but the builder's to nobody and carries no system
+# layout, so nothing there can be root-protected and only the rejection cases stay
+# meaningful. Probe ownership directly rather than through the predicate under test.
+if [ "$(stat -Lc '%u' /etc 2>/dev/null || echo 1)" = 0 ] && [ -e /etc/os-release ]
+then
+    is_root_protected_file /etc/os-release
+else
+    echo "skipping the acceptance case: no root-owned system files here" >&2
+fi
 printf 'ordinary\n' > "$temporary/ordinary"
 if is_root_protected_file "$temporary/ordinary"; then
     echo "a file below a user-writable directory was accepted as protected" >&2
     exit 1
 fi
 
+# A sandbox carries only /bin/sh, so locate the one binary this needs (a process that
+# stays alive across its own replacement) on PATH and write the replacement here.
+sleep_binary=$(command -v sleep)
+[ -x "$sleep_binary" ]
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$temporary/replacement"
+chmod 0755 "$temporary/replacement"
+
 live_executable=$temporary/live-executable
-cp /bin/sleep "$live_executable"
+cp "$sleep_binary" "$live_executable"
 chmod 0755 "$live_executable"
 old_inode=$(stat -c '%i' "$live_executable")
 "$live_executable" 30 &
 upgrade_pid=$!
-atomic_install_file /bin/true "$live_executable" 0755
+atomic_install_file "$temporary/replacement" "$live_executable" 0755
 new_inode=$(stat -c '%i' "$live_executable")
 [ "$old_inode" != "$new_inode" ]
 kill -0 "$upgrade_pid"
