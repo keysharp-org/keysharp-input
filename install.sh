@@ -31,24 +31,12 @@ if [ ! -f third_party/keysharp-permissions/CMakeLists.txt ]; then
     exit 1
 fi
 
-# CMake's own setup step is deferred because it starts the daemon, which needs the
-# client library resolvable and its permission-store directory present. Both are
-# arranged below, so setup runs last, in the release installer's order.
+# The install step refreshes the linker cache, creates the permission store, and
+# configures udev and the service itself, so there is nothing to do afterwards.
 cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$prefix" -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
+    -DCMAKE_INSTALL_PREFIX="$prefix"
 cmake --build "$build_dir" --parallel
 cmake --install "$build_dir"
-
-[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
-if command -v systemd-tmpfiles >/dev/null 2>&1; then
-    systemd-tmpfiles --create \
-        "$prefix/lib/tmpfiles.d/keysharp-input-permissions.conf" || true
-fi
-if ! "$prefix/bin/keysharp-input" daemon --install-input-access; then
-    echo "keysharp-input service setup was not completed; run as root:" >&2
-    echo "  $prefix/bin/keysharp-input daemon --install-input-access" >&2
-    exit 1
-fi
 
 uninstaller=$prefix/share/doc/keysharp-input/uninstall.sh
 if [ -x "$uninstaller" ]; then

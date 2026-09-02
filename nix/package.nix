@@ -1,7 +1,6 @@
 { lib
 , stdenv
 , cmake
-, ninja
 , pkg-config
 , libevdev
 , systemd
@@ -15,7 +14,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   src = lib.cleanSource ../.;
 
-  nativeBuildInputs = [ cmake ninja pkg-config ];
+  nativeBuildInputs = [ cmake pkg-config ];
   buildInputs = [ libevdev systemd ];
 
   cmakeFlags = [

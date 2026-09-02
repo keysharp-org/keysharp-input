@@ -37,13 +37,13 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake ninja-build pkg-config libudev-dev libevdev-dev
+          sudo apt-get install --yes cmake pkg-config libudev-dev libevdev-dev
 
       - name: Configure
         env:
           CC: ${{ matrix.compiler }}
         run: >-
-          cmake -S . -B build -G Ninja
+          cmake -S . -B build
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
           -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
@@ -71,7 +71,7 @@ jobs:
           test -f "$RUNNER_TEMP/install-root/usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf"
           test ! -e "$RUNNER_TEMP/install-root/usr/local/lib/systemd/system/keysharp-input.service"
           test ! -e "$RUNNER_TEMP/install-root/usr/local/lib/udev/rules.d/70-keysharp-input-uaccess.rules"
-          cmake -S tests/install-consumer -B "$RUNNER_TEMP/consumer-build" -G Ninja \
+          cmake -S tests/install-consumer -B "$RUNNER_TEMP/consumer-build" \
             -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/install-root/usr/local"
           cmake --build "$RUNNER_TEMP/consumer-build"
           LD_LIBRARY_PATH="$RUNNER_TEMP/install-root/usr/local/lib" \

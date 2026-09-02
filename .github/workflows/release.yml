@@ -114,11 +114,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake ninja-build pkg-config libudev-dev libevdev-dev dpkg-dev
+          sudo apt-get install --yes cmake pkg-config libudev-dev libevdev-dev dpkg-dev
 
       - name: Build and test portable layout
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
             -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
@@ -168,7 +168,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
-          cmake -S . -B build-deb -G Ninja \
+          cmake -S . -B build-deb \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF

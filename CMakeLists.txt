@@ -225,13 +225,30 @@ if(KEYSHARP_INPUT_NORMALIZED_PREFIX STREQUAL "/usr/local")
         DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input)
 endif()
 
-# Direct root installs finish service setup immediately. Packaging installs
-# set DESTDIR and should run the equivalent post-install step themselves.
+# A direct root install finishes the job, so `sudo cmake --install` needs no
+# follow-up commands. Packaging installs stage into DESTDIR, or turn this off,
+# and run the equivalent step from their own maintainer scripts.
 option(KEYSHARP_INPUT_SETUP_ON_INSTALL
     "configure udev/uinput/systemd after a direct root install" ON)
 if(KEYSHARP_INPUT_SETUP_ON_INSTALL)
+    # The setup step runs the installed binary, which links the client library
+    # and writes to the permission store, so the linker cache and the tmpfiles
+    # directory have to exist before it is invoked.
     install(CODE "
         if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
+            find_program(_ldconfig ldconfig PATHS /sbin /usr/sbin NO_CACHE)
+            if(_ldconfig)
+                execute_process(COMMAND \"\${_ldconfig}\")
+            endif()
+            find_program(_tmpfiles systemd-tmpfiles NO_CACHE)
+            if(_tmpfiles)
+                execute_process(COMMAND \"\${_tmpfiles}\" --create
+                    \"${KEYSHARP_INPUT_TMPFILES_CONFIG}\"
+                    RESULT_VARIABLE _tmpfiles_result)
+                if(NOT _tmpfiles_result EQUAL 0)
+                    message(WARNING \"systemd-tmpfiles did not create the keysharp-input permission store\")
+                endif()
+            endif()
             set(_bin \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/keysharp-input\")
             execute_process(
                 COMMAND \"\${_bin}\" daemon --install-input-access
