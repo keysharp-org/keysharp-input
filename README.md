@@ -109,9 +109,31 @@ The service manages two durable scopes:
 Modifier, lock-toggle, cursor-position, and idle-time queries need no durable
 permission.
 
-Polkit handles an application's first interactive request, and a grant remains
-until the user revokes it. Grants live in the shared permission store outside
-this project's install prefix, so they survive an upgrade or a reinstall.
+Polkit authenticates an interactive request that no existing grant already
+satisfies, and the result remains until it is revoked. Grants live in the
+shared permission store outside this project's install prefix, so they survive
+an upgrade or a reinstall.
+
+### Input Control is one grant shared with keysharp-desktop
+
+A grant marker is keyed by uid, executable identity, and one scope bit. It
+carries no service name, and every authority reads the same directory, so Input
+Control is a single grant rather than one grant per service.
+
+`keysharp-desktop` manages the same bit for its pointer calls. An application
+granted Input Control there already holds it here: `ksi_synthesize` and
+`ksi_set_block_input` go through with no second prompt, because the request
+path rechecks the store under the shared prompt lock and never reaches
+`pkcheck`. The reverse holds too.
+
+Revocation crosses the same way. `keysharp-input permissions revoke` defaults
+to both input scopes, so a revoke with no scope argument also stops that
+application's `keysharp-desktop` pointer calls, and `revoke --all` does it for
+every application of the calling uid. Pass `input-monitoring` to revoke only
+the scope nothing else shares.
+
+Input Monitoring is this service's alone. `keysharp-desktop` accepts it for
+neither a grant nor a revocation, so a hook grant survives anything done there.
 
 ## Use it from an application
 
@@ -136,9 +158,10 @@ is `0x1B`.
 ### Type into whatever has focus
 
 Synthesis needs Input Control. `ksi_connect` asks for the scope, and
-`ksi_authorize` with `KSI_AUTH_REQUEST` is what opens the polkit dialog the
-first time this application runs; after the user approves it, the grant is
-remembered and later runs go straight through.
+`ksi_authorize` with `KSI_AUTH_REQUEST` is what opens the polkit dialog, unless
+this application already holds Input Control from an earlier run or from
+`keysharp-desktop`; after the user approves it, the grant is remembered and
+later runs go straight through.
 
 ```c
 #include <keysharp_input/client.h>
@@ -273,10 +296,12 @@ lock-toggle state and idle time need no durable permission. `ksi_set_block_input
 suppresses physical input wholesale. `ksi_permissions_list` and
 `ksi_permissions_revoke` back a settings UI.
 
-Connect without requesting any scope to read `info.available_operations` and
-learn what the host can do without opening a permission dialog. Use a separate
-connection per unrelated concurrent task; one connection is used by one thread
-at a time. [docs/integrating.md](docs/integrating.md) covers the whole API,
+Connect without requesting any scope to read `info.available_operations`
+without opening a permission dialog. It is the static set of operations this
+build of the service implements, not a readiness check: a device the operation
+needs can still be absent, and the call then returns `UNAVAILABLE`. Use a
+separate connection per unrelated concurrent task; one connection is used by one
+thread at a time. [docs/integrating.md](docs/integrating.md) covers the whole API,
 including nested dispatch for synthesizing from inside a hook callback.
 
 The default socket is `/run/keysharp-input/keysharp-input.sock`; clients can
@@ -307,7 +332,8 @@ With no arguments, the command prints help. `info` emits stable `key=value`
 lines, including `client_abi_major` and `client_abi_minor`.
 
 Permission hashes are lowercase SHA-256 values. `revoke` defaults to both input
-scopes and performs one atomic daemon request.
+scopes and performs one atomic daemon request. That default includes Input
+Control, which is shared with `keysharp-desktop`; see Permissions above.
 
 ## Running the service
 

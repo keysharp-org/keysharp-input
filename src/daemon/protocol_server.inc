@@ -169,6 +169,23 @@ static void handle_authorize(
         message->header->request_id);
 }
 
+/* An absolute MouseMove is emitted on the second uinput device, whose creation
+ * is non-fatal. Requiring the internal readiness bit turns a batch the backend
+ * would have silently dropped into an honest UNAVAILABLE (or, for a hook
+ * decision, a Pass) instead. */
+static uint64_t input_needs_absolute_pointer(const ksi_input *input)
+{
+    const uint32_t absolute_move = (uint32_t)KSI_MOUSE_MOVE
+        | (uint32_t)KSI_MOUSE_ABSOLUTE;
+
+    if (input->type != KSI_INPUT_MOUSE
+        || (input->data.mouse.flags & absolute_move) != absolute_move) {
+        return 0u;
+    }
+
+    return KSI_INTERNAL_OPERATION_SYNTHESIZE_MOUSE_ABSOLUTE;
+}
+
 static void handle_get_indicator_state(
     ksi_daemon_state *state,
     ksi_client *client,
@@ -639,6 +656,7 @@ static bool handle_hook_decision(
         required_operations |= decision.inputs[i].type == KSI_INPUT_KEYBOARD
             ? KSI_OPERATION_SYNTHESIZE_KEYBOARD
             : KSI_OPERATION_SYNTHESIZE_MOUSE;
+        required_operations |= input_needs_absolute_pointer(&decision.inputs[i]);
     }
     if ((required_operations & state->ready_operations) != required_operations
         || !lane_decision_queue_push(&lane->decision_queue, &decision)) {
@@ -713,6 +731,7 @@ static void handle_synthesize_input(
         required_operations |= inputs[i].type == KSI_INPUT_KEYBOARD
             ? KSI_OPERATION_SYNTHESIZE_KEYBOARD
             : KSI_OPERATION_SYNTHESIZE_MOUSE;
+        required_operations |= input_needs_absolute_pointer(&inputs[i]);
     }
     if ((required_operations & state->ready_operations) != required_operations) {
         send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE,

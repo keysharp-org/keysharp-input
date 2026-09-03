@@ -11,8 +11,8 @@ from `/proc/<pid>/exe`. A seat change fences queued work and releases grabs
 before the new owner becomes active.
 
 HELLO is mandatory. Its requested permission bits are Input Monitoring and
-Input Control; its returned operation mask reports what the current backend can
-perform. These masks are intentionally separate.
+Input Control; its returned operation mask reports what the backend implements,
+not what is ready right now. These masks are intentionally separate.
 
 - Input Monitoring permits global hooks and arbitrary key/button state.
 - Input Control permits synthesis, input blocking, and hook suppression.
@@ -28,14 +28,17 @@ written.
 
 Grants are root-owned records in `/var/lib/keysharp-permissions/v1`. The
 canonical shared implementation is vendored from `keysharp-permissions`; this
-service configures it to read and write only the two input scopes. Foreign
-scope bits are rejected.
+service configures it to read and write only the two input scopes. Scope bits
+outside that pair are rejected. Input Control is not exclusive to this service:
+`keysharp-desktop` manages the same bit, the marker carries no service name,
+and a grant or a revocation of it on either side is the same record.
 
 Revocation emits `SESSION_REVOKED`, clears cached grants, and releases matching
-hooks or blocking state. The runtime generation file lets another compatible
-authority trigger the same refresh. An inotify failure disables persistent
-privileges and releases active input state. Permission files are never read on
-the physical input hot path.
+hooks or blocking state. Revoking Input Control removes the one marker
+`keysharp-desktop` also reads, so it ends that service's use of the scope too.
+The runtime generation file lets another compatible authority trigger the same
+refresh. An inotify failure disables persistent privileges and releases active
+input state. Permission files are never read on the physical input hot path.
 
 Hook lanes use preallocated event pools, fixed queues, and one-second callback
 deadlines. Heap fallback is reserved for queue saturation. Missing, malformed,
@@ -56,3 +59,8 @@ keysharp-input permissions revoke --hash HASH
 keysharp-input permissions revoke --pid PID input-monitoring
 keysharp-input permissions revoke --all
 ```
+
+The first, second, and fourth of those omit a scope and so default to both
+input scopes. Because Input Control is one shared grant, each of them also
+stops the application's `keysharp-desktop` pointer calls. The third names
+`input-monitoring`, the only scope no other authority shares.

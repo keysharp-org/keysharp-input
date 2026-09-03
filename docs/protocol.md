@@ -130,3 +130,13 @@ Subscriptions and nonzero input blocking use a 15-second lease. Empty PING
 requests renew it; id zero avoids a response on a receive-sensitive callback
 stream. The physical Backspace+Escape+Enter chord also releases grabs without
 depending on any client.
+
+## Client forward compatibility
+
+The shipped client library tolerates enumerated values it does not know. Scope
+bits, operation bits, quarantine hook types, key codes, and scan codes arrive
+verbatim; an unrecognized one is never treated as supported and never fails the
+call. Framing stays strict: magic, major and minor, unknown flag bits, reserved
+fields, payload lengths, and malformed tails invalidate the connection. Values
+travelling client to service are still validated against this build's
+vocabulary before they are sent.

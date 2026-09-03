@@ -54,6 +54,11 @@ static uint64_t linux_get_ready_operations(void)
     if (synth_available) {
         operations |= KSI_OPERATION_SYNTHESIZE_KEYBOARD
             | KSI_OPERATION_SYNTHESIZE_MOUSE;
+
+        /* Daemon-internal; never advertised. See the definition. */
+        if (ksi_linux_synth_absolute_is_available()) {
+            operations |= KSI_INTERNAL_OPERATION_SYNTHESIZE_MOUSE_ABSOLUTE;
+        }
     }
     if (ksi_linux_devices_has_candidates()) {
         operations |= KSI_OPERATION_QUERY_KEY_STATE

@@ -57,9 +57,13 @@ The public permission bits are:
 | `KSI_SCOPE_INPUT_MONITORING` | `0x01` |
 | `KSI_SCOPE_INPUT_CONTROL` | `0x02` |
 
-The service's available-operation mask is independent of authorization. A
-backend can advertise an operation yet temporarily return `UNAVAILABLE`, and a
-client can lack the permission required to invoke an available operation.
+The service's available-operation mask is independent of authorization. It is
+static for a given build: a backend advertises an operation it implements, can
+still return `UNAVAILABLE` when the device that operation needs is absent, and a
+client can lack the permission required to invoke an available operation. An
+absolute `MouseMove` is the case to expect. The service creates a second uinput
+device for it, that creation is deliberately non-fatal, and `ksi_synthesize`
+returns `UNAVAILABLE` for an absolute move when the device is missing.
 
 For settings UI, use an authorization-lease connection. `ksi_lease_next`
 blocks until a revocation or timeout, and `ksi_lease_granted_scopes` reads the
@@ -71,6 +75,12 @@ each record; returning false drains the response and returns `CANCELLED`.
 `ksi_permissions_revoke` accepts one initialized `ksi_permission_revoke`.
 Target kinds are HASH=1, PID=2, and ALL=3. Hashes are exactly 64 lowercase hex
 characters. A zero scope mask is invalid.
+
+`KSI_SCOPE_INPUT_CONTROL` is one grant shared with `keysharp-desktop`, which
+manages the same bit for its pointer calls. A listed record carrying that scope
+may have come from a prompt that named the other service, and revoking it here
+also stops that application's `keysharp-desktop` pointer calls. A settings UI
+should say so before it revokes. `KSI_SCOPE_INPUT_MONITORING` is not shared.
 
 ## Error handling
 

@@ -11,6 +11,11 @@ int ksi_linux_synth_start(void);
 void ksi_linux_synth_stop(void);
 bool ksi_linux_synth_is_started(void);
 bool ksi_linux_synth_is_available(void);
+/* True only while the second (absolute pointer) uinput device exists. Its
+ * creation is deliberately non-fatal, so the relative device can be usable when
+ * absolute MouseMove is not; callers must gate absolute output on this rather
+ * than on ksi_linux_synth_is_available(). */
+bool ksi_linux_synth_absolute_is_available(void);
 /* Main-thread detector: returns true (rate-limited) when a prior write failure
  * has latched the device as broken and a recreation should be requested. Does
  * NOT touch the device itself, so it is safe to call off the sequencer thread. */

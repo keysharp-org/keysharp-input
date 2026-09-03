@@ -19,7 +19,12 @@ The version-1 namespace contains eight scopes:
 | Clipboard Monitoring | `0x80` |
 
 This service configures `read_scopes` and `write_scopes` to `0x03`. It cannot
-list, grant, or revoke another authority's scopes.
+list, grant, or revoke a scope outside that mask.
+
+Inside the mask it is not alone. `keysharp-desktop` manages `0x02` for its
+pointer calls, and a marker file is named `grant-<uid>-<hash>-<scope>.grant`
+with no service in it, so Input Control is one grant that either service reads,
+writes, and unlinks. Only `0x01` belongs to this service alone.
 
 Persistent records live below `/var/lib/keysharp-permissions/v1`; runtime
 generation and prompt-lock files live below `/run/keysharp-permissions`. Both

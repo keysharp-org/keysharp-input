@@ -35,6 +35,7 @@ enum {
 typedef uint32_t ksi_connection_role;
 enum {
     KSI_ROLE_RPC = 0u,
+    /* Reserved. HELLO with this role is rejected as UNSUPPORTED. */
     KSI_ROLE_EVENT_STREAM = 1u,
     KSI_ROLE_CALLBACK_STREAM = 2u,
     KSI_ROLE_AUTHORIZATION_LEASE = 3u,

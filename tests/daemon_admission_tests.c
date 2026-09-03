@@ -101,6 +101,7 @@ static bool test_daemon_admission_and_operation_gates(void)
     uint8_t authorize[KSI_AUTHORIZE_PAYLOAD_SIZE] = { 0 };
     uint8_t hook[KSI_HOOK_SUBSCRIPTION_PAYLOAD_SIZE] = { 0 };
     uint8_t block[KSI_BLOCK_INPUT_PAYLOAD_SIZE] = { 0 };
+    uint8_t synthesize[KSI_SYNTHESIZE_PREFIX_SIZE + KSI_INPUT_WIRE_SIZE] = { 0 };
     uint8_t hello_result[KSI_HELLO_RESULT_PAYLOAD_SIZE];
     int sockets[2];
 
@@ -153,6 +154,40 @@ static bool test_daemon_admission_and_operation_gates(void)
     CHECK(read_status_response(sockets[1], KSI_OPCODE_SET_BLOCK_INPUT, 5u,
         KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE,
         NULL));
+
+    /* Synthesis ready but the absolute-pointer device missing. A relative
+     * batch clears the operation gate (and then fails on the uninitialized
+     * output queue); an absolute MouseMove is refused up front instead of being
+     * accepted and dropped inside the backend; granting the internal bit lets
+     * the same absolute batch through the gate again. */
+    state.ready_operations = KSI_OPERATION_SYNTHESIZE_KEYBOARD
+        | KSI_OPERATION_SYNTHESIZE_MOUSE;
+    ksi_wire_write_u32(synthesize, 1u);
+    ksi_wire_write_u32(synthesize + 4u, (uint32_t)KSI_SYNTH_BYPASS_HOOK);
+    ksi_wire_write_u32(synthesize + KSI_SYNTHESIZE_PREFIX_SIZE,
+        (uint32_t)KSI_INPUT_MOUSE);
+    ksi_wire_write_u32(synthesize + KSI_SYNTHESIZE_PREFIX_SIZE + 20u,
+        (uint32_t)KSI_MOUSE_MOVE);
+    CHECK(dispatch_request(&state, &client, KSI_OPCODE_SYNTHESIZE_INPUT, 6u,
+        synthesize, sizeof(synthesize)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_SYNTHESIZE_INPUT, 6u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_RESOURCE_EXHAUSTED,
+        KSI_DETAIL_NONE, NULL));
+
+    ksi_wire_write_u32(synthesize + KSI_SYNTHESIZE_PREFIX_SIZE + 20u,
+        (uint32_t)KSI_MOUSE_MOVE | (uint32_t)KSI_MOUSE_ABSOLUTE);
+    CHECK(dispatch_request(&state, &client, KSI_OPCODE_SYNTHESIZE_INPUT, 7u,
+        synthesize, sizeof(synthesize)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_SYNTHESIZE_INPUT, 7u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE,
+        NULL));
+
+    state.ready_operations |= KSI_INTERNAL_OPERATION_SYNTHESIZE_MOUSE_ABSOLUTE;
+    CHECK(dispatch_request(&state, &client, KSI_OPCODE_SYNTHESIZE_INPUT, 8u,
+        synthesize, sizeof(synthesize)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_SYNTHESIZE_INPUT, 8u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_RESOURCE_EXHAUSTED,
+        KSI_DETAIL_NONE, NULL));
 
     hook_send_ref_invalidate(client.hook_send_ref);
     hook_send_ref_release(client.hook_send_ref);

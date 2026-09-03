@@ -612,8 +612,7 @@ static uint32_t apply_revocation(ksi_connection *connection,
         && read_u32(payload + 4u) == 0u) {
         uint32_t revoked = read_u32(payload);
 
-        if (revoked == 0u
-            || (revoked & ~(uint32_t)KSI_SCOPE_ALL) != 0u) {
+        if (revoked == 0u) {
             return 0u;
         }
         connection->granted_scopes &= ~revoked;
@@ -640,8 +639,7 @@ static bool decode_quarantine(
     event->generation = read_u32(payload + 16u);
     event->strike_count = read_u32(payload + 20u);
     event->retry_after_ms = read_u32(payload + 24u);
-    return event->hook_type == KSI_HOOK_KEYBOARD
-        || event->hook_type == KSI_HOOK_MOUSE;
+    return true;
 }
 
 static bool queue_notification(
@@ -1072,11 +1070,10 @@ ksi_status ksi_connect(
         ksi_disconnect(created);
         return status;
     }
-    created->granted_scopes = read_u32(created->rx + 8u);
+    created->granted_scopes = read_u32(created->rx + 8u)
+        & (uint32_t)KSI_SCOPE_ALL;
     created->available_operations = read_u64(created->rx + 16u);
-    if ((created->granted_scopes & ~(uint32_t)KSI_SCOPE_ALL) != 0u
-        || (created->available_operations & ~(ksi_operations)KSI_OPERATION_ALL) != 0u
-        || read_u32(created->rx + 12u) != 0u) {
+    if (read_u32(created->rx + 12u) != 0u) {
         set_error(error, 0u, 0, "service returned invalid authorization data");
         ksi_disconnect(created);
         return KSI_STATUS_INTERNAL;
@@ -1141,13 +1138,12 @@ ksi_status ksi_authorize(
     if (status != KSI_STATUS_OK) {
         return status;
     }
-    if (read_u32(connection->rx + 12u) != 0u
-        || (read_u32(connection->rx + 8u)
-            & ~(uint32_t)KSI_SCOPE_ALL) != 0u) {
+    if (read_u32(connection->rx + 12u) != 0u) {
         set_error(error, 0u, 0, "service returned invalid authorization data");
         return KSI_STATUS_INTERNAL;
     }
-    connection->granted_scopes |= read_u32(connection->rx + 8u);
+    connection->granted_scopes |= read_u32(connection->rx + 8u)
+        & (uint32_t)KSI_SCOPE_ALL;
     if (granted_scopes != NULL) {
         *granted_scopes = connection->granted_scopes;
     }
@@ -1224,9 +1220,7 @@ ksi_status ksi_permissions_list(
 
             if ((size_t)path_length
                     != response.payload_size - KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE
-                || path_length >= KSI_EXECUTABLE_PATH_SIZE
-                || (read_u32(connection->rx + 8u)
-                    & ~(uint32_t)KSI_SCOPE_ALL) != 0u) {
+                || path_length >= KSI_EXECUTABLE_PATH_SIZE) {
                 set_error(error, 0u, 0, "service returned an invalid permission entry");
                 return KSI_STATUS_INTERNAL;
             }
@@ -1394,11 +1388,7 @@ static ksi_status hook_subscription(
     write_u32(payload, hook_type);
     status = simple_request(connection, opcode, payload, sizeof(payload),
         KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE, &response, error);
-    if (status == KSI_STATUS_OK
-        && (read_u32(connection->rx + 12u) != 0u
-            || (read_u32(connection->rx + 8u)
-                & ~(uint32_t)(KSI_OPERATION_HOOK_KEYBOARD
-                    | KSI_OPERATION_HOOK_MOUSE)) != 0u)) {
+    if (status == KSI_STATUS_OK && read_u32(connection->rx + 12u) != 0u) {
         set_error(error, 0u, 0, "service returned invalid hook state");
         return KSI_STATUS_INTERNAL;
     }

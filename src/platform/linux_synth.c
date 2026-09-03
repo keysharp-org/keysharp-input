@@ -868,6 +868,11 @@ bool ksi_linux_synth_is_available(void)
     return ksi_linux_synth_is_started() && !synth_write_failed;
 }
 
+bool ksi_linux_synth_absolute_is_available(void)
+{
+    return uinput_abs_fd >= 0 && !synth_write_failed;
+}
+
 /* Rate limit for synth recovery: recreating the uinput devices is real
  * ioctl/UI_DEV_DESTROY/UI_DEV_CREATE work, not something to repeat on every
  * single main-loop tick if the underlying problem persists. */
@@ -1514,13 +1519,24 @@ static int replay_mouse_hook_event(const ksi_mouse_hook_event *event)
     switch (event->message) {
         case KSI_MESSAGE_MOUSE_MOVE:
             input.data.mouse.flags = KSI_MOUSE_MOVE;
-
-            if ((event->mouse_data & KSI_MOUSE_ABSOLUTE) != 0) {
-                input.data.mouse.flags |= KSI_MOUSE_ABSOLUTE;
-            }
-
             input.data.mouse.dx = event->x;
             input.data.mouse.dy = event->y;
+
+            if ((event->mouse_data & KSI_MOUSE_ABSOLUTE) != 0) {
+                if (uinput_abs_fd >= 0) {
+                    input.data.mouse.flags |= KSI_MOUSE_ABSOLUTE;
+                } else {
+                    /* A grabbed absolute pointer (VM tablet, touchscreen) must
+                     * still reach the desktop when the absolute output device
+                     * failed to create; otherwise PASS silently swallows the
+                     * user's own pointer for as long as a mouse hook is
+                     * subscribed. The hook event carries the movement delta the
+                     * device reported, so re-emit it on the relative device. */
+                    input.data.mouse.dx = event->delta_x;
+                    input.data.mouse.dy = event->delta_y;
+                }
+            }
+
             break;
         case KSI_MESSAGE_LEFT_BUTTON_DOWN:
             input.data.mouse.flags = KSI_MOUSE_LEFT_DOWN;

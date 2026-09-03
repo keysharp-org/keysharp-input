@@ -19,6 +19,10 @@
 #define HOOK_EVENT 0x1002u
 #define HOOK_QUARANTINED 0x1003u
 #define SYNTHESIZE 0x1010u
+#define FUTURE_SCOPE_REVOKED 0x00000004u
+#define FUTURE_SCOPE_KEPT 0x00000008u
+#define FUTURE_HOOK_TYPE 15u
+#define FUTURE_OPERATION UINT64_C(0x0000000000001000)
 
 _Static_assert(sizeof(ksi_service_info) == 56u,
     "service-info ABI size changed");
@@ -117,9 +121,10 @@ static void *server_main(void *argument)
         || opcode != HELLO || flags != 0u || size != 16u
         || read_u16(payload) != KSI_ROLE_CALLBACK_STREAM) goto fail;
     memset(payload, 0, 24u); write_u32(payload, KSI_STATUS_OK);
-    write_u32(payload + 8u, KSI_SCOPE_INPUT_CONTROL);
+    write_u32(payload + 8u, KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED
+        | FUTURE_SCOPE_KEPT);
     write_u64(payload + 16u, KSI_OPERATION_HOOK_KEYBOARD
-        | KSI_OPERATION_SYNTHESIZE_KEYBOARD);
+        | KSI_OPERATION_SYNTHESIZE_KEYBOARD | FUTURE_OPERATION);
     if (!send_frame(fd, HELLO, RESPONSE, outer_id, payload, 24u)) goto fail;
 
     if (!receive_frame(fd, &opcode, &flags, &outer_id, payload, sizeof(payload), &size)
@@ -138,12 +143,13 @@ static void *server_main(void *argument)
         || opcode != HOOK_EVENT || flags != RESPONSE || nested_id != event_id
         || size != 16u || read_u32(payload + 8u) != KSI_HOOK_PASS) goto fail;
 
-    memset(payload, 0, 32u); write_u32(payload, KSI_HOOK_KEYBOARD);
+    memset(payload, 0, 32u); write_u32(payload, FUTURE_HOOK_TYPE);
     write_u32(payload + 4u, KSI_HOOK_QUARANTINE_TIMEOUT);
     write_u64(payload + 8u, event_id); write_u32(payload + 16u, 3u);
     write_u32(payload + 20u, 1u); write_u32(payload + 24u, 1000u);
     if (!send_frame(fd, HOOK_QUARANTINED, EVENT, 0u, payload, 32u)) goto fail;
-    memset(payload, 0, 8u); write_u32(payload, KSI_SCOPE_INPUT_CONTROL);
+    memset(payload, 0, 8u);
+    write_u32(payload, KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED);
     if (!send_frame(fd, SESSION_REVOKED, EVENT, 0u, payload, 8u)) goto fail;
     memset(payload, 0, 8u);
     if (!send_frame(fd, SYNTHESIZE, RESPONSE, outer_id, payload, 8u)) goto fail;
@@ -202,14 +208,20 @@ int main(void)
         || ksi_synthesize(connection, NULL, 0u,
             KSI_SYNTH_BYPASS_HOOK, &error) != KSI_STATUS_OK
         || callback_calls != 1u
+        || ksi_connection_available_operations(connection)
+            != (KSI_OPERATION_HOOK_KEYBOARD | KSI_OPERATION_SYNTHESIZE_KEYBOARD
+                | FUTURE_OPERATION)
         || ksi_connection_granted_scopes(connection) != 0u) goto joined;
     ksi_hook_message_init(&message);
     if (ksi_hook_next(connection, 0u, &message, &error) != KSI_STATUS_OK
-        || message.kind != KSI_HOOK_MESSAGE_QUARANTINED) goto joined;
+        || message.kind != KSI_HOOK_MESSAGE_QUARANTINED
+        || message.data.quarantined.hook_type
+            != FUTURE_HOOK_TYPE) goto joined;
     ksi_hook_message_init(&message);
     if (ksi_hook_next(connection, 0u, &message, &error) != KSI_STATUS_OK
         || message.kind != KSI_HOOK_MESSAGE_SESSION_REVOKED
-        || message.data.revoked_scopes != KSI_SCOPE_INPUT_CONTROL) goto joined;
+        || message.data.revoked_scopes
+            != (KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED)) goto joined;
     result = 0;
 joined:
     ksi_disconnect(connection); pthread_join(thread, NULL);

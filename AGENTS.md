@@ -85,8 +85,14 @@ a sibling checkout instead of the submodule.
 ## Permissions
 
 Two durable scopes, `KSI_SCOPE_INPUT_MONITORING` and `KSI_SCOPE_INPUT_CONTROL`. Polkit
-authenticates the first interactive request; the grant persists until revoked. Modifier
-state, lock-toggle state, cursor position and idle time are ungated.
+authenticates an interactive request that no existing grant already satisfies; the grant
+persists until revoked. Modifier state, lock-toggle state, cursor position and idle time
+are ungated.
+
+`KSI_SCOPE_INPUT_CONTROL` is one grant shared with `keysharp-desktop`, which manages the
+same bit for its pointer calls. A marker carries no service name, so granting or revoking
+it on either side is the same record, and `permissions revoke` with no scope argument
+includes it. `KSI_SCOPE_INPUT_MONITORING` is this service's alone.
 
 `ksi_connect` names the scopes an application wants; `ksi_authorize` with
 `KSI_AUTH_REQUEST` is what opens the dialog. Connecting with no scopes reads
