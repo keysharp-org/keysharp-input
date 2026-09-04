@@ -44,6 +44,9 @@ allocation. `ksi_hook_next` returns a tagged `ksi_hook_message`:
 - `KSI_HOOK_MESSAGE_QUARANTINED` reports timeout/transport safety state; and
 - `KSI_HOOK_MESSAGE_SESSION_REVOKED` reports scopes removed while connected.
 
+While waiting, `ksi_hook_next` sends the callback-stream heartbeats needed to
+keep active hook and input-blocking leases alive, including for an infinite wait.
+
 If an application can synthesize from inside its hook callback, install a
 `ksi_nested_hook_handler` before subscribing. With no handler, nested hook
 requests fail open as Pass.

@@ -18,6 +18,7 @@
 
 #define KSI_CLIENT_MAX_RECURSION 32u
 #define KSI_CLIENT_NOTIFICATION_CAPACITY 16u
+#define KSI_CLIENT_HOOK_HEARTBEAT_MS 5000u
 
 _Static_assert((uint32_t)KSI_SCOPE_INPUT_MONITORING
         == (uint32_t)KSP_SCOPE_INPUT_MONITORING,
@@ -1424,6 +1425,8 @@ ksi_status ksi_hook_next(
     ksi_hook_message *message,
     ksi_error *error)
 {
+    uint64_t deadline;
+
     if (connection == NULL || message == NULL
         || message->struct_size < sizeof(*message)
         || connection->role != KSI_ROLE_CALLBACK_STREAM) {
@@ -1438,11 +1441,34 @@ ksi_status ksi_hook_next(
         clear_error(error);
         return KSI_STATUS_OK;
     }
+    deadline = timeout_ms == UINT32_MAX
+        ? 0u : monotonic_ms() + timeout_ms;
     for (;;) {
         ksi_wire_header header;
-        ksi_status status = receive_frame(connection, &header,
-            timeout_ms, error);
+        uint32_t wait_ms = KSI_CLIENT_HOOK_HEARTBEAT_MS;
+        ksi_status status;
 
+        if (timeout_ms != UINT32_MAX) {
+            int remaining = remaining_timeout(deadline, timeout_ms);
+            wait_ms = remaining < (int)KSI_CLIENT_HOOK_HEARTBEAT_MS
+                ? (uint32_t)remaining : KSI_CLIENT_HOOK_HEARTBEAT_MS;
+        }
+        status = receive_frame(connection, &header, wait_ms, error);
+
+        if (status == KSI_STATUS_TIMEOUT) {
+            status = send_frame(connection, KSI_OPCODE_PING, 0u, 0u,
+                NULL, 0u, 0u, error);
+            if (status != KSI_STATUS_OK) {
+                return status;
+            }
+            if (timeout_ms != UINT32_MAX
+                && remaining_timeout(deadline, timeout_ms) == 0) {
+                set_error(error, 0u, 0, "operation timed out");
+                return KSI_STATUS_TIMEOUT;
+            }
+            clear_error(error);
+            continue;
+        }
         if (status != KSI_STATUS_OK) {
             return status;
         }

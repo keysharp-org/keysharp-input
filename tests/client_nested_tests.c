@@ -15,6 +15,7 @@
 #define RESPONSE 0x0001u
 #define EVENT 0x0002u
 #define HELLO 0x0001u
+#define PING 0x0003u
 #define SESSION_REVOKED 0x0006u
 #define HOOK_EVENT 0x1002u
 #define HOOK_QUARANTINED 0x1003u
@@ -152,7 +153,11 @@ static void *server_main(void *argument)
     write_u32(payload, KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED);
     if (!send_frame(fd, SESSION_REVOKED, EVENT, 0u, payload, 8u)) goto fail;
     memset(payload, 0, 8u);
-    if (!send_frame(fd, SYNTHESIZE, RESPONSE, outer_id, payload, 8u)) goto fail;
+    if (!send_frame(fd, SYNTHESIZE, RESPONSE, outer_id, payload, 8u)
+        || !receive_frame(fd, &opcode, &flags, &nested_id,
+            payload, sizeof(payload), &size)
+        || opcode != PING || flags != 0u || nested_id != 0u || size != 0u)
+        goto fail;
 
     close(fd); return NULL;
 fail:
@@ -222,6 +227,9 @@ int main(void)
         || message.kind != KSI_HOOK_MESSAGE_SESSION_REVOKED
         || message.data.revoked_scopes
             != (KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED)) goto joined;
+    ksi_hook_message_init(&message);
+    if (ksi_hook_next(connection, 1u, &message, &error) != KSI_STATUS_TIMEOUT)
+        goto joined;
     result = 0;
 joined:
     ksi_disconnect(connection); pthread_join(thread, NULL);
