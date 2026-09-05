@@ -297,6 +297,20 @@ if(BUILD_TESTING)
     add_test(NAME keysharp-input-client-nested-tests
         COMMAND keysharp-input-client-nested-tests)
 
+    add_executable(keysharp-input-client-stream-tests
+        tests/client_stream_tests.c
+        src/client.c)
+    target_include_directories(keysharp-input-client-stream-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(keysharp-input-client-stream-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L KSI_CLIENT_TESTING
+        KSI_PRODUCT_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(keysharp-input-client-stream-tests PRIVATE
+        KeysharpPermissions::permissions)
+    add_test(NAME keysharp-input-client-stream-tests
+        COMMAND keysharp-input-client-stream-tests)
+
     add_executable(keysharp-input-daemon-admission-tests
         tests/daemon_admission_tests.c
         src/active_session.c
@@ -333,6 +347,8 @@ if(BUILD_TESTING)
         target_compile_options(keysharp-input-protocol-tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
         target_compile_options(keysharp-input-client-nested-tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+        target_compile_options(keysharp-input-client-stream-tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
         target_compile_options(keysharp-input-daemon-admission-tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

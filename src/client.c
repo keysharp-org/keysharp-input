@@ -58,6 +58,31 @@ struct ksi_connection {
     uint8_t tx[KSI_MAX_PAYLOAD_SIZE];
 };
 
+#ifdef KSI_CLIENT_TESTING
+ksi_connection *ksi_client_test_adopt_descriptor(int descriptor)
+{
+    if (descriptor < 0) {
+        return NULL;
+    }
+    ksi_connection *connection = calloc(1u, sizeof(*connection));
+    if (connection != NULL) {
+        connection->fd = descriptor;
+        connection->role = KSI_ROLE_RPC;
+        connection->default_timeout_ms = KSI_DEFAULT_REQUEST_TIMEOUT_MS;
+        connection->next_request_id = 1u;
+    }
+    return connection;
+}
+
+void ksi_client_test_set_outstanding_hook_request(
+    ksi_connection *connection, uint64_t request_id)
+{
+    if (connection != NULL) {
+        connection->outstanding_hook_request = request_id;
+    }
+}
+#endif
+
 static uint16_t read_u16(const uint8_t *source)
 {
     return (uint16_t)((uint16_t)source[0]
