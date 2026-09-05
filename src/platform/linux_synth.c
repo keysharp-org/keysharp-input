@@ -5,6 +5,7 @@
 #include "linux_device_filter.h"
 #include "../protocol_internal.h"
 #include "vk_evdev.h"
+#include "linux_wheel.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <linux/uinput.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -66,15 +68,15 @@
 #define KSI_VK_PACKET 0xE7u
 
 /* Relative mouse: keyboard keys + BTN_* + REL_X/Y/WHEEL. */
-static int uinput_fd = -1;
+static atomic_int uinput_fd = -1;
 /* Absolute pointer: ABS_X/Y with INPUT_PROP_POINTER for absolute MouseMove. */
-static int uinput_abs_fd = -1;
-/* Latched by emit_event_to() on a genuine uinput write failure (see there).
- * Cleared/re-latched by ksi_linux_synth_recreate() (on the sequencer thread).
- * Read by ksi_linux_synth_is_available() and ksi_linux_synth_needs_recovery()
- * on the main thread -- a benign read of a simple latch, the same cross-thread
- * read is_available() has always done. */
-static bool synth_write_failed;
+static atomic_int uinput_abs_fd = -1;
+/* The sequencer owns device mutation; the main thread reads readiness. */
+static atomic_bool synth_write_failed;
+static atomic_bool synth_lifecycle_busy;
+static pthread_mutex_t synth_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int32_t wheel_remainder;
+static int32_t horizontal_wheel_remainder;
 
 /* All uinput writes and the ACTUAL-device synthesis state they touch (uinput_fd,
  * uinput_abs_fd, synthesized_keys_down and the pacing counters) are accessed on a
@@ -698,7 +700,9 @@ static int configure_uinput_device(void)
     if (enable_relative(REL_X) != 0
         || enable_relative(REL_Y) != 0
         || enable_relative(REL_WHEEL) != 0
-        || enable_relative(REL_HWHEEL) != 0) {
+        || enable_relative(REL_HWHEEL) != 0
+        || enable_relative(REL_WHEEL_HI_RES) != 0
+        || enable_relative(REL_HWHEEL_HI_RES) != 0) {
         return -1;
     }
 
@@ -803,7 +807,7 @@ static int configure_abs_uinput_device(void)
     return 0;
 }
 
-int ksi_linux_synth_start(void)
+static int start_synth_devices(void)
 {
     uinput_fd = open(KSI_UINPUT_PATH, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 
@@ -839,9 +843,20 @@ int ksi_linux_synth_start(void)
     return 0;
 }
 
-void ksi_linux_synth_stop(void)
+int ksi_linux_synth_start(void)
+{
+    pthread_mutex_lock(&synth_lifecycle_mutex);
+    synth_lifecycle_busy = true;
+    int result = uinput_fd >= 0 ? 0 : start_synth_devices();
+    synth_lifecycle_busy = false;
+    pthread_mutex_unlock(&synth_lifecycle_mutex);
+    return result;
+}
+
+static void stop_synth_devices(void)
 {
     ksi_linux_synth_release_all();
+    wheel_remainder = horizontal_wheel_remainder = 0;
 
     if (uinput_fd >= 0) {
         (void)ioctl(uinput_fd, UI_DEV_DESTROY);
@@ -858,6 +873,15 @@ void ksi_linux_synth_stop(void)
     }
 }
 
+void ksi_linux_synth_stop(void)
+{
+    pthread_mutex_lock(&synth_lifecycle_mutex);
+    synth_lifecycle_busy = true;
+    stop_synth_devices();
+    synth_lifecycle_busy = false;
+    pthread_mutex_unlock(&synth_lifecycle_mutex);
+}
+
 bool ksi_linux_synth_is_started(void)
 {
     return uinput_fd >= 0;
@@ -865,12 +889,12 @@ bool ksi_linux_synth_is_started(void)
 
 bool ksi_linux_synth_is_available(void)
 {
-    return ksi_linux_synth_is_started() && !synth_write_failed;
+    return !synth_lifecycle_busy && ksi_linux_synth_is_started() && !synth_write_failed;
 }
 
 bool ksi_linux_synth_absolute_is_available(void)
 {
-    return uinput_abs_fd >= 0 && !synth_write_failed;
+    return !synth_lifecycle_busy && uinput_abs_fd >= 0 && !synth_write_failed;
 }
 
 /* Rate limit for synth recovery: recreating the uinput devices is real
@@ -893,7 +917,7 @@ bool ksi_linux_synth_needs_recovery(void)
 {
     uint64_t now;
 
-    if (!synth_write_failed) {
+    if (synth_lifecycle_busy || !synth_write_failed) {
         return false;
     }
 
@@ -916,16 +940,20 @@ bool ksi_linux_synth_needs_recovery(void)
  * daemon silently sitting on a dead synth output. */
 void ksi_linux_synth_recreate(void)
 {
+    pthread_mutex_lock(&synth_lifecycle_mutex);
+    synth_lifecycle_busy = true;
     fprintf(stderr, "keysharp-input: synthetic output device write failed; recreating uinput devices\n");
-    ksi_linux_synth_stop();
+    stop_synth_devices();
     synth_write_failed = false;
-    (void)ksi_linux_synth_start();
+    (void)start_synth_devices();
 
     if (uinput_fd < 0) {
         /* ksi_linux_synth_start() already logged the specific reason. Mark
          * broken again so the next needs_recovery() poll re-requests recovery. */
         synth_write_failed = true;
     }
+    synth_lifecycle_busy = false;
+    pthread_mutex_unlock(&synth_lifecycle_mutex);
 }
 
 /* Resolve a keyboard synth input to the evdev key code it toggles and its
@@ -1333,13 +1361,11 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
     }
 
     if ((input->flags & KSI_MOUSE_WHEEL) != 0) {
-        int32_t delta = (int32_t)input->mouse_data / 120;
+        int32_t delta = (int32_t)input->mouse_data;
+        int32_t steps = ksi_linux_wheel_steps(delta, &wheel_remainder);
 
-        if (delta == 0 && input->mouse_data != 0) {
-            delta = input->mouse_data > 0 ? 1 : -1;
-        }
-
-        if (emit_event(EV_REL, REL_WHEEL, delta) != 0) {
+        if (emit_event(EV_REL, REL_WHEEL_HI_RES, delta) != 0
+            || (steps != 0 && emit_event(EV_REL, REL_WHEEL, steps) != 0)) {
             return -1;
         }
 
@@ -1347,13 +1373,11 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
     }
 
     if ((input->flags & KSI_MOUSE_HORIZONTAL_WHEEL) != 0) {
-        int32_t delta = (int32_t)input->mouse_data / 120;
+        int32_t delta = (int32_t)input->mouse_data;
+        int32_t steps = ksi_linux_wheel_steps(delta, &horizontal_wheel_remainder);
 
-        if (delta == 0 && input->mouse_data != 0) {
-            delta = input->mouse_data > 0 ? 1 : -1;
-        }
-
-        if (emit_event(EV_REL, REL_HWHEEL, delta) != 0) {
+        if (emit_event(EV_REL, REL_HWHEEL_HI_RES, delta) != 0
+            || (steps != 0 && emit_event(EV_REL, REL_HWHEEL, steps) != 0)) {
             return -1;
         }
 

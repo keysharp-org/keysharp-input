@@ -130,6 +130,7 @@ install(TARGETS keysharp-input-client
 install(FILES
     include/keysharp_input/client.h
     include/keysharp_input/constants.h
+    include/keysharp_input/devices.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/keysharp_input)
 configure_file(cmake/keysharp-input.pc.in
     ${CMAKE_CURRENT_BINARY_DIR}/keysharp-input.pc @ONLY)
@@ -213,6 +214,8 @@ endif()
 install(FILES README.md LICENSE PROVENANCE.md
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input
     PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+install(DIRECTORY examples/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input/examples)
 install(DIRECTORY docs/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input/docs
     FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
@@ -436,6 +439,22 @@ if(BUILD_TESTING)
     add_test(NAME keysharp-input-linux-device-filter-tests
         COMMAND keysharp-input-linux-device-filter-tests)
 
+    add_executable(keysharp-input-linux-device-state-tests
+        tests/linux_device_state_tests.c
+        src/platform/linux_synth.c
+        src/platform/vk_evdev.c)
+    target_include_directories(keysharp-input-linux-device-state-tests PRIVATE include src)
+    target_compile_definitions(keysharp-input-linux-device-state-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(keysharp-input-linux-device-state-tests PRIVATE
+        Threads::Threads PkgConfig::LIBUDEV PkgConfig::LIBEVDEV KeysharpPermissions::permissions)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(keysharp-input-linux-device-state-tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME keysharp-input-linux-device-state-tests
+        COMMAND keysharp-input-linux-device-state-tests)
+
     add_executable(keysharp-input-owned-text-file-tests
         tests/owned_text_file_tests.c
         src/owned_text_file.c)
@@ -498,7 +517,10 @@ set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "polkitd, udev, kmod, systemd")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-input-client-abi-0")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_input/client.h"
+    KEYSHARP_INPUT_ABI_MINOR_LINE REGEX "^#define KSI_CLIENT_ABI_MINOR ")
+string(REGEX MATCH "[0-9]+" KEYSHARP_INPUT_ABI_MINOR "${KEYSHARP_INPUT_ABI_MINOR_LINE}")
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-input-client-abi-0 (= 0.${KEYSHARP_INPUT_ABI_MINOR})")
 set(KEYSHARP_INPUT_DEBIAN_CONTROLS)
 foreach(script preinst postinst prerm postrm)
     file(COPY packaging/debian/${script}

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include <keysharp_input/constants.h>
+#include <keysharp_input/devices.h>
 
 #if defined(_WIN32)
 #  if defined(KEYSHARP_INPUT_CLIENT_BUILD)
@@ -24,7 +25,7 @@ extern "C" {
 #endif
 
 #define KSI_CLIENT_ABI_MAJOR 0u
-#define KSI_CLIENT_ABI_MINOR 1u
+#define KSI_CLIENT_ABI_MINOR 2u
 #define KSI_DEFAULT_SOCKET_PATH "/run/keysharp-input/keysharp-input.sock"
 #define KSI_SOCKET_ENV "KEYSHARP_INPUT_SOCKET"
 
@@ -388,10 +389,38 @@ KSI_API ksi_status ksi_get_modifier_state(
     ksi_modifier_state *state,
     ksi_error *error);
 
+typedef struct ksi_observer_message {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint64_t device_generation;
+    uint64_t dropped_events;
+    union {
+        ksi_hook_event input;
+        ksi_device_info device;
+        ksi_raw_input_event raw_input;
+        ksi_permission_scopes revoked_scopes;
+    } data;
+    uint64_t reserved[4];
+} ksi_observer_message;
+
+typedef bool (*ksi_device_visitor)(const ksi_device_info *device, void *context);
+KSI_API void ksi_device_info_init(ksi_device_info *device);
+KSI_API void ksi_device_axis_info_init(ksi_device_axis_info *axis);
+KSI_API void ksi_raw_input_event_init(ksi_raw_input_event *event);
+KSI_API void ksi_observer_message_init(ksi_observer_message *message);
+KSI_API ksi_status ksi_devices_list(ksi_connection *connection,
+    ksi_device_visitor visitor, void *context, uint64_t *generation, ksi_error *error);
+/* Subscribe with ksi_hook_subscribe on KSI_ROLE_OBSERVER_STREAM. Observation
+ * never grabs devices and needs no reply. Overflow requires a state/device refresh. */
+KSI_API ksi_status ksi_observer_next(ksi_connection *connection,
+    uint32_t timeout_ms, ksi_observer_message *message, ksi_error *error);
+
 /* A connection is used by one thread at a time. The nested-hook callback is
  * the sole reentrant path: it may call this API on the same connection before
  * returning. Event and reply pointers are borrowed only for the duration of
- * the call that receives or sends them. */
+ * the call that receives or sends them. A nested callback must not disconnect
+ * the connection or free its context: defer destruction until the outer API
+ * call returns. Replacement event arrays must remain alive until that return. */
 
 #ifdef __cplusplus
 }

@@ -54,6 +54,7 @@ rm -f -- \
     /usr/local/lib/cmake/KeysharpInput/KeysharpInputTargets-debug.cmake \
     /usr/local/include/keysharp_input/client.h \
     /usr/local/include/keysharp_input/constants.h \
+    /usr/local/include/keysharp_input/devices.h \
     /etc/systemd/system/keysharp-input.service \
     /etc/systemd/system/keysharp-input.socket \
     /usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf \

@@ -44,8 +44,8 @@ HELLO must be the first request and may appear exactly once.
 | `0x0006` | SESSION_REVOKED | server EVENT | `{u32 revoked_scopes,u32 reserved=0}` |
 
 Roles are RPC=0, EVENT_STREAM=1, CALLBACK_STREAM=2, and
-AUTHORIZATION_LEASE=3. This service accepts RPC, CALLBACK_STREAM, and
-AUTHORIZATION_LEASE. Authorization modes are CHECK=0 and REQUEST=1. Input
+AUTHORIZATION_LEASE=3, and OBSERVER_STREAM=4. This service accepts all except
+the reserved EVENT_STREAM role. Authorization modes are CHECK=0 and REQUEST=1. Input
 scopes are InputMonitoring=`0x01` and InputControl=`0x02`; foreign bits are
 rejected.
 
@@ -71,6 +71,9 @@ lists and revokes only its two managed scopes.
 | `0x0100` | pointer-button query | Input Monitoring |
 | `0x0200` | idle-time query | none |
 | `0x0400` | modifier-state query | none |
+| `0x0800` | passive keyboard observation | Input Monitoring |
+| `0x1000` | passive mouse observation | Input Monitoring |
+| `0x2000` | device enumeration | Input Monitoring |
 
 Operation availability and granted permission scopes are separate masks.
 
@@ -90,6 +93,31 @@ Operation availability and granted permission scopes are separate masks.
 | `0x1023` | GET_POINTER_BUTTONS | empty | 12 bytes |
 | `0x1024` | GET_IDLE_TIME | empty | 16 bytes |
 | `0x1025` | GET_MODIFIER_STATE | empty | 12 bytes |
+| `0x1026` | DEVICES_LIST | `{u32 offset,u32 reserved=0,u64 generation}` | paged devices, below |
+| `0x1030` | OBSERVER_EVENT | server EVENT | observation, below |
+
+On OBSERVER_STREAM, subscribe/unsubscribe operate on passive subscriptions and
+return observation operation bits. They acquire no grabs and have no decision
+or heartbeat lease. Observer event request IDs are zero.
+
+DEVICES_LIST succeeds with `{u64 generation,u32 next_offset,u32 count,device[count]}`
+after the status. Pages contain at most eight records. A zero request generation
+starts enumeration; a nonzero mismatched generation returns BUSY. A zero next
+offset terminates enumeration. Each device record is 2720 bytes:
+`{u32 id,u32 capabilities,u16 bus,u16 vendor,u16 product,u16 version,u64 reserved=0,
+char name[256],char path[512],char physical[256],char unique[128],u32 axis_count,
+u32 reserved=0,axis[64]}`. Each axis is `{u32 code,i32 minimum,i32 maximum,
+i32 fuzz,i32 flat,i32 resolution}`; populated axes are ordered by code and the
+remaining entries are zero. Strings are
+NUL terminated and zero padded; the public ABI adds its size tag and reserves.
+
+OBSERVER_EVENT starts `{u32 kind,u32 reserved=0,u64 device_generation,u64 dropped_events}`.
+Kind INPUT=1 appends the ordinary hook-event payload, with no response expected.
+RAW_INPUT=7 appends `{u32 device_id,u32 reserved=0,u64 time_ms,u16 type,u16 code,
+i32 value,u32 flags,u32 reserved=0}`. It preserves raw evdev records for
+compositor-processed devices and never requests an interception decision.
+ADDED=2, REMOVED=3, CHANGED=4 append one device record. OVERFLOW=5 has no body and
+a nonzero dropped-event count. Revocation uses the existing SESSION_REVOKED event.
 
 Hook types are keyboard=13 and mouse=14. A hook event is an ordinary server
 request with a nonzero id. Its body begins `{u32 hook_type,u32 reserved=0}`.

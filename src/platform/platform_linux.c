@@ -48,7 +48,10 @@ static uint64_t linux_get_ready_operations(void)
     uint64_t operations = KSI_OPERATION_QUERY_INDICATORS
         | KSI_OPERATION_QUERY_POINTER_POSITION
         | KSI_OPERATION_QUERY_IDLE_TIME
-        | KSI_OPERATION_QUERY_MODIFIERS;
+        | KSI_OPERATION_QUERY_MODIFIERS
+        | KSI_OPERATION_QUERY_DEVICES
+        | KSI_OPERATION_OBSERVE_KEYBOARD
+        | KSI_OPERATION_OBSERVE_MOUSE;
     bool synth_available = ksi_linux_synth_is_available();
 
     if (synth_available) {

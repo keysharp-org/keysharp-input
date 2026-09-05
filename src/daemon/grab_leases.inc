@@ -86,65 +86,6 @@ static void send_pending_authorization_status(
         client->pending_request_id, status, detail, granted_scopes);
 }
 
-static uint32_t client_persistent_allowed(const ksi_daemon_state *state, const ksi_client *client)
-{
-    uint32_t allowed = 0u;
-
-    if (state == NULL || state->permission_monitor_failed) {
-        return 0u;
-    }
-    if (ksp_store_check(state->permissions, client->uid, client->exe_hash,
-            KSI_INPUT_PERMISSION_SCOPES, &allowed) != 0) {
-        return 0u;
-    }
-    return allowed;
-}
-
-/* Returns scopes currently granted from the store without prompting.
- * Sets *out_missing to the durable permission scopes not yet granted. */
-static uint32_t check_scopes_sync(
-    ksi_daemon_state *state,
-    ksi_client *client,
-    uint32_t requested,
-    uint32_t *out_missing)
-{
-    uint32_t granted = 0u;
-    uint32_t missing = 0u;
-
-    if (out_missing != NULL) {
-        *out_missing = 0u;
-    }
-
-    if (state == NULL || client == NULL || requested == 0u) {
-        return 0u;
-    }
-
-    if (!client->has_identity || state->permissions == NULL
-        || state->permission_monitor_failed) {
-        return 0u;
-    }
-
-    uint32_t allowed;
-    uint64_t generation;
-
-    if (ksp_store_check_at_generation(state->permissions,
-            client->uid, client->exe_hash, requested,
-            &allowed, &generation) != 0) {
-        return 0u;
-    }
-
-    granted = requested & allowed;
-    missing = requested & ~allowed;
-    client->permission_store_generation = generation;
-    client->permission_store_generation_valid = true;
-
-    if (out_missing != NULL) {
-        *out_missing = missing;
-    }
-
-    return granted;
-}
-
 static void finish_client_authorization(
     ksi_client *client,
     uint16_t opcode,
@@ -212,6 +153,9 @@ static void invalidate_connected_permissions(
         client->granted_scopes &= ~scopes;
 
         if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u) {
+            client->observer_subscriptions = 0u;
+            client->observer_count = 0u;
+            client->observer_dropped = 0u;
             flush_keyboard = flush_keyboard
                 || (old_grants & KSP_SCOPE_INPUT_MONITORING) != 0u
                 || (client->hook_subscriptions & KSI_OPERATION_HOOK_KEYBOARD) != 0u;
@@ -267,11 +211,13 @@ static void invalidate_connected_permissions(
          * ordinary control connections stay open so independently retained
          * Input Control operations remain usable. */
         if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u
-            && client->connection_role == KSI_ROLE_CALLBACK_STREAM) {
+            && (client->connection_role == KSI_ROLE_CALLBACK_STREAM
+                || client->connection_role == KSI_ROLE_OBSERVER_STREAM)) {
             hook_send_ref_invalidate(client->hook_send_ref);
         }
     }
 
+    update_observer_callbacks(state);
     if (flush_keyboard) {
         lane_flush_passthrough(&state->keyboard_lane);
     }
@@ -286,129 +232,44 @@ static void invalidate_connected_permissions(
     }
 }
 
-/* Refreshes after an inotify edge from the shared control-plane directory.
- * There is no timer-driven permission I/O on the physical-input poll path. */
+static bool fence_permission_output(ksi_daemon_state *state)
+{
+    uint64_t generation = advance_input_generation(state);
+    lane_flush_passthrough(&state->keyboard_lane);
+    lane_flush_passthrough(&state->mouse_lane);
+    synthetic_hook_queue_abort(&state->synthetic_hook_queue);
+    output_queue_discard_stale(&state->output_queue, generation);
+    /* The sole writer executes this unscoped cleanup after any batch already
+     * in flight; the input reader never waits for that batch. */
+    return !state->output_queue.mutex_initialized
+        || output_queue_push_release_all(&state->output_queue);
+}
+
+/* Pause privileged dispatch while the worker resolves an external revoke. */
 static bool refresh_external_permissions(ksi_daemon_state *state)
 {
-    if (state == NULL || state->permissions == NULL) {
-        return false;
+    if (state == NULL || state->permissions == NULL) return false;
+    if (state->permission_refresh_inflight) return true;
+    ksi_permission_task *task = new_permission_task(state, NULL, KSI_PERMISSION_REFRESH, 0u);
+    if (task == NULL) return false;
+    for (nfds_t i = 0u; i < state->client_count; i++) {
+        ksi_client *client = &state->clients[i];
+        if (!client->has_identity) continue;
+        bool duplicate = false;
+        for (size_t prior = 0u; prior < task->snapshot_count; prior++)
+            duplicate |= task->snapshots[prior].uid == client->uid
+                && strcmp(task->snapshots[prior].hash, client->exe_hash) == 0;
+        if (!duplicate) {
+            ksi_permission_snapshot *snapshot = &task->snapshots[task->snapshot_count++];
+            snapshot->uid = client->uid;
+            (void)snprintf(snapshot->hash, sizeof(snapshot->hash), "%s", client->exe_hash);
+        }
+        client->permission_refresh_pending = true;
     }
-
-    for (nfds_t uid_index = 0u; uid_index < state->client_count; uid_index++) {
-        ksi_client *uid_client = &state->clients[uid_index];
-        uint64_t generation;
-
-        if (!uid_client->has_identity) {
-            continue;
-        }
-
-        bool uid_already_checked = false;
-
-        for (nfds_t prior = 0u; prior < uid_index; prior++) {
-            ksi_client *other = &state->clients[prior];
-
-            if (other->has_identity && other->uid == uid_client->uid) {
-                uid_already_checked = true;
-                break;
-            }
-        }
-
-        if (uid_already_checked) {
-            continue;
-        }
-        if (ksp_store_generation(state->permissions, uid_client->uid,
-                &generation) != 0) {
-            return false;
-        }
-
-        for (nfds_t identity_index = uid_index;
-             identity_index < state->client_count; identity_index++) {
-            ksi_client *identity_client = &state->clients[identity_index];
-            uint32_t revoked = 0u;
-            uint32_t allowed = 0u;
-
-            if (!identity_client->has_identity
-                || identity_client->uid != uid_client->uid) {
-                continue;
-            }
-
-            bool identity_already_checked = false;
-
-            for (nfds_t prior = uid_index; prior < identity_index; prior++) {
-                ksi_client *other = &state->clients[prior];
-
-                if (other->has_identity && other->uid == identity_client->uid
-                    && strcmp(other->exe_hash, identity_client->exe_hash) == 0) {
-                    identity_already_checked = true;
-                    break;
-                }
-            }
-
-            if (identity_already_checked) {
-                continue;
-            }
-
-            bool changed = false;
-
-            for (nfds_t current = identity_index;
-                 current < state->client_count; current++) {
-                ksi_client *matching = &state->clients[current];
-
-                if (!matching->has_identity
-                    || matching->uid != identity_client->uid
-                    || strcmp(matching->exe_hash,
-                              identity_client->exe_hash) != 0) {
-                    continue;
-                }
-
-                changed = changed
-                    || (matching->permission_store_generation_valid
-                        && matching->permission_store_generation != generation);
-            }
-
-            if (changed) {
-                allowed = client_persistent_allowed(state, identity_client);
-            }
-
-            for (nfds_t current = identity_index;
-                 current < state->client_count; current++) {
-                ksi_client *matching = &state->clients[current];
-
-                if (!matching->has_identity
-                    || matching->uid != identity_client->uid
-                    || strcmp(matching->exe_hash,
-                              identity_client->exe_hash) != 0) {
-                    continue;
-                }
-
-                matching->permission_store_generation = generation;
-                matching->permission_store_generation_valid = true;
-
-                if (changed) {
-                    revoked |= matching->granted_scopes & ~allowed;
-                }
-            }
-
-            if (!changed) {
-                continue;
-            }
-
-            if (revoked != 0u) {
-                invalidate_connected_permissions(state, identity_client->uid,
-                    identity_client->exe_hash, false, revoked);
-            } else {
-                /* Even a revoke in another capability domain fences an input
-                 * authorization which began before that explicit user action. */
-                state->permission_generation++;
-
-                if (state->permission_generation == 0u) {
-                    state->permission_generation = 1u;
-                }
-            }
-        }
-    }
-
-    return true;
+    if (!submit_permission_task(task, NULL)) return false;
+    state->permission_refresh_inflight = true;
+    state->permission_refresh_started_ms = monotonic_ms();
+    return fence_permission_output(state) && update_grab_state(state) == 0;
 }
 
 static bool is_permission_generation_event(const char *name)
@@ -586,97 +447,39 @@ static void process_permission_notifications(
         }
     }
 
-    if (refresh && !refresh_external_permissions(state)) {
-        permission_monitor_fail_open(state);
+    if (refresh) {
+        atomic_fetch_add(&state->permission_generation, 1u);
+        if (!refresh_external_permissions(state)) permission_monitor_fail_open(state);
     }
 }
 
 /* Applies a completed prompt decision and sends its authorization response. */
 static void process_client_prompt_done(ksi_daemon_state *state, ksi_daemon_command *command)
 {
-    ssize_t client_index;
-    ksi_client *client;
-    ksp_polkit_result decision;
-    uint32_t requested;
-    uint32_t missing;
-    uint32_t granted;
-
-    if (state == NULL || command == NULL) {
-        return;
-    }
-
-    client_index = find_client_index_by_connection(
-        state, command->client_fd, command->connection_id);
-
-    if (client_index < 0) {
-        free_daemon_command(command);
-        return;
-    }
-
-    client = &state->clients[client_index];
+    ssize_t index = find_client_index_by_connection(state, command->client_fd, command->connection_id);
+    if (index < 0) return;
+    ksi_client *client = &state->clients[index];
+    if (!client->pending_authorization) return;
     client->state = KSI_CLIENT_STATE_READY;
-
-    if (!client->pending_authorization) {
-        free_daemon_command(command);
-        return;
-    }
-
     client->pending_authorization = false;
-
-    if (!input_owner_matches_uid(state, client->uid)) {
-        send_pending_authorization_status(client, KSI_STATUS_DENIED,
-            KSI_DETAIL_NONE, 0u);
-        free_daemon_command(command);
+    if (!hook_send_ref_is_valid(client->hook_send_ref)
+        || !input_owner_matches_uid(state, client->uid)
+        || command->data.prompt_done.input_generation != current_input_generation(state)
+        || command->data.prompt_done.permission_generation != atomic_load(&state->permission_generation)
+        || client->pending_permission_generation != atomic_load(&state->permission_generation)
+        || state->permission_monitor_failed || state->permission_refresh_inflight
+        || command->data.prompt_done.decision != KSP_POLKIT_GRANTED) {
+        send_pending_authorization_status(client, KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
         return;
     }
-
-    decision = command->data.prompt_done.decision;
-    requested = command->data.prompt_done.requested_scopes
-        & KSI_INPUT_PERMISSION_SCOPES;
-    missing = command->data.prompt_done.missing_scopes
-        & KSI_INPUT_PERMISSION_SCOPES;
-
-    if (client->pending_permission_generation
-        != state->permission_generation) {
-        decision = KSP_POLKIT_DENIED;
-    }
-
-    if (decision == KSP_POLKIT_GRANTED && missing != 0u) {
-        ksp_identity identity = {
-            .uid = client->uid,
-            .pid = client->pid,
-            .start_time = client->start_time,
-        };
-        (void)snprintf(identity.executable, sizeof(identity.executable),
-            "%s", client->exe_path);
-        (void)snprintf(identity.hash, sizeof(identity.hash),
-            "%s", client->exe_hash);
-        int grant_result = ksp_store_grant_if_generation(
-            state->permissions, &identity, missing,
-            command->data.prompt_done.store_generation);
-
-        if (grant_result != 0) {
-            decision = grant_result > 0
-                ? KSP_POLKIT_DENIED : KSP_POLKIT_UNAVAILABLE;
-        }
-    }
-
-    granted = requested & client_persistent_allowed(state, client);
-
-    if (decision != KSP_POLKIT_GRANTED) {
-        client->granted_scopes |= granted;
-        send_pending_authorization_status(client, KSI_STATUS_DENIED,
-            KSI_DETAIL_NONE, 0u);
-        free_daemon_command(command);
-        return;
-    }
-
-    finish_client_authorization(client,
-        client->pending_authorization_opcode,
-        client->pending_request_id,
-            requested,
-            granted);
-    free_daemon_command(command);
+    if (client->connection_role != KSI_ROLE_OBSERVER_STREAM
+        || (client->pending_requested_scopes & KSP_SCOPE_INPUT_CONTROL) != 0u)
+        prepare_requested_scopes(state, client->pending_requested_scopes);
+    client->permission_store_generation = command->data.prompt_done.store_generation;
+    client->permission_store_generation_valid = true;
+    finish_client_authorization(client, client->pending_authorization_opcode,
+        client->pending_request_id, client->pending_requested_scopes,
+        command->data.prompt_done.allowed_scopes & client->pending_requested_scopes);
 }
 /* Stores the identification result and resumes pending authorization. */
 static void process_client_identified(ksi_daemon_state *state, ksi_daemon_command *command)
@@ -725,6 +528,8 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
 
     if (result != NULL && result->has_identity) {
         client->has_identity = true;
+        client->identity = result->identity;
+        client->identity_checked_ms = monotonic_ms();
         client->start_time = result->start_time;
         (void)snprintf(client->exe_path, sizeof(client->exe_path), "%s", result->exe_path);
         (void)snprintf(client->exe_hash, sizeof(client->exe_hash), "%s", result->exe_hash);
@@ -745,43 +550,10 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
         return;
     }
 
-    /* Resume the request that waited for identity. */
-	{
-        uint32_t requested = client->pending_requested_scopes;
-        uint32_t authorization_mode = client->pending_authorization_mode;
-		uint32_t missing = 0u;
-		uint32_t granted;
-
-        prepare_requested_scopes(state, requested);
-        granted = check_scopes_sync(state, client, requested, &missing);
-
-        if (missing != 0u && state->permissions != NULL
-            && !state->permission_monitor_failed
-            && authorization_mode == KSI_AUTH_REQUEST) {
-            /* Need to prompt. Transition to AWAITING_PROMPT and start the worker. */
-            client->pending_permission_generation =
-                state->permission_generation;
-            if (!start_prompt_task(state->commands, state->permissions,
-                                   client->fd, client->connection_id, requested, missing,
-                                   client->exe_path, client->exe_hash,
-                                   client->pid, client->uid, client->start_time)) {
-                /* Prompt thread failed; deny immediately. */
-                client->pending_authorization = false;
-                client->state = KSI_CLIENT_STATE_READY;
-                send_pending_authorization_status(client, KSI_STATUS_UNAVAILABLE,
-                    KSI_DETAIL_NONE, 0u);
-            } else {
-                client->state = KSI_CLIENT_STATE_AWAITING_PROMPT;
-            }
-            return;
-        }
-
-        /* No prompt needed — grant immediately. */
+    if (!client->has_identity || state->permissions == NULL || state->permission_monitor_failed
+        || state->permission_refresh_inflight || !start_permission_check(state, client)) {
         client->pending_authorization = false;
-
-        finish_client_authorization(client,
-            client->pending_authorization_opcode, client->pending_request_id,
-            requested, granted);
+        send_pending_authorization_status(client, KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
     }
 }
 
@@ -812,7 +584,7 @@ static void prepare_requested_scopes(ksi_daemon_state *state, uint32_t requested
 
 static bool client_has_scope(const ksi_client *client, uint32_t scope)
 {
-    if (!client->hello_complete)
+    if (!client->hello_complete || client->permission_refresh_pending)
         return false;
     return (client->granted_scopes & scope) == scope;
 }
@@ -840,7 +612,8 @@ static uint32_t active_hook_subscription_mask(const ksi_daemon_state *state)
     }
 
     for (nfds_t i = 0; i < state->client_count; i++) {
-        if (input_owner_matches_uid(state, state->clients[i].uid)) {
+        if (!state->clients[i].permission_refresh_pending
+            && input_owner_matches_uid(state, state->clients[i].uid)) {
             mask |= state->clients[i].hook_subscriptions
                 & (uint32_t)~state->clients[i].quarantined_hooks;
         }
@@ -858,7 +631,8 @@ static uint32_t active_block_input_mask(const ksi_daemon_state *state)
     }
 
     for (nfds_t i = 0; i < state->client_count; i++) {
-        if (input_owner_matches_uid(state, state->clients[i].uid)) {
+        if (!state->clients[i].permission_refresh_pending
+            && input_owner_matches_uid(state, state->clients[i].uid)) {
             mask |= state->clients[i].block_input_mask;
         }
     }
@@ -883,6 +657,7 @@ static bool any_matching_hook_subscriptions(const ksi_daemon_state *state, uint3
     for (nfds_t i = 0; i < state->client_count; i++) {
         if ((state->clients[i].hook_subscriptions & subscription_bit) != 0
             && (state->clients[i].quarantined_hooks & subscription_bit) == 0u
+            && !state->clients[i].permission_refresh_pending
             && input_owner_matches_uid(state, state->clients[i].uid)) {
             return true;
         }
@@ -1089,10 +864,35 @@ static void expire_unauthenticated_clients(ksi_daemon_state *state)
     }
 
     now = monotonic_ms();
+    if (state->permission_refresh_inflight
+        && now - state->permission_refresh_started_ms >= KSI_PERMISSION_IO_TIMEOUT_MS)
+        permission_monitor_fail_open(state);
 
     for (nfds_t i = state->client_count; i > 0; i--) {
         nfds_t index = i - 1u;
         ksi_client *client = &state->clients[index];
+
+        if (!hook_send_ref_is_valid(client->hook_send_ref)) {
+            remove_client(state, index);
+            continue;
+        }
+        if ((client->permission_task != NULL && now >= client->permission_task_deadline_ms)
+            || (client->pending_authorization && now - client->pending_authorization_started_ms >= KSI_AUTHORIZATION_TIMEOUT_MS)) {
+            remove_client(state, index);
+            continue;
+        }
+        if (client->revalidation_pending && now - client->identity_checked_ms >= 1000u) {
+            remove_client(state, index);
+            continue;
+        }
+        if (client->has_identity && !client->revalidation_pending
+            && (client->granted_scopes != 0u || client->pending_authorization)
+            && now - client->identity_checked_ms >= KSI_DAEMON_MAINTENANCE_MS) {
+            if (!start_revalidation_task(state, client)) {
+                remove_client(state, index);
+                continue;
+            }
+        }
 
         /* Capless-idle reaper: an authenticated connection holding no grants and
          * no hook/block subscriptions, idle past the timeout, is dropped so it

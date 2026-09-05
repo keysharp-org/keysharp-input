@@ -1,4 +1,5 @@
 #include "keysharp_input/client.h"
+#include "../src/device_codec.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -175,7 +176,74 @@ static ksi_status nested_handler(
     return ksi_synthesize(connection, NULL, 0u, KSI_SYNTH_BYPASS_HOOK, error);
 }
 
-int main(void)
+static void *observer_server(void *argument)
+{
+    server_state *state = argument;
+    uint8_t payload[4096];
+    uint16_t opcode, flags;
+    uint64_t id;
+    size_t size;
+    int fd = accept(state->listener, NULL, NULL);
+    if (fd < 0) { state->failed = 1; return NULL; }
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != HELLO || read_u16(payload) != KSI_ROLE_OBSERVER_STREAM) goto fail;
+    memset(payload, 0, 24u);
+    write_u32(payload + 8u, KSI_SCOPE_INPUT_MONITORING);
+    write_u64(payload + 16u, KSI_OPERATION_OBSERVE_KEYBOARD | KSI_OPERATION_QUERY_DEVICES);
+    if (!send_frame(fd, HELLO, RESPONSE, id, payload, 24u)) goto fail;
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_SUBSCRIBE_HOOK || read_u32(payload) != KSI_HOOK_KEYBOARD) goto fail;
+    memset(payload, 0, 72u);
+    write_u32(payload, KSI_OBSERVER_INPUT); write_u64(payload + 8u, 2u);
+    write_u32(payload + 24u, KSI_HOOK_KEYBOARD);
+    write_u32(payload + 32u, KSI_MESSAGE_KEY_DOWN); write_u32(payload + 36u, 'A');
+    write_u32(payload + 64u, 7u);
+    if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload, 72u)) goto fail;
+    memset(payload, 0, 16u); write_u32(payload + 8u, KSI_OPERATION_OBSERVE_KEYBOARD);
+    if (!send_frame(fd, KSI_OPCODE_SUBSCRIBE_HOOK, RESPONSE, id, payload, 16u)) goto fail;
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_DEVICES_LIST || size != KSI_DEVICE_LIST_REQUEST_SIZE) goto fail;
+    ksi_device_info device = { .struct_size = sizeof(device), .device_id = 7u,
+        .name = "Observed keyboard", .path = "/dev/input/event2", .vendor = 0x1234u,
+        .capabilities = KSI_DEVICE_KEYBOARD };
+    memset(payload, 0, KSI_DEVICE_LIST_PREFIX_SIZE);
+    write_u64(payload + 8u, 2u); write_u32(payload + 20u, 1u);
+    ksi_device_encode(payload + KSI_DEVICE_LIST_PREFIX_SIZE, &device);
+    if (!send_frame(fd, KSI_OPCODE_DEVICES_LIST, RESPONSE, id, payload,
+            KSI_DEVICE_LIST_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE)) goto fail;
+    memset(payload, 0, KSI_OBSERVER_PREFIX_SIZE);
+    write_u32(payload, KSI_OBSERVER_DEVICE_REMOVED); write_u64(payload + 8u, 3u);
+    ksi_device_encode(payload + KSI_OBSERVER_PREFIX_SIZE, &device);
+    if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload,
+            KSI_OBSERVER_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE)) goto fail;
+    memset(payload, 0, KSI_OBSERVER_PREFIX_SIZE + KSI_RAW_INPUT_WIRE_SIZE);
+    write_u32(payload, KSI_OBSERVER_RAW_INPUT);
+    write_u32(payload + 24u, 12u); write_u64(payload + 32u, 123456u);
+    write_u16(payload + 40u, 3u); write_u16(payload + 42u, 53u);
+    write_u32(payload + 44u, (uint32_t)-50); write_u32(payload + 48u, KSI_RAW_INPUT_MONOTONIC_TIME);
+    if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload,
+            KSI_OBSERVER_PREFIX_SIZE + KSI_RAW_INPUT_WIRE_SIZE)) goto fail;
+    memset(payload, 0, KSI_OBSERVER_PREFIX_SIZE);
+    write_u32(payload, KSI_OBSERVER_OVERFLOW); write_u64(payload + 8u, 3u); write_u64(payload + 16u, 9u);
+    if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload, KSI_OBSERVER_PREFIX_SIZE)) goto fail;
+    memset(payload, 0, 8u); write_u32(payload, KSI_SCOPE_INPUT_MONITORING);
+    if (!send_frame(fd, SESSION_REVOKED, EVENT, 0u, payload, 8u)) goto fail;
+    /* No observer event should generate a hook-decision frame. */
+    if (read(fd, payload, 1u) != 0) goto fail;
+    close(fd); return NULL;
+fail:
+    state->failed = 1; close(fd); return NULL;
+}
+
+static bool visit_device(const ksi_device_info *device, void *context)
+{
+    unsigned int *count = context;
+    if (device->device_id == 7u && device->vendor == 0x1234u
+        && strcmp(device->name, "Observed keyboard") == 0) (*count)++;
+    return true;
+}
+
+static int run_client_test(bool observer)
 {
     char directory[] = "/tmp/keysharp-input-client-XXXXXX";
     char socket_path[108];
@@ -201,12 +269,39 @@ int main(void)
     memcpy(address.sun_path, socket_path, strlen(socket_path) + 1u);
     if (bind(server.listener, (struct sockaddr *)&address, sizeof(address)) != 0
         || listen(server.listener, 1) != 0
-        || pthread_create(&thread, NULL, server_main, &server) != 0) goto done;
+        || pthread_create(&thread, NULL, observer ? observer_server : server_main, &server) != 0) goto done;
 
     options.socket_path = socket_path;
-    options.role = KSI_ROLE_CALLBACK_STREAM;
-    options.requested_scopes = KSI_SCOPE_INPUT_CONTROL;
+    options.role = observer ? KSI_ROLE_OBSERVER_STREAM : KSI_ROLE_CALLBACK_STREAM;
+    options.requested_scopes = observer ? KSI_SCOPE_INPUT_MONITORING : KSI_SCOPE_INPUT_CONTROL;
     ksi_service_info_init(&info); ksi_error_init(&error);
+    if (observer) {
+        ksi_observer_message observation;
+        ksi_operations active = 0u;
+        unsigned int device_count = 0u;
+        ksi_observer_message_init(&observation);
+        if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
+            || ksi_hook_subscribe(connection, KSI_HOOK_KEYBOARD, &active, &error) != KSI_STATUS_OK
+            || active != KSI_OPERATION_OBSERVE_KEYBOARD
+            || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
+            || observation.kind != KSI_OBSERVER_INPUT || observation.data.input.request_id != 0u
+            || observation.data.input.event.keyboard.device_id != 7u
+            || ksi_devices_list(connection, visit_device, &device_count, NULL, &error) != KSI_STATUS_OK
+            || device_count != 1u
+            || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
+            || observation.kind != KSI_OBSERVER_DEVICE_REMOVED || observation.device_generation != 3u
+            || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
+            || observation.kind != KSI_OBSERVER_RAW_INPUT || observation.data.raw_input.device_id != 12u
+            || observation.data.raw_input.type != 3u || observation.data.raw_input.code != 53u
+            || observation.data.raw_input.value != -50 || observation.data.raw_input.time_ms != 123456u
+            || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
+            || observation.kind != KSI_OBSERVER_OVERFLOW || observation.dropped_events != 9u
+            || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
+            || observation.kind != KSI_OBSERVER_SESSION_REVOKED
+            || ksi_connection_granted_scopes(connection) != 0u) goto joined;
+        result = 0;
+        goto joined;
+    }
     if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
         || ksi_set_nested_hook_handler(connection, nested_handler,
             &callback_calls, &error) != KSI_STATUS_OK
@@ -238,4 +333,9 @@ done:
     if (server.listener >= 0) close(server.listener);
     unlink(socket_path); rmdir(directory);
     return result;
+}
+
+int main(void)
+{
+    return run_client_test(false) || run_client_test(true);
 }

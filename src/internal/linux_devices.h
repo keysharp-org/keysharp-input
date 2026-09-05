@@ -3,10 +3,14 @@
 
 #include <poll.h>
 #include <stdint.h>
+#include <keysharp_input/devices.h>
 
 #include "internal/platform.h"
 
 typedef void (*ksi_physical_key_event_callback)(void *context, uint32_t scan_code);
+typedef void (*ksi_device_change_callback)(void *context, uint32_t kind,
+    const ksi_device_info *device, uint64_t generation);
+typedef void (*ksi_raw_device_callback)(void *context, const ksi_raw_input_event *event);
 
 int ksi_linux_devices_start(void);
 bool ksi_linux_devices_has_candidates(void);
@@ -20,6 +24,12 @@ int ksi_linux_devices_set_block_input_mask(uint32_t block_mask);
 void ksi_linux_devices_retry_incomplete_grabs(void);
 bool ksi_linux_devices_peek_oldest_pending_event(int *out_fd, uint64_t *out_time_ns);
 void ksi_linux_devices_set_hook_event_callback(ksi_hook_event_callback callback, void *context);
+void ksi_linux_devices_set_observer_callback(ksi_hook_event_callback callback,
+    ksi_device_change_callback device_callback, void *context);
+void ksi_linux_devices_set_raw_observer_callback(ksi_raw_device_callback callback, void *context);
+uint64_t ksi_linux_devices_generation(void);
+size_t ksi_linux_devices_list(uint32_t offset, ksi_device_info *entries,
+    size_t capacity, uint32_t *next_offset);
 void ksi_linux_devices_set_physical_key_event_callback(
     ksi_physical_key_event_callback callback,
     void *context);

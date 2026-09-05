@@ -1,5 +1,6 @@
 #include "keysharp_input/client.h"
 #include "internal/protocol_contract.h"
+#include "device_codec.h"
 
 #include <keysharp_permissions/permissions.h>
 
@@ -49,6 +50,10 @@ struct ksi_connection {
     ksi_hook_message notifications[KSI_CLIENT_NOTIFICATION_CAPACITY];
     uint32_t notification_head;
     uint32_t notification_count;
+    ksi_observer_message observer_notifications[KSI_CLIENT_NOTIFICATION_CAPACITY];
+    uint32_t observer_head;
+    uint32_t observer_count;
+    uint64_t observer_dropped;
     uint8_t rx[KSI_MAX_PAYLOAD_SIZE];
     uint8_t tx[KSI_MAX_PAYLOAD_SIZE];
 };
@@ -673,6 +678,35 @@ static bool pop_notification(
     return true;
 }
 
+static bool decode_observer(const ksi_wire_header *header, const uint8_t *payload,
+    ksi_observer_message *message)
+{
+    if (header->payload_size < KSI_OBSERVER_PREFIX_SIZE || read_u32(payload + 4u) != 0u) return false;
+    ksi_observer_message_init(message);
+    message->kind = read_u32(payload);
+    message->device_generation = read_u64(payload + 8u);
+    message->dropped_events = read_u64(payload + 16u);
+    const uint8_t *body = payload + KSI_OBSERVER_PREFIX_SIZE;
+    size_t size = header->payload_size - KSI_OBSERVER_PREFIX_SIZE;
+    if (message->kind == KSI_OBSERVER_INPUT)
+        return decode_hook_event(body, size, header->request_id, &message->data.input);
+    if (message->kind >= KSI_OBSERVER_DEVICE_ADDED && message->kind <= KSI_OBSERVER_DEVICE_CHANGED)
+        return ksi_device_decode(body, size, &message->data.device);
+    if (message->kind == KSI_OBSERVER_RAW_INPUT) {
+        if (size != KSI_RAW_INPUT_WIRE_SIZE || read_u32(body) == 0u || read_u32(body + 28u) != 0u) return false;
+        ksi_raw_input_event *event = &message->data.raw_input;
+        ksi_raw_input_event_init(event);
+        event->device_id = read_u32(body);
+        event->time_ms = read_u64(body + 8u);
+        event->type = (uint16_t)ksi_device_read(body + 16u, 2u);
+        event->code = (uint16_t)ksi_device_read(body + 18u, 2u);
+        event->value = (int32_t)read_u32(body + 20u);
+        event->flags = read_u32(body + 24u);
+        return read_u32(body + 4u) == 0u;
+    }
+    return message->kind == KSI_OBSERVER_OVERFLOW && size == 0u && message->dropped_events != 0u;
+}
+
 static bool queue_service_event(
     ksi_connection *connection,
     const ksi_wire_header *header)
@@ -680,11 +714,29 @@ static bool queue_service_event(
     ksi_hook_message message;
 
     ksi_hook_message_init(&message);
+    if (header->opcode == KSI_OPCODE_OBSERVER_EVENT && connection->role == KSI_ROLE_OBSERVER_STREAM) {
+        ksi_observer_message observation;
+        if (!decode_observer(header, connection->rx, &observation)) return false;
+        if (connection->observer_count == KSI_CLIENT_NOTIFICATION_CAPACITY) {
+            if (connection->observer_dropped != UINT64_MAX) connection->observer_dropped++;
+        } else {
+            uint32_t index = (connection->observer_head + connection->observer_count)
+                % KSI_CLIENT_NOTIFICATION_CAPACITY;
+            connection->observer_notifications[index] = observation;
+            connection->observer_count++;
+        }
+        return true;
+    }
     if (header->opcode == KSI_OPCODE_SESSION_REVOKED) {
         uint32_t revoked = apply_revocation(connection, connection->rx,
             header->payload_size);
         if (revoked == 0u) {
             return false;
+        }
+        if (connection->role == KSI_ROLE_OBSERVER_STREAM
+            && (revoked & KSI_SCOPE_INPUT_MONITORING) != 0u) {
+            connection->observer_count = 0u;
+            connection->observer_dropped = 0u;
         }
         if (connection->role == KSI_ROLE_CALLBACK_STREAM) {
             message.kind = KSI_HOOK_MESSAGE_SESSION_REVOKED;
@@ -986,7 +1038,7 @@ ksi_status ksi_connect(
         || options->struct_size < sizeof(*options)
         || options->flags != 0u
         || !reserved_is_zero(options->reserved, 4u)
-        || options->role > KSI_ROLE_AUTHORIZATION_LEASE
+        || options->role > KSI_ROLE_OBSERVER_STREAM
         || options->authorization_mode > KSI_AUTH_REQUEST
         || (options->requested_scopes & ~(uint32_t)KSI_SCOPE_ALL) != 0u) {
         set_error(error, 0u, EINVAL, "invalid connection options");
@@ -1370,6 +1422,112 @@ ksi_status ksi_set_nested_hook_handler(
     return KSI_STATUS_OK;
 }
 
+void ksi_device_info_init(ksi_device_info *device)
+{
+    init_sized(device, sizeof(*device));
+}
+
+void ksi_device_axis_info_init(ksi_device_axis_info *axis)
+{
+    init_sized(axis, sizeof(*axis));
+}
+
+void ksi_raw_input_event_init(ksi_raw_input_event *event)
+{
+    init_sized(event, sizeof(*event));
+}
+
+void ksi_observer_message_init(ksi_observer_message *message)
+{
+    init_sized(message, sizeof(*message));
+}
+
+ksi_status ksi_devices_list(ksi_connection *connection,
+    ksi_device_visitor visitor, void *context, uint64_t *snapshot_generation, ksi_error *error)
+{
+    if (snapshot_generation != NULL) *snapshot_generation = 0u;
+    if (connection == NULL || visitor == NULL) {
+        set_error(error, 0u, EINVAL, "invalid device visitor");
+        return KSI_STATUS_INVALID_REQUEST;
+    }
+    uint32_t offset = 0u;
+    uint64_t generation = 0u;
+    do {
+        uint8_t payload[KSI_DEVICE_LIST_REQUEST_SIZE] = { 0 };
+        ksi_wire_header response;
+        write_u32(payload, offset);
+        write_u64(payload + 8u, generation);
+        ksi_status status = request(connection, KSI_OPCODE_DEVICES_LIST,
+            payload, sizeof(payload), connection->default_timeout_ms, &response, error);
+        if (status != KSI_STATUS_OK) return status;
+        status = decode_status(connection->rx, response.payload_size, response.payload_size, error);
+        if (status != KSI_STATUS_OK) return status;
+        if (response.flags != KSI_FRAME_FLAG_RESPONSE || response.payload_size < KSI_DEVICE_LIST_PREFIX_SIZE)
+            return invalid_result(error, "device list");
+        uint32_t count = read_u32(connection->rx + 20u);
+        uint32_t next = read_u32(connection->rx + 16u);
+        uint64_t returned_generation = read_u64(connection->rx + 8u);
+        if (count > KSI_DEVICE_LIST_PAGE_SIZE
+            || response.payload_size != KSI_DEVICE_LIST_PREFIX_SIZE + count * KSI_DEVICE_INFO_WIRE_SIZE
+            || (next != 0u && next <= offset)
+            || (generation != 0u && returned_generation != generation))
+            return invalid_result(error, "device list");
+        generation = returned_generation;
+        for (uint32_t i = 0u; i < count; i++) {
+            ksi_device_info device;
+            if (!ksi_device_decode(connection->rx + KSI_DEVICE_LIST_PREFIX_SIZE
+                    + (size_t)i * KSI_DEVICE_INFO_WIRE_SIZE, KSI_DEVICE_INFO_WIRE_SIZE, &device))
+                return invalid_result(error, "device");
+            if (!visitor(&device, context)) return KSI_STATUS_CANCELLED;
+        }
+        offset = next;
+    } while (offset != 0u);
+    if (snapshot_generation != NULL) *snapshot_generation = generation;
+    clear_error(error);
+    return KSI_STATUS_OK;
+}
+
+ksi_status ksi_observer_next(ksi_connection *connection,
+    uint32_t timeout_ms, ksi_observer_message *message, ksi_error *error)
+{
+    if (connection == NULL || connection->role != KSI_ROLE_OBSERVER_STREAM
+        || !sized_output_is_valid(message, sizeof(*message)))
+        return invalid_output(error, "observer message");
+    uint64_t deadline = timeout_ms == UINT32_MAX ? 0u : monotonic_ms() + timeout_ms;
+    for (;;) {
+        if (connection->pending_revoked_scopes != 0u) {
+            ksi_observer_message_init(message);
+            message->kind = KSI_OBSERVER_SESSION_REVOKED;
+            message->data.revoked_scopes = connection->pending_revoked_scopes;
+            connection->pending_revoked_scopes = 0u;
+            clear_error(error);
+            return KSI_STATUS_OK;
+        }
+        if (connection->observer_count != 0u) {
+            *message = connection->observer_notifications[connection->observer_head];
+            connection->observer_head = (connection->observer_head + 1u) % KSI_CLIENT_NOTIFICATION_CAPACITY;
+            connection->observer_count--;
+            clear_error(error);
+            return KSI_STATUS_OK;
+        }
+        if (connection->observer_dropped != 0u) {
+            ksi_observer_message_init(message);
+            message->kind = KSI_OBSERVER_OVERFLOW;
+            message->dropped_events = connection->observer_dropped;
+            connection->observer_dropped = 0u;
+            clear_error(error);
+            return KSI_STATUS_OK;
+        }
+        ksi_wire_header header;
+        uint32_t wait = timeout_ms == UINT32_MAX ? UINT32_MAX
+            : (uint32_t)remaining_timeout(deadline, timeout_ms);
+        ksi_status status = receive_frame(connection, &header, wait, error);
+        if (status != KSI_STATUS_OK) return status;
+        if (header.flags == KSI_FRAME_FLAG_EVENT && queue_service_event(connection, &header)) continue;
+        return invalid_result(error, "observer frame");
+    }
+}
+
 static ksi_status hook_subscription(
     ksi_connection *connection,
     uint16_t opcode,
@@ -1381,7 +1539,8 @@ static ksi_status hook_subscription(
     ksi_wire_header response;
     ksi_status status;
 
-    if (connection == NULL || connection->role != KSI_ROLE_CALLBACK_STREAM
+    if (connection == NULL || (connection->role != KSI_ROLE_CALLBACK_STREAM
+            && connection->role != KSI_ROLE_OBSERVER_STREAM)
         || (hook_type != KSI_HOOK_KEYBOARD && hook_type != KSI_HOOK_MOUSE)) {
         set_error(error, 0u, EINVAL, "invalid hook subscription");
         return KSI_STATUS_INVALID_REQUEST;

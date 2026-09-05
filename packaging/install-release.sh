@@ -1,9 +1,13 @@
 #!/bin/sh
 set -eu
 
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
+
 expected_version=0.2.0
 expected_client_abi_major=0
-expected_client_abi_minor=1
+expected_client_abi_minor=2
 
 usage() {
     echo "Usage: sudo ./install.sh [--skip-if-compatible]"
@@ -386,6 +390,7 @@ for required in \
     lib/libkeysharp-input.so.0.2.0 \
     include/keysharp_input/client.h \
     include/keysharp_input/constants.h \
+    include/keysharp_input/devices.h \
     pkgconfig/keysharp-input.pc \
     cmake/KeysharpInputConfig.cmake \
     cmake/KeysharpInputConfigVersion.cmake \
@@ -426,6 +431,7 @@ if $skip_if_compatible && installation_complete_for_channel portable; then
     exit 0
 fi
 
+sh "$archive_dir/check-runtime.sh" --install
 previous_library=$(portable_library_payload || true)
 install -d -m 0755 /usr/local/bin /usr/local/lib
 atomic_temporary=
@@ -453,6 +459,8 @@ install -D -m 0644 "$archive_dir/include/keysharp_input/client.h" \
     /usr/local/include/keysharp_input/client.h
 install -D -m 0644 "$archive_dir/include/keysharp_input/constants.h" \
     /usr/local/include/keysharp_input/constants.h
+install -D -m 0644 "$archive_dir/include/keysharp_input/devices.h" \
+    /usr/local/include/keysharp_input/devices.h
 install -D -m 0644 "$archive_dir/pkgconfig/keysharp-input.pc" \
     /usr/local/lib/pkgconfig/keysharp-input.pc
 for metadata in KeysharpInputConfig.cmake KeysharpInputConfigVersion.cmake \

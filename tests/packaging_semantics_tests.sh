@@ -16,8 +16,23 @@ trap cleanup EXIT HUP INT TERM
 sed -n '/^is_root_protected_chain() {$/,/^archive_dir=/p' \
     "$source_dir/packaging/install-release.sh" | sed '$d' \
     > "$temporary/install-functions.sh"
-expected_client_abi_major=0
-expected_client_abi_minor=1
+expected_client_abi_major=$(awk '$2 == "KSI_CLIENT_ABI_MAJOR" { gsub(/u$/, "", $3); print $3 }' \
+    "$source_dir/include/keysharp_input/client.h")
+expected_client_abi_minor=$(awk '$2 == "KSI_CLIENT_ABI_MINOR" { gsub(/u$/, "", $3); print $3 }' \
+    "$source_dir/include/keysharp_input/client.h")
+for component in major minor; do
+    installer_value=$(sed -n "s/^expected_client_abi_${component}=//p" \
+        "$source_dir/packaging/install-release.sh")
+    if [ "$component" = major ]; then
+        header_value=$expected_client_abi_major
+    else
+        header_value=$expected_client_abi_minor
+    fi
+    if [ "$installer_value" != "$header_value" ]; then
+        echo "archive installer ABI $component does not match its public header" >&2
+        exit 1
+    fi
+done
 # shellcheck source=/dev/null
 . "$temporary/install-functions.sh"
 
@@ -110,7 +125,7 @@ fi
 udev_configuration_matches "$source_dir/udev/70-keysharp-input-uaccess.rules"
 
 printf '%s\n' '#!/bin/sh' \
-    "printf '%s\\n' client_abi_major=0 client_abi_minor=1" \
+    "printf '%s\\n' client_abi_major=$expected_client_abi_major client_abi_minor=$expected_client_abi_minor" \
     > "$temporary/good-info"
 chmod 0755 "$temporary/good-info"
 client_abi_matches "$temporary/good-info"
@@ -119,7 +134,7 @@ mkdir -p "$temporary/bin"
 cat > "$temporary/bin/dpkg-query" <<'EOF'
 #!/bin/sh
 printf '%s\n' \
-    'ii |unrelated-provider, keysharp-input-client-abi-0 (= 0.1)' \
+    'ii |unrelated-provider, keysharp-input-client-abi-0 (= 0.2)' \
     'rc |ignored-provider, keysharp-input-client-abi-0'
 EOF
 chmod 0755 "$temporary/bin/dpkg-query"
@@ -133,7 +148,7 @@ fi
 PATH=$old_path
 
 printf '%s\n' '#!/bin/sh' \
-    "printf '%s\\n' client_abi_major=0 client_abi_minor=0" \
+    "printf '%s\\n' client_abi_major=$expected_client_abi_major client_abi_minor=$((expected_client_abi_minor - 1))" \
     > "$temporary/old-info"
 chmod 0755 "$temporary/old-info"
 if client_abi_matches "$temporary/old-info"; then

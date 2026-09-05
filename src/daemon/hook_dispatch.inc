@@ -86,7 +86,8 @@ static ksi_lane_event *create_hook_lane_event(
         ksi_lane_subscriber candidate;
         size_t position;
 
-        if ((c->hook_subscriptions & subscription_bit) == 0u
+        if (c->permission_refresh_pending
+            || (c->hook_subscriptions & subscription_bit) == 0u
             || (c->quarantined_hooks & subscription_bit) != 0u
             || !input_owner_matches_uid(state, c->uid)) {
             continue;

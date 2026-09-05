@@ -35,6 +35,7 @@
 #define KSI_BIT_ARRAY_LENGTH(max_bit) (((max_bit) / KSI_BITS_PER_LONG) + 1)
 
 typedef struct ksi_linux_device_info {
+    ksi_device_info public_info;
     char path[PATH_MAX];
     char name[KSI_DEVICE_NAME_LENGTH];
     bool has_keys;
@@ -44,6 +45,8 @@ typedef struct ksi_linux_device_info {
     bool has_mouse_buttons;
     bool has_pointer_axes;
     bool requires_compositor_processing;
+    bool high_resolution_wheel;
+    bool high_resolution_horizontal_wheel;
     uint16_t bustype;
     uint16_t vendor;
     uint16_t product;
@@ -52,6 +55,7 @@ typedef struct ksi_linux_device_info {
 } ksi_linux_device_info;
 
 typedef struct ksi_linux_tracked_device {
+    ksi_device_info public_info;
     char path[PATH_MAX];
     char name[KSI_DEVICE_NAME_LENGTH];
     int fd;
@@ -63,9 +67,13 @@ typedef struct ksi_linux_tracked_device {
     bool mouse_hook_candidate;
     bool mouse_block_candidate;
     bool injected_source;
+    bool raw_observation_candidate;
     bool event_clock_monotonic;
     bool grab_deferred;
     bool has_buffered_event;
+    bool synchronizing;
+    bool high_resolution_wheel;
+    bool high_resolution_horizontal_wheel;
     struct input_event buffered_event;
     unsigned long physical_down_keys[KSI_BIT_ARRAY_LENGTH(KEY_MAX)];
     unsigned long deferred_down_keys[KSI_BIT_ARRAY_LENGTH(KEY_MAX)];
@@ -98,6 +106,12 @@ static struct udev_monitor *udev_monitor;
 static uint32_t next_device_id = 1;
 static ksi_hook_event_callback hook_event_callback;
 static void *hook_event_context;
+static ksi_hook_event_callback observer_event_callback;
+static ksi_raw_device_callback raw_observer_callback;
+static void *raw_observer_context;
+static ksi_device_change_callback device_change_callback;
+static void *observer_event_context;
+static uint64_t device_generation = 1u;
 static ksi_physical_key_event_callback physical_key_event_callback;
 static void *physical_key_event_context;
 static uint32_t grab_hook_mask;
@@ -323,11 +337,49 @@ static int read_device_info(const char *path, ksi_linux_device_info *info)
     info->has_pointer_axes = looks_like_pointer_axes(rel_bits, abs_bits);
     info->requires_compositor_processing = info->has_absolute
         && looks_like_compositor_processed_pointer(key_bits);
+    info->high_resolution_wheel = test_bit(rel_bits, REL_WHEEL_HI_RES);
+    info->high_resolution_horizontal_wheel = test_bit(rel_bits, REL_HWHEEL_HI_RES);
     info->is_synth_device = is_keysharp_synth_device_identity(
         info->name,
         info->bustype,
         info->vendor,
         info->product);
+
+    ksi_device_info *public = &info->public_info;
+    public->struct_size = sizeof(*public);
+    public->bus_type = info->bustype;
+    public->vendor = info->vendor;
+    public->product = info->product;
+    public->version = info->version;
+    (void)snprintf(public->name, sizeof(public->name), "%s", info->name);
+    (void)snprintf(public->path, sizeof(public->path), "%.*s",
+        (int)sizeof(public->path) - 1, path);
+    (void)ioctl(fd, EVIOCGPHYS(sizeof(public->physical) - 1u), public->physical);
+    (void)ioctl(fd, EVIOCGUNIQ(sizeof(public->unique) - 1u), public->unique);
+    if (info->has_keyboard_keys) public->capabilities |= KSI_DEVICE_KEYBOARD | KSI_DEVICE_CAN_INTERCEPT_KEYBOARD;
+    if (info->has_mouse_buttons && info->has_pointer_axes) public->capabilities |= KSI_DEVICE_MOUSE;
+    if (test_bit(key_bits, BTN_TOOL_FINGER)) public->capabilities |= KSI_DEVICE_TOUCHPAD;
+    if (test_bit(key_bits, BTN_TOOL_PEN) || test_bit(key_bits, BTN_TOOL_RUBBER)) public->capabilities |= KSI_DEVICE_TABLET;
+    if (info->has_relative) public->capabilities |= KSI_DEVICE_RELATIVE;
+    if (info->has_absolute) public->capabilities |= KSI_DEVICE_ABSOLUTE;
+    if (info->requires_compositor_processing) public->capabilities |= KSI_DEVICE_RAW_OBSERVATION;
+    if (info->high_resolution_wheel) public->capabilities |= KSI_DEVICE_HIGH_RESOLUTION_WHEEL;
+    if (info->high_resolution_horizontal_wheel) public->capabilities |= KSI_DEVICE_HIGH_RESOLUTION_HORIZONTAL_WHEEL;
+    if ((public->capabilities & KSI_DEVICE_MOUSE) != 0u && !info->requires_compositor_processing)
+        public->capabilities |= KSI_DEVICE_CAN_INTERCEPT_MOUSE;
+    for (uint32_t code = 0u; code < KSI_DEVICE_AXIS_CAPACITY; code++) {
+        if (!test_bit(abs_bits, (int)code)) continue;
+        struct input_absinfo abs;
+        if (ioctl(fd, EVIOCGABS(code), &abs) != 0) continue;
+        ksi_device_axis_info *axis = &public->axes[public->axis_count++];
+        axis->struct_size = sizeof(*axis);
+        axis->code = code;
+        axis->minimum = abs.minimum;
+        axis->maximum = abs.maximum;
+        axis->fuzz = abs.fuzz;
+        axis->flat = abs.flat;
+        axis->resolution = abs.resolution;
+    }
 
     close(fd);
     return 0;
@@ -451,6 +503,10 @@ static void apply_udev_device_metadata(
 
     info->requires_compositor_processing = info->requires_compositor_processing
         || udev_hierarchy_requires_compositor_processing(device);
+    if (info->requires_compositor_processing) {
+        info->public_info.capabilities &= ~(uint32_t)KSI_DEVICE_CAN_INTERCEPT_MOUSE;
+        info->public_info.capabilities |= KSI_DEVICE_RAW_OBSERVATION;
+    }
 }
 
 static bool is_candidate(const ksi_linux_device_info *info)
@@ -528,6 +584,12 @@ static ssize_t find_tracked_device_by_fd(int fd)
 
 static void close_tracked_device(ksi_linux_tracked_device *device)
 {
+    if (device->fd >= 0 && !device->injected_source) {
+        device_generation++;
+        if (device_change_callback != NULL)
+            device_change_callback(observer_event_context, KSI_OBSERVER_DEVICE_REMOVED,
+                &device->public_info, device_generation);
+    }
     if (device->grabbed && device->fd >= 0) {
         (void)ioctl(device->fd, EVIOCGRAB, 0);
         device->grabbed = false;
@@ -546,6 +608,7 @@ static void close_tracked_device(ksi_linux_tracked_device *device)
     device->grab_deferred = false;
     device->event_clock_monotonic = false;
     device->has_buffered_event = false;
+    device->synchronizing = false;
     memset(&device->buffered_event, 0, sizeof(device->buffered_event));
     memset(device->physical_down_keys, 0, sizeof(device->physical_down_keys));
     memset(device->deferred_down_keys, 0, sizeof(device->deferred_down_keys));
@@ -866,6 +929,14 @@ static void track_device(const ksi_linux_device_info *info, const char *reason)
     target->mouse_hook_candidate = is_mouse_hook_candidate(info);
     target->mouse_block_candidate = is_mouse_block_candidate(info);
     target->injected_source = info->is_synth_device;
+    target->raw_observation_candidate = info->requires_compositor_processing;
+    target->high_resolution_wheel = info->high_resolution_wheel;
+    target->high_resolution_horizontal_wheel = info->high_resolution_horizontal_wheel;
+    ksi_device_info public_info = info->public_info;
+    public_info.device_id = target->device_id;
+    bool changed = memcmp(&target->public_info, &public_info, sizeof(public_info)) != 0;
+    bool newly_opened = is_new || target->fd < 0;
+    target->public_info = public_info;
 
     if (is_new || target->fd < 0) {
         if (open_tracked_device(target) != 0) {
@@ -873,6 +944,14 @@ static void track_device(const ksi_linux_device_info *info, const char *reason)
         }
 
         update_absolute_axis_ranges(target);
+    }
+
+    if (!target->injected_source && (changed || newly_opened)) {
+        device_generation++;
+        if (device_change_callback != NULL)
+            device_change_callback(observer_event_context,
+                newly_opened ? KSI_OBSERVER_DEVICE_ADDED : KSI_OBSERVER_DEVICE_CHANGED,
+                &target->public_info, device_generation);
     }
 
     {
@@ -1345,6 +1424,9 @@ static uint32_t evdev_key_to_flags(const struct input_event *event)
     if (event->value == 0) {
         flags |= KSI_KEYBOARD_HOOK_UP;
     }
+    if (event->value == 2) {
+        flags |= KSI_KEYBOARD_HOOK_REPEAT;
+    }
 
     return flags;
 }
@@ -1371,6 +1453,16 @@ static uint32_t mouse_injected_flags(bool is_injected)
 static bool should_dispatch_hook_input(const ksi_linux_tracked_device *device)
 {
     return device != NULL && device->grabbed && !device->injected_source;
+}
+
+static void deliver_device_event(const ksi_linux_tracked_device *device,
+    uint32_t hook_type, const void *event, size_t size)
+{
+    if (observer_event_callback != NULL && !device->injected_source)
+        observer_event_callback(observer_event_context, hook_type, event, size);
+    if (should_dispatch_hook_input(device) && hook_event_callback != NULL
+        && (hook_type != KSI_HOOK_MOUSE || device->mouse_hook_candidate))
+        hook_event_callback(hook_event_context, hook_type, event, size);
 }
 
 static bool evdev_button_to_mouse_message(unsigned int code, int value, uint32_t *message)
@@ -1419,7 +1511,7 @@ static void dispatch_keyboard_event(
     uint64_t extra_info,
     bool is_injected)
 {
-    if (!should_dispatch_hook_input(device)) {
+    if (!should_dispatch_hook_input(device) && observer_event_callback == NULL) {
         return;
     }
 
@@ -1427,7 +1519,8 @@ static void dispatch_keyboard_event(
         .message = evdev_key_to_message(event),
         .vk_code = evdev_key_to_vk((unsigned int)event->code),
         .scan_code = (uint32_t)event->code,
-        .flags = evdev_key_to_flags(event) | keyboard_injected_flags(is_injected) | keyboard_indicator_flags(),
+        .flags = evdev_key_to_flags(event) | keyboard_injected_flags(is_injected) | keyboard_indicator_flags()
+            | (device->synchronizing ? KSI_KEYBOARD_HOOK_SYNCHRONIZED : 0u),
         .time_ms = event_time_ms(event),
         .extra_info = extra_info,
         .device_id = device->device_id,
@@ -1444,13 +1537,7 @@ static void dispatch_keyboard_event(
             device->name);
     }
 
-    if (hook_event_callback != NULL) {
-        hook_event_callback(
-            hook_event_context,
-            KSI_HOOK_KEYBOARD,
-            &hook_event,
-            sizeof(hook_event));
-    }
+    deliver_device_event(device, KSI_HOOK_KEYBOARD, &hook_event, sizeof(hook_event));
 }
 
 static void dispatch_mouse_button_event(
@@ -1461,7 +1548,7 @@ static void dispatch_mouse_button_event(
 {
     uint32_t message;
 
-    if (!should_dispatch_hook_input(device)) {
+    if (!should_dispatch_hook_input(device) && observer_event_callback == NULL) {
         return;
     }
 
@@ -1489,13 +1576,7 @@ static void dispatch_mouse_button_event(
             device->name);
     }
 
-    if (hook_event_callback != NULL) {
-        hook_event_callback(
-            hook_event_context,
-            KSI_HOOK_MOUSE,
-            &hook_event,
-            sizeof(hook_event));
-    }
+    deliver_device_event(device, KSI_HOOK_MOUSE, &hook_event, sizeof(hook_event));
 }
 
 static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
@@ -1529,13 +1610,7 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
         device->pending_rel_extra_info = 0;
         device->pending_rel_injected = false;
 
-        if (should_dispatch_hook_input(device) && hook_event_callback != NULL) {
-            hook_event_callback(
-                hook_event_context,
-                KSI_HOOK_MOUSE,
-                &hook_event,
-                sizeof(hook_event));
-        }
+        deliver_device_event(device, KSI_HOOK_MOUSE, &hook_event, sizeof(hook_event));
     }
 
     if (device->has_pending_abs) {
@@ -1563,13 +1638,7 @@ static void dispatch_pending_mouse_move(ksi_linux_tracked_device *device)
         device->pending_abs_extra_info = 0;
         device->pending_abs_injected = false;
 
-        if (should_dispatch_hook_input(device) && hook_event_callback != NULL) {
-            hook_event_callback(
-                hook_event_context,
-                KSI_HOOK_MOUSE,
-                &hook_event,
-                sizeof(hook_event));
-        }
+        deliver_device_event(device, KSI_HOOK_MOUSE, &hook_event, sizeof(hook_event));
     }
 }
 
@@ -1612,13 +1681,22 @@ static void dispatch_relative_event(
         return;
     }
 
-    if (event->code == REL_WHEEL || event->code == REL_HWHEEL) {
+    if ((event->code == REL_WHEEL && !device->high_resolution_wheel)
+        || (event->code == REL_HWHEEL && !device->high_resolution_horizontal_wheel)
+        || event->code == REL_WHEEL_HI_RES || event->code == REL_HWHEEL_HI_RES) {
+        bool vertical = event->code == REL_WHEEL || event->code == REL_WHEEL_HI_RES;
+        int64_t delta = event->value;
+        if (event->code == REL_WHEEL || event->code == REL_HWHEEL) {
+            delta *= 120;
+        }
+        if (delta > INT16_MAX) delta = INT16_MAX;
+        if (delta < INT16_MIN) delta = INT16_MIN;
         ksi_mouse_hook_event hook_event = {
-            .message = event->code == REL_WHEEL ? KSI_MESSAGE_MOUSE_WHEEL : KSI_MESSAGE_MOUSE_HORIZONTAL_WHEEL,
+            .message = vertical ? KSI_MESSAGE_MOUSE_WHEEL : KSI_MESSAGE_MOUSE_HORIZONTAL_WHEEL,
             /* Wheel events carry no cursor position; report the sentinel, not a bogus (0,0). */
             .x = KSI_MOUSE_COORD_UNSPECIFIED,
             .y = KSI_MOUSE_COORD_UNSPECIFIED,
-            .mouse_data = (uint32_t)((int32_t)event->value * 120) << 16,
+            .mouse_data = (uint32_t)delta << 16,
             .flags = mouse_injected_flags(is_injected),
             .time_ms = event_time_ms(event),
             .extra_info = extra_info,
@@ -1635,13 +1713,7 @@ static void dispatch_relative_event(
                 device->name);
         }
 
-        if (should_dispatch_hook_input(device) && hook_event_callback != NULL) {
-            hook_event_callback(
-                hook_event_context,
-                KSI_HOOK_MOUSE,
-                &hook_event,
-                sizeof(hook_event));
-        }
+        deliver_device_event(device, KSI_HOOK_MOUSE, &hook_event, sizeof(hook_event));
     }
 }
 
@@ -1712,6 +1784,18 @@ static void handle_input_event(
         return;
     }
 
+    if (raw_observer_callback != NULL && device->raw_observation_candidate
+        && (event->type == EV_ABS || event->type == EV_KEY || event->type == EV_SYN)) {
+        const ksi_raw_input_event raw = {
+            .struct_size = sizeof(raw), .device_id = device->device_id,
+            .time_ms = event_time_ms(event), .type = event->type, .code = event->code,
+            .value = event->value,
+            .flags = (device->synchronizing ? KSI_RAW_INPUT_SYNCHRONIZED : 0u)
+                | (device->event_clock_monotonic ? KSI_RAW_INPUT_MONOTONIC_TIME : 0u),
+        };
+        raw_observer_callback(raw_observer_context, &raw);
+    }
+
     /* Count activity at raw evdev ingress, before hook callbacks or deferred
      * processing can create re-entrant events. Synchronization packets, LED
      * output, and zero relative deltas can occur without user-visible input and
@@ -1765,7 +1849,7 @@ static void handle_input_event(
             return;
         }
 
-        if (device->mouse_hook_candidate && is_mouse_button_code(event->code)) {
+        if (device->mouse_candidate && is_mouse_button_code(event->code)) {
             dispatch_mouse_button_event(device, event, extra_info, is_injected);
         } else if (device->keyboard_candidate && is_keyboard_key_code(event->code)) {
             dispatch_keyboard_event(device, event, extra_info, is_injected);
@@ -2003,12 +2087,71 @@ void ksi_linux_devices_set_hook_event_callback(ksi_hook_event_callback callback,
     hook_event_context = context;
 }
 
+void ksi_linux_devices_set_observer_callback(ksi_hook_event_callback callback,
+    ksi_device_change_callback device_callback, void *context)
+{
+    observer_event_callback = callback;
+    device_change_callback = device_callback;
+    observer_event_context = context;
+}
+
+void ksi_linux_devices_set_raw_observer_callback(ksi_raw_device_callback callback, void *context)
+{
+    raw_observer_callback = callback;
+    raw_observer_context = context;
+}
+
+uint64_t ksi_linux_devices_generation(void)
+{
+    return device_generation;
+}
+
+size_t ksi_linux_devices_list(uint32_t offset, ksi_device_info *entries,
+    size_t capacity, uint32_t *next_offset)
+{
+    size_t count = 0u;
+    size_t index = offset;
+    for (; index < tracked_device_count && count < capacity; index++) {
+        const ksi_linux_tracked_device *device = &tracked_devices[index];
+        if (device->fd >= 0 && !device->injected_source)
+            entries[count++] = device->public_info;
+    }
+    *next_offset = index < tracked_device_count ? (uint32_t)index : 0u;
+    return count;
+}
+
 void ksi_linux_devices_set_physical_key_event_callback(
     ksi_physical_key_event_callback callback,
     void *context)
 {
     physical_key_event_callback = callback;
     physical_key_event_context = context;
+}
+
+static int next_device_event(ksi_linux_tracked_device *device, struct input_event *event)
+{
+    for (;;) {
+        int result = libevdev_next_event(device->evdev,
+            device->synchronizing ? LIBEVDEV_READ_FLAG_SYNC : LIBEVDEV_READ_FLAG_NORMAL,
+            event);
+
+        if (result == LIBEVDEV_READ_STATUS_SYNC) {
+            if (device->synchronizing) {
+                return 0;
+            }
+            /* Incomplete motion reports cannot be replayed after the state jump. */
+            device->synchronizing = true;
+            device->has_pending_rel = false;
+            device->has_pending_abs = false;
+            device->pending_rel_x = device->pending_rel_y = 0;
+            continue;
+        }
+        if (result == -EAGAIN && device->synchronizing) {
+            device->synchronizing = false;
+            continue;
+        }
+        return result;
+    }
 }
 
 static void process_device_events(ksi_linux_tracked_device *device)
@@ -2029,7 +2172,7 @@ static void process_device_events(ksi_linux_tracked_device *device)
             memset(&device->buffered_event, 0, sizeof(device->buffered_event));
             result = 0;
         } else {
-            result = libevdev_next_event(device->evdev, LIBEVDEV_READ_FLAG_NORMAL, &event);
+            result = next_device_event(device, &event);
         }
 
         if (result == 0) {
@@ -2040,10 +2183,6 @@ static void process_device_events(ksi_linux_tracked_device *device)
         if (result == -EAGAIN) {
             dispatch_pending_mouse_move(device);
             return;
-        }
-
-        if (result == LIBEVDEV_READ_STATUS_SYNC) {
-            continue;
         }
 
         fprintf(stderr, "keysharp-input: failed reading %s: %s\n",
@@ -2070,7 +2209,7 @@ static bool buffer_next_device_event(ksi_linux_tracked_device *device)
 
     for (;;) {
         struct input_event event;
-        int result = libevdev_next_event(device->evdev, LIBEVDEV_READ_FLAG_NORMAL, &event);
+        int result = next_device_event(device, &event);
 
         if (result == 0) {
             device->buffered_event = event;
@@ -2080,10 +2219,6 @@ static bool buffer_next_device_event(ksi_linux_tracked_device *device)
 
         if (result == -EAGAIN) {
             return false;
-        }
-
-        if (result == LIBEVDEV_READ_STATUS_SYNC) {
-            continue;
         }
 
         fprintf(stderr, "keysharp-input: failed peeking %s: %s\n",

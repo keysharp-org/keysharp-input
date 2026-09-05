@@ -39,6 +39,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include "device_codec.h"
 
 #define KSI_MAX_CLIENTS 64
 #define KSI_MAX_BACKEND_FDS 160
@@ -78,6 +79,15 @@
 /* Reserve a few client slots for other users/root helpers on shared systems. */
 #define KSI_MAX_CLIENTS_PER_UID (KSI_MAX_CLIENTS - 8u)
 #define KSI_VK_LCONTROL 0xA2u
+#define KSI_OBSERVER_QUEUE_CAPACITY 64u
+#define KSI_PERMISSION_IO_TIMEOUT_MS 15000u
+#define KSI_AUTHORIZATION_TIMEOUT_MS 130000u
+
+typedef struct ksi_observer_frame {
+    uint32_t size;
+    uint64_t event_id;
+    uint8_t payload[KSI_OBSERVER_MAX_PAYLOAD_SIZE];
+} ksi_observer_frame;
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -103,6 +113,10 @@ static inline void wake_pipe_write(int fd)
  * prompt cannot starve new client identification. */
 static ksi_worker_pool g_worker_pool;
 static ksi_worker_pool g_identify_worker_pool;
+static ksi_worker_pool g_permission_worker_pool;
+typedef struct ksi_permission_task ksi_permission_task;
+static void free_permission_task(void *context);
+static uint64_t monotonic_ms(void);
 
 typedef enum ksi_client_state {
     KSI_CLIENT_STATE_IDENTIFYING,     /* process identity resolution running on worker thread */
@@ -127,12 +141,20 @@ typedef struct ksi_client {
     ksi_client_state state;
     bool identity_attempted;
     bool has_identity;
+    ksp_identity identity;
+    bool revalidation_pending;
+    uint64_t identity_checked_ms;
     bool hello_complete;
     uint32_t connection_role;
     uint64_t connected_at_ms;
     uint32_t granted_scopes;
     uint64_t advertised_operations;
     uint32_t hook_subscriptions;
+    uint32_t observer_subscriptions;
+    ksi_observer_frame *observer_queue;
+    uint32_t observer_head;
+    uint32_t observer_count;
+    uint64_t observer_dropped;
     /* Windows installs each hook type independently at the chain head. A
      * disconnect/re-subscribe therefore gets a fresh per-type ordinal even if
      * its transport connection is older than other scripts. */
@@ -156,6 +178,10 @@ typedef struct ksi_client {
     uint32_t pending_requested_scopes;
     uint64_t pending_request_id;
     uint64_t pending_permission_generation;
+    uint64_t pending_authorization_started_ms;
+    ksi_permission_task *permission_task;
+    uint64_t permission_task_deadline_ms;
+    bool permission_refresh_pending;
     uint64_t permission_store_generation;
     bool permission_store_generation_valid;
 } ksi_client;
@@ -163,6 +189,7 @@ typedef struct ksi_client {
 /* Heap-allocated payload for KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED. */
 typedef struct ksi_client_identified_result {
     bool has_identity;
+    ksp_identity identity;
     char exe_path[KSP_PATH_CAPACITY];
     char exe_hash[KSP_HASH_HEX_LENGTH + 1u];
     uint64_t start_time;
@@ -170,6 +197,8 @@ typedef struct ksi_client_identified_result {
 
 typedef enum ksi_daemon_command_type {
     KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED, /* worker -> main: identity resolution complete */
+    KSI_DAEMON_COMMAND_CLIENT_REVALIDATED,
+    KSI_DAEMON_COMMAND_PERMISSION_DONE,
     KSI_DAEMON_COMMAND_CLIENT_PROMPT_DONE, /* worker → main: user permission prompt complete */
     KSI_DAEMON_COMMAND_LANE_HOOK_FAILURE, /* lane → main: send/timeout failure for a client */
 } ksi_daemon_command_type;
@@ -179,6 +208,7 @@ typedef struct ksi_daemon_command {
     int client_fd;
     uint64_t connection_id;
     union {
+        ksi_permission_task *permission;
         struct {
             ksi_client_identified_result *result; /* heap-allocated; freed by consumer */
         } identified;
@@ -187,6 +217,9 @@ typedef struct ksi_daemon_command {
             uint32_t requested_scopes;
             uint32_t missing_scopes;
             uint64_t store_generation;
+            uint64_t permission_generation;
+            uint64_t input_generation;
+            uint32_t allowed_scopes;
             int prompt_lock_fd;
             bool prompt_lock_held;
         } prompt_done;
@@ -425,7 +458,9 @@ typedef struct ksi_daemon_state {
     ksi_daemon_command_queue *commands;
     ksp_store *permissions;
     /* Control-plane epoch used to invalidate prompts which crossed a revoke. */
-    uint64_t permission_generation;
+    atomic_uint_least64_t permission_generation;
+    bool permission_refresh_inflight;
+    uint64_t permission_refresh_started_ms;
     uint64_t available_operations;
     uint64_t ready_operations;
     uint64_t next_connection_id;
@@ -485,6 +520,7 @@ static void lane_flush_passthrough(ksi_hook_lane *lane);
 static bool output_queue_push_release_all(ksi_output_queue *q);
 static bool input_owner_matches_uid(
     const ksi_daemon_state *state, uid_t uid);
+static void update_observer_callbacks(ksi_daemon_state *state);
 static uint64_t current_input_generation(const ksi_daemon_state *state);
 static uint64_t advance_input_generation(ksi_daemon_state *state);
 
@@ -566,7 +602,11 @@ static void free_daemon_command(ksi_daemon_command *command)
         return;
     }
 
-    if (command->type == KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED) {
+    if (command->type == KSI_DAEMON_COMMAND_PERMISSION_DONE) {
+        free_permission_task(command->data.permission);
+        command->data.permission = NULL;
+    } else if (command->type == KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED
+        || command->type == KSI_DAEMON_COMMAND_CLIENT_REVALIDATED) {
         free(command->data.identified.result);
         command->data.identified.result = NULL;
     } else if (command->type == KSI_DAEMON_COMMAND_CLIENT_PROMPT_DONE
@@ -602,10 +642,13 @@ static uint64_t current_input_generation(const ksi_daemon_state *state)
             &state->active_input_generation, memory_order_acquire);
 }
 
+#include "daemon/permission_workers.inc"
 #include "daemon/privilege_workers.inc"
 #include "daemon/client_lifecycle.inc"
 #include "daemon/hook_lanes.inc"
 #include "daemon/grab_leases.inc"
+#include "daemon/permission_completions.inc"
+#include "daemon/observers.inc"
 #include "daemon/hook_dispatch.inc"
 #include "daemon/hook_ingress.inc"
 #include "daemon/protocol_server.inc"
@@ -652,6 +695,10 @@ static void set_active_input_owner(
     atomic_store_explicit(
         &state->active_input_uid_valid, false, memory_order_release);
     generation = advance_input_generation(state);
+    for (nfds_t i = 0u; i < state->client_count; i++) {
+        state->clients[i].observer_count = 0u;
+        state->clients[i].observer_dropped = 0u;
+    }
 
     lane_flush_passthrough(&state->keyboard_lane);
     lane_flush_passthrough(&state->mouse_lane);
@@ -869,6 +916,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     atomic_init(&daemon_state->active_input_uid_valid, false);
     atomic_init(&daemon_state->active_input_uid, 0u);
     atomic_init(&daemon_state->active_input_generation, 1u);
+    atomic_init(&daemon_state->permission_generation, 1u);
 
     if (command_queue_init(&command_queue) != 0) {
         free(daemon_state);
@@ -949,10 +997,18 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         daemon_handle_physical_key_event, daemon_state);
 
     if (ksi_worker_pool_init(&g_worker_pool) != 0
-        || ksi_worker_pool_init(&g_identify_worker_pool) != 0) {
+        || ksi_worker_pool_init(&g_identify_worker_pool) != 0
+        || ksi_worker_pool_init(&g_permission_worker_pool) != 0) {
         fprintf(stderr, "keysharp-input: failed to start worker pool\n");
+        ksi_worker_pool_request_stop(&g_worker_pool);
+        ksi_worker_pool_request_stop(&g_identify_worker_pool);
+        ksi_worker_pool_request_stop(&g_permission_worker_pool);
+        (void)ksi_worker_pool_join_before(&g_worker_pool, 0u);
+        (void)ksi_worker_pool_join_before(&g_identify_worker_pool, 0u);
+        (void)ksi_worker_pool_join_before(&g_permission_worker_pool, 0u);
         ksi_worker_pool_destroy(&g_worker_pool);
         ksi_worker_pool_destroy(&g_identify_worker_pool);
+        ksi_worker_pool_destroy(&g_permission_worker_pool);
 
         if (backend->set_hook_event_callback != NULL) {
             backend->set_hook_event_callback(NULL, NULL);
@@ -1037,6 +1093,8 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         for (nfds_t i = 0; i < polled_client_count; i++) {
             fds[count].fd = daemon_state->clients[i].fd;
             fds[count].events = POLLIN;
+            if (daemon_state->clients[i].observer_count != 0u)
+                fds[count].events |= POLLOUT;
             count++;
         }
 
@@ -1121,10 +1179,13 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         process_daemon_commands(daemon_state);
         expire_client_leases(daemon_state);
         expire_unauthenticated_clients(daemon_state);
+        flush_observers(daemon_state);
 
     }
 
     keep_running = 0;
+    ksi_linux_devices_set_observer_callback(NULL, NULL, NULL);
+    ksi_linux_devices_set_raw_observer_callback(NULL, NULL);
 
     if (backend->set_hook_event_callback != NULL) {
         backend->set_hook_event_callback(NULL, NULL);
@@ -1152,12 +1213,14 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     /* Abort in-progress prompts so worker threads exit promptly. */
     ksi_worker_pool_request_stop(&g_worker_pool);
     ksi_worker_pool_request_stop(&g_identify_worker_pool);
+    ksi_worker_pool_request_stop(&g_permission_worker_pool);
 
     /* Wake the main loop so it observes keep_running=0. */
     ksi_pipe_ring_wake(&command_queue.ring);
 
     if (!ksi_worker_pool_join_before(&g_worker_pool, shutdown_deadline_ms)
-        || !ksi_worker_pool_join_before(&g_identify_worker_pool, shutdown_deadline_ms)) {
+        || !ksi_worker_pool_join_before(&g_identify_worker_pool, shutdown_deadline_ms)
+        || !ksi_worker_pool_join_before(&g_permission_worker_pool, shutdown_deadline_ms)) {
         fprintf(stderr, "keysharp-input: shutdown deadline exceeded waiting for worker pool; terminating\n");
         fflush(NULL);
         _exit(EXIT_FAILURE);
@@ -1165,6 +1228,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 
     ksi_worker_pool_destroy(&g_worker_pool);
     ksi_worker_pool_destroy(&g_identify_worker_pool);
+    ksi_worker_pool_destroy(&g_permission_worker_pool);
 
     while (daemon_state->client_count > 0u) {
         remove_client(daemon_state, daemon_state->client_count - 1u);

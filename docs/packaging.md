@@ -20,7 +20,9 @@ The package also installs one polkit policy, one udev rule, and one tmpfiles
 declaration. The service socket is
 `/run/keysharp-input/keysharp-input.sock`.
 
-Debian metadata provides `keysharp-input-client-abi-0`. Applications depend on
+Debian metadata provides `keysharp-input-client-abi-0` with version `0.<minor>`
+derived from the public header, independent of the product release. Consumers can
+require an additive API with a versioned dependency. Applications depend on
 the client ABI; the daemon protocol is private to the matching client library.
 
 After a staged package install, run:

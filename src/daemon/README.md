@@ -6,6 +6,8 @@ helpers private while making ownership boundaries explicit without introducing
 an internal ABI.
 
 - `privilege_workers.inc`: process identification and permission prompt jobs.
+- `permission_workers.inc`: bounded store checks, listings, revocations, and snapshots.
+- `permission_completions.inc`: main-thread grant application and revocation fences.
 - `client_lifecycle.inc`: client removal and connection cleanup.
 - `hook_lanes.inc`: bounded output sequencing, keyboard/mouse lanes, decisions,
   and lane shutdown.
@@ -13,6 +15,7 @@ an internal ABI.
   failure accounting.
 - `hook_dispatch.inc`: physical event snapshotting, emergency replay, and
   backend hook callback dispatch.
+- `observers.inc`: bounded passive input/device notification queues and nonblocking writes.
 - `hook_ingress.inc`: physical/synthetic hook ingress fairness and Send input
   conversion into hook events.
 - `protocol_server.inc`: protocol handlers, frame parsing, accept, and command
@@ -37,6 +40,10 @@ in standalone modules.
 
 - The main thread exclusively owns `clients[]`, subscription snapshots, device
   discovery, and protocol parsing.
+- Permission workers carry immutable requests and retained connection references.
+  The main thread compares their completion tokens without dereferencing worker-owned
+  jobs; deadlines live in client state. Store locks and marker commits never run
+  on the physical input reader.
 - Each hook lane owns its current event context. Other threads communicate with
   it only through bounded action, decision, and nested-transaction queues.
 - One `ksi_hook_send_ref` owns each callback stream's keyboard/mouse callback stack.

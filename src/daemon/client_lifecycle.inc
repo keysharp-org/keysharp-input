@@ -7,6 +7,8 @@ static void remove_client(ksi_daemon_state *state, nfds_t index)
     clients[index].hook_send_ref = NULL;
     free(clients[index].rx_buffer);
     clients[index].rx_buffer = NULL;
+    free(clients[index].observer_queue);
+    clients[index].observer_queue = NULL;
 
     /* Snapshot refs remain alive but invalid. Their lane waiters wake immediately,
      * so one disconnect never flushes unrelated scripts or hook types. */
@@ -15,6 +17,7 @@ static void remove_client(ksi_daemon_state *state, nfds_t index)
     }
 
     (*count)--;
+    update_observer_callbacks(state);
 
     if (update_grab_state(state) != 0) {
         fprintf(stderr, "keysharp-input: failed to update grab state after client removal\n");

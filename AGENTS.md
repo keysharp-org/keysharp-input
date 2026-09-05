@@ -15,7 +15,7 @@ Three things ship together:
 - `libkeysharp-input.so.0` — the public client library, header `keysharp_input/client.h`.
 - systemd units, a polkit action, and a uaccess udev rule.
 
-The public client ABI is 0.1. The socket wire protocol is private and is an
+The public client ABI version is declared in `include/keysharp_input/client.h`. The socket wire protocol is private and is an
 implementation detail of that ABI; `docs/protocol.md` documents it for service
 maintainers, not for clients.
 
@@ -76,8 +76,9 @@ sudo cmake --install build
 The install step finishes the job: it refreshes the linker cache, creates the permission
 store, and runs `keysharp-input daemon --install-input-access`. Configure with
 `-DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF` to install files only, which is what packaging
-does. `sudo ./install.sh` wraps the same three commands and adds the distribution
-dependencies.
+does. `sudo ./install.sh` wraps configure, build and install; install the development
+dependencies first. Release archives check and install runtime dependencies through
+`check-runtime.sh` before copying files or starting services.
 
 Use `-DKEYSHARP_PERMISSIONS_SOURCE_DIR=/path/to/keysharp-permissions` to develop against
 a sibling checkout instead of the submodule.
@@ -112,8 +113,7 @@ client that stops answering cannot lock the user out. Keep that path working.
 - Shell lifecycle scripts are POSIX `sh`, and CI shellchecks
   `install.sh uninstall.sh packaging/install-release.sh packaging/debian/*`.
 - Public API changes need `include/keysharp_input/client.h`, `docs/integrating.md`, and
-  the README's worked examples updated together. The README's C blocks are meant to
-  compile as written.
+  the complete C programs in `examples/` updated together.
 
 ## Traps worth knowing
 

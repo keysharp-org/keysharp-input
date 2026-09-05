@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/e5bdc4a41d4c072fe1e3787eaa0320a384741d44";
   inputs.permissions = {
-    url = "github:keysharp-org/keysharp-permissions/ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13";
+    url = "github:keysharp-org/keysharp-permissions/b8f31942dd2c286608d390634a9916bffce55ddf";
     flake = false;
   };
 

@@ -23,6 +23,9 @@ int hook_send_ref_send(
     uint64_t request_id,
     const void *payload,
     size_t payload_size);
+/* 1 sent, 0 backpressure, -1 disconnected. Never waits for socket capacity. */
+int hook_send_ref_try_send(ksi_hook_send_ref *ref, uint16_t opcode,
+    uint16_t flags, uint64_t request_id, const void *payload, size_t payload_size);
 /* Enter one client's callback stream. Keyboard and mouse turns serialize;
  * a recursive turn may re-enter only while the current callback is blocked in
  * a synchronous Send. Ready recursive turns take priority over ordinary ones. */

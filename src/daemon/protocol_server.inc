@@ -6,6 +6,7 @@ static void remember_authorization(
     uint64_t request_id)
 {
     client->pending_authorization = true;
+    client->pending_authorization_started_ms = monotonic_ms();
     client->pending_authorization_opcode = opcode;
     client->pending_authorization_mode = mode;
     client->pending_requested_scopes = scopes;
@@ -20,9 +21,6 @@ static void begin_authorization(
     uint32_t requested,
     uint64_t request_id)
 {
-    uint32_t granted;
-    uint32_t missing = 0u;
-
     if (!input_owner_matches_uid(state, client->uid)) {
         send_authorization_status(client, opcode, request_id,
             KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
@@ -32,7 +30,8 @@ static void begin_authorization(
         finish_client_authorization(client, opcode, request_id, requested, 0u);
         return;
     }
-    if (client->pending_authorization
+    if (client->pending_authorization || client->permission_task != NULL
+        || state->permission_refresh_inflight
         || client->state == KSI_CLIENT_STATE_AWAITING_PROMPT) {
         send_authorization_status(client, opcode, request_id,
             KSI_STATUS_BUSY, KSI_DETAIL_WRONG_STATE, 0u);
@@ -62,26 +61,13 @@ static void begin_authorization(
         return;
     }
 
-    prepare_requested_scopes(state, requested);
-    granted = check_scopes_sync(state, client, requested, &missing);
-    if (missing != 0u && mode == KSI_AUTH_REQUEST
-        && state->permissions != NULL && !state->permission_monitor_failed) {
-        client->pending_permission_generation = state->permission_generation;
-        if (start_prompt_task(state->commands, state->permissions,
-                client->fd, client->connection_id, requested, missing,
-                client->exe_path, client->exe_hash, client->pid, client->uid,
-                client->start_time)) {
-            client->state = KSI_CLIENT_STATE_AWAITING_PROMPT;
-            return;
-        }
+    if (state->permissions == NULL || state->permission_monitor_failed
+        || !start_permission_check(state, client)) {
         client->pending_authorization = false;
         send_authorization_status(client, opcode, request_id,
-            KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE, 0u);
-        return;
+            KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
     }
 
-    client->pending_authorization = false;
-    finish_client_authorization(client, opcode, request_id, requested, granted);
 }
 
 static void handle_client_hello(
@@ -109,7 +95,8 @@ static void handle_client_hello(
     }
     if (payload.role != KSI_ROLE_RPC
         && payload.role != KSI_ROLE_CALLBACK_STREAM
-        && payload.role != KSI_ROLE_AUTHORIZATION_LEASE) {
+        && payload.role != KSI_ROLE_AUTHORIZATION_LEASE
+        && payload.role != KSI_ROLE_OBSERVER_STREAM) {
         send_status(client->fd, message->header, KSI_STATUS_UNSUPPORTED,
             KSI_DETAIL_WRONG_ROLE);
         return;
@@ -284,10 +271,6 @@ static void handle_list_permissions(
     ksi_client *client,
     const ksi_binary_message_view *message)
 {
-    ksp_permission_entry *entries = NULL;
-    size_t count = 0u;
-    uint8_t buffer[KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE + KSP_PATH_CAPACITY];
-
     if (client->connection_role != KSI_ROLE_RPC) {
         send_status(client->fd, message->header, KSI_STATUS_DENIED,
             KSI_DETAIL_WRONG_ROLE);
@@ -303,38 +286,10 @@ static void handle_list_permissions(
             KSI_DETAIL_NONE);
         return;
     }
-    if (ksp_store_list(state->permissions, client->uid, &entries, &count) != 0) {
-        send_status(client->fd, message->header, KSI_STATUS_INTERNAL,
-            KSI_DETAIL_NONE);
-        return;
-    }
+    ksi_permission_task *task = new_permission_task(state, client, KSI_PERMISSION_LIST, message->header->request_id);
+    if (!submit_permission_task(task, client))
+        send_status(client->fd, message->header, KSI_STATUS_BUSY, KSI_DETAIL_NONE);
 
-    for (size_t i = 0u; i < count; i++) {
-        uint32_t scopes = entries[i].scopes & KSI_INPUT_PERMISSION_SCOPES;
-        size_t path_length;
-
-        if (scopes == 0u || !ksp_hash_is_canonical(entries[i].app_hash)) {
-            continue;
-        }
-        path_length = strnlen(entries[i].executable, KSP_PATH_CAPACITY);
-        ksi_status_encode(buffer, KSI_STATUS_OK, KSI_DETAIL_NONE);
-        ksi_wire_write_u32(buffer + 8u, scopes);
-        ksi_wire_write_u32(buffer + 12u, (uint32_t)path_length);
-        ksi_wire_write_u64(buffer + 16u, entries[i].granted_at_utc);
-        ksi_protocol_encode_hash(entries[i].app_hash, buffer + 24u);
-        memcpy(buffer + KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE,
-            entries[i].executable, path_length);
-        if (ipc_send_locked(client->fd, KSI_OPCODE_PERMISSIONS_LIST,
-                KSI_FRAME_FLAG_RESPONSE | KSI_FRAME_FLAG_MORE,
-                message->header->request_id, buffer,
-                KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE + path_length) != 0) {
-            ksp_store_list_free(entries);
-            return;
-        }
-    }
-
-    ksp_store_list_free(entries);
-    send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
 }
 
 static bool raw_hash_is_zero(const uint8_t hash[KSI_PERMISSION_HASH_SIZE])
@@ -394,36 +349,24 @@ static void handle_revoke_permissions(
         }
         (void)ksi_protocol_decode_hash(payload.hash, exe_hash);
     } else if (payload.target_kind == KSI_PERMISSION_TARGET_PID) {
-        ksp_identity identity;
-
-        if (payload.pid == 0u || payload.pid > (uint64_t)INT_MAX
-            || !raw_hash_is_zero(payload.hash)
-            || ksp_identity_capture((pid_t)payload.pid, client->uid,
-                &identity) != 0) {
-            send_status(client->fd, message->header, KSI_STATUS_NOT_FOUND,
-                KSI_DETAIL_NONE);
+        if (payload.pid == 0u || payload.pid > (uint64_t)INT_MAX || !raw_hash_is_zero(payload.hash)) {
+            send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_VALUE_RANGE);
             return;
         }
-        (void)snprintf(exe_hash, sizeof(exe_hash), "%s", identity.hash);
     } else if (!all || payload.pid != 0u || !raw_hash_is_zero(payload.hash)) {
         send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
             KSI_DETAIL_VALUE_RANGE);
         return;
     }
 
-    int result = all
-        ? ksp_store_revoke_uid(state->permissions, client->uid, payload.scopes)
-        : ksp_store_revoke(state->permissions, client->uid, exe_hash,
-            payload.scopes);
-    if (result != 0) {
-        send_status(client->fd, message->header, KSI_STATUS_INTERNAL,
-            KSI_DETAIL_NONE);
-        return;
+    ksi_permission_task *task = new_permission_task(state, client, KSI_PERMISSION_REVOKE, message->header->request_id);
+    if (task != NULL) {
+        task->revoke = payload;
+        (void)snprintf(task->hash, sizeof(task->hash), "%s", exe_hash);
     }
+    if (!submit_permission_task(task, client))
+        send_status(client->fd, message->header, KSI_STATUS_BUSY, KSI_DETAIL_NONE);
 
-    invalidate_connected_permissions(state, client->uid,
-        all ? NULL : exe_hash, all, payload.scopes);
-    send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
 }
 
 static void handle_hook_subscription(
@@ -437,7 +380,8 @@ static void handle_hook_subscription(
     uint64_t old_ordinal;
     size_t lane_index;
 
-    if (client->connection_role != KSI_ROLE_CALLBACK_STREAM) {
+    if (client->connection_role != KSI_ROLE_CALLBACK_STREAM
+        && client->connection_role != KSI_ROLE_OBSERVER_STREAM) {
         send_status(client->fd, message->header, KSI_STATUS_DENIED,
             KSI_DETAIL_WRONG_ROLE);
         return;
@@ -458,6 +402,36 @@ static void handle_hook_subscription(
     if (subscription_bit == 0u) {
         send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
             KSI_DETAIL_VALUE_RANGE);
+        return;
+    }
+
+    if (client->connection_role == KSI_ROLE_OBSERVER_STREAM) {
+        if (message->header->opcode == KSI_OPCODE_SUBSCRIBE_HOOK) {
+            if (!input_owner_matches_uid(state, client->uid)
+                || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+                send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
+                return;
+            }
+            if (client->observer_queue == NULL)
+                client->observer_queue = calloc(KSI_OBSERVER_QUEUE_CAPACITY, sizeof(*client->observer_queue));
+            if (client->observer_queue == NULL) {
+                send_status(client->fd, message->header, KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
+                return;
+            }
+            client->observer_subscriptions |= subscription_bit;
+        } else {
+            client->observer_subscriptions &= ~subscription_bit;
+        }
+        update_observer_callbacks(state);
+        uint8_t response[KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE];
+        uint32_t active = 0u;
+        if ((client->observer_subscriptions & KSI_OPERATION_HOOK_KEYBOARD) != 0u)
+            active |= KSI_OPERATION_OBSERVE_KEYBOARD;
+        if ((client->observer_subscriptions & KSI_OPERATION_HOOK_MOUSE) != 0u)
+            active |= KSI_OPERATION_OBSERVE_MOUSE;
+        size_t size = ksi_protocol_encode_u32_result(response, active);
+        (void)ipc_send_locked(client->fd, message->header->opcode,
+            KSI_FRAME_FLAG_RESPONSE, message->header->request_id, response, size);
         return;
     }
 
@@ -510,6 +484,41 @@ static void handle_hook_subscription(
     (void)ipc_send_locked(client->fd, message->header->opcode,
         KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
         response, response_size);
+}
+
+static void handle_devices_list(ksi_daemon_state *state, ksi_client *client,
+    const ksi_binary_message_view *message)
+{
+    if (!input_owner_matches_uid(state, client->uid)
+        || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
+        return;
+    }
+    if (message->payload_size != KSI_DEVICE_LIST_REQUEST_SIZE
+        || ksi_wire_read_u32(message->payload + 4u) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    uint64_t generation = ksi_linux_devices_generation();
+    uint64_t expected = ksi_wire_read_u64(message->payload + 8u);
+    if (expected != 0u && expected != generation) {
+        send_status(client->fd, message->header, KSI_STATUS_BUSY, KSI_DETAIL_NONE);
+        return;
+    }
+    ksi_device_info entries[KSI_DEVICE_LIST_PAGE_SIZE];
+    uint32_t next = 0u;
+    size_t count = ksi_linux_devices_list(ksi_wire_read_u32(message->payload),
+        entries, KSI_DEVICE_LIST_PAGE_SIZE, &next);
+    uint8_t response[KSI_DEVICE_LIST_PREFIX_SIZE + KSI_DEVICE_LIST_PAGE_SIZE * KSI_DEVICE_INFO_WIRE_SIZE];
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    ksi_wire_write_u64(response + 8u, generation);
+    ksi_wire_write_u32(response + 16u, next);
+    ksi_wire_write_u32(response + 20u, (uint32_t)count);
+    for (size_t i = 0u; i < count; i++)
+        ksi_device_encode(response + KSI_DEVICE_LIST_PREFIX_SIZE + i * KSI_DEVICE_INFO_WIRE_SIZE, &entries[i]);
+    (void)ipc_send_locked(client->fd, KSI_OPCODE_DEVICES_LIST,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, KSI_DEVICE_LIST_PREFIX_SIZE + count * KSI_DEVICE_INFO_WIRE_SIZE);
 }
 
 static void handle_set_block_input(
@@ -989,6 +998,9 @@ static bool handle_binary_message(
         case KSI_OPCODE_GET_MODIFIER_STATE:
             handle_get_modifier_state(state, client, message);
             return true;
+        case KSI_OPCODE_DEVICES_LIST:
+            handle_devices_list(state, client, message);
+            return true;
         case KSI_OPCODE_PERMISSIONS_LIST:
             handle_list_permissions(state, client, message);
             return true;
@@ -1443,6 +1455,26 @@ static void process_daemon_command(ksi_daemon_state *state, ksi_daemon_command *
     switch (command->type) {
         case KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED:
             process_client_identified(state, command);
+            break;
+
+        case KSI_DAEMON_COMMAND_CLIENT_REVALIDATED: {
+            ssize_t index = find_client_index_by_connection(state,
+                command->client_fd, command->connection_id);
+            if (index >= 0) {
+                ksi_client_identified_result *result = command->data.identified.result;
+                if (result == NULL || !result->has_identity) {
+                    remove_client(state, (nfds_t)index);
+                } else {
+                    state->clients[index].identity = result->identity;
+                    state->clients[index].identity_checked_ms = monotonic_ms();
+                    state->clients[index].revalidation_pending = false;
+                }
+            }
+            break;
+        }
+
+        case KSI_DAEMON_COMMAND_PERMISSION_DONE:
+            process_permission_done(state, command->data.permission);
             break;
 
         case KSI_DAEMON_COMMAND_CLIENT_PROMPT_DONE:

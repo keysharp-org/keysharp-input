@@ -3,6 +3,7 @@
 #include "internal/ipc.h"
 
 #include <limits.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -199,6 +200,35 @@ int hook_send_ref_send(
 
     pthread_mutex_unlock(&ref->send_mutex);
     return result;
+}
+
+int hook_send_ref_try_send(ksi_hook_send_ref *ref, uint16_t opcode,
+    uint16_t flags, uint64_t request_id, const void *payload, size_t payload_size)
+{
+    uint8_t header[KSI_FRAME_HEADER_SIZE];
+    ksi_message_header decoded = {
+        .major = KSI_PROTOCOL_MAJOR, .minor = KSI_PROTOCOL_MINOR,
+        .opcode = opcode, .flags = flags, .request_id = request_id,
+        .payload_length = (uint32_t)payload_size,
+    };
+    if (!hook_send_ref_is_valid(ref) || payload_size > KSI_MAX_PAYLOAD_SIZE) return -1;
+    if (pthread_mutex_trylock(&ref->send_mutex) != 0) return 0;
+    ksi_frame_header_encode(header, &decoded);
+    struct iovec parts[2] = {
+        { .iov_base = header, .iov_len = sizeof(header) },
+        { .iov_base = (void *)payload, .iov_len = payload_size },
+    };
+    struct msghdr message = { .msg_iov = parts, .msg_iovlen = 2u };
+    ssize_t written = -1;
+    if (hook_send_ref_is_valid(ref))
+        written = sendmsg(ref->fd, &message, MSG_DONTWAIT | MSG_NOSIGNAL);
+    int saved = errno;
+    pthread_mutex_unlock(&ref->send_mutex);
+    if (written == (ssize_t)(sizeof(header) + payload_size)) return 1;
+    if (written < 0 && (saved == EAGAIN || saved == EWOULDBLOCK || saved == EINTR)) return 0;
+    /* A partial frame cannot be dropped without corrupting the byte stream. */
+    hook_send_ref_invalidate(ref);
+    return -1;
 }
 
 static void append_waiter(

@@ -140,6 +140,8 @@ jobs:
             "$root/include/keysharp_input/client.h"
           install -D -m 0644 "$stage/usr/local/include/keysharp_input/constants.h" \
             "$root/include/keysharp_input/constants.h"
+          install -D -m 0644 "$stage/usr/local/include/keysharp_input/devices.h" \
+            "$root/include/keysharp_input/devices.h"
           install -D -m 0644 "$stage/usr/local/lib/pkgconfig/keysharp-input.pc" \
             "$root/pkgconfig/keysharp-input.pc"
           install -d -m 0755 "$root/cmake"
@@ -153,7 +155,9 @@ jobs:
             "$root/udev/70-keysharp-input-uaccess.rules"
           install -d -m 0755 "$root/docs"
           install -m 0644 docs/*.md "$root/docs/"
+          cp -R examples "$root/examples"
           install -m 0755 packaging/install-release.sh "$root/install.sh"
+          install -m 0755 packaging/check-runtime.sh "$root/check-runtime.sh"
           install -m 0755 uninstall.sh "$root/uninstall.sh"
           install -m 0644 LICENSE README.md PROVENANCE.md "$root/"
           mkdir -p dist
@@ -177,8 +181,9 @@ jobs:
           package=$(find . -maxdepth 2 -type f -name '*.deb' -print -quit)
           test -n "$package"
           mv "$package" "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb"
+          abi_minor=$(awk '/^#define KSI_CLIENT_ABI_MINOR / { gsub(/u/, "", $3); print $3 }' include/keysharp_input/client.h)
           test "$(dpkg-deb -f "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb" Provides)" = \
-            "keysharp-input-client-abi-0"
+            "keysharp-input-client-abi-0 (= 0.${abi_minor})"
 
       - name: Attest release binaries
         uses: actions/attest@v4

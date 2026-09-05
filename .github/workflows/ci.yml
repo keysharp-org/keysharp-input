@@ -84,4 +84,4 @@ jobs:
         with:
           submodules: recursive
       - name: Check lifecycle scripts
-        run: shellcheck install.sh uninstall.sh packaging/install-release.sh packaging/debian/*
+        run: shellcheck install.sh uninstall.sh packaging/install-release.sh packaging/check-runtime.sh packaging/debian/*
