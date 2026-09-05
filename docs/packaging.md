@@ -1,12 +1,12 @@
 # Packaging
 
-The 0.2.0 package contains one executable, one shared client library, its public
+The 0.3.0 package contains one executable, one shared client library, its public
 headers, and two systemd units:
 
 ```text
 /usr/bin/keysharp-input
-/usr/lib/libkeysharp-input.so.0.2.0
-/usr/lib/libkeysharp-input.so.0 -> libkeysharp-input.so.0.2.0
+/usr/lib/libkeysharp-input.so.0.3.0
+/usr/lib/libkeysharp-input.so.0 -> libkeysharp-input.so.0.3.0
 /usr/lib/libkeysharp-input.so -> libkeysharp-input.so.0
 /usr/include/keysharp_input/client.h
 /usr/include/keysharp_input/constants.h

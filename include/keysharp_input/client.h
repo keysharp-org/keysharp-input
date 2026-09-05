@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define KSI_CLIENT_ABI_MAJOR 0u
-#define KSI_CLIENT_ABI_MINOR 2u
+#define KSI_CLIENT_ABI_MINOR 3u
 #define KSI_DEFAULT_SOCKET_PATH "/run/keysharp-input/keysharp-input.sock"
 #define KSI_SOCKET_ENV "KEYSHARP_INPUT_SOCKET"
 
@@ -410,6 +410,19 @@ KSI_API void ksi_raw_input_event_init(ksi_raw_input_event *event);
 KSI_API void ksi_observer_message_init(ksi_observer_message *message);
 KSI_API ksi_status ksi_devices_list(ksi_connection *connection,
     ksi_device_visitor visitor, void *context, uint64_t *generation, ksi_error *error);
+/* Gamepads carry no text input, so discovering them and reading their sticks
+ * and buttons needs no scope, as with pointer position and idle time. The
+ * entries omit the device node path and the physical and unique identifiers;
+ * ksi_devices_list reports those under Input Monitoring. Pass the generation
+ * from the listing to ksi_get_gamepad_state to read a device the listing
+ * described, or 0 to accept whatever the current device set is: a hotplug in
+ * between returns BUSY, and an id that is no longer a gamepad NOT_FOUND. */
+KSI_API void ksi_gamepad_axis_state_init(ksi_gamepad_axis_state *axis);
+KSI_API void ksi_gamepad_state_init(ksi_gamepad_state *state);
+KSI_API ksi_status ksi_gamepads_list(ksi_connection *connection,
+    ksi_device_visitor visitor, void *context, uint64_t *generation, ksi_error *error);
+KSI_API ksi_status ksi_get_gamepad_state(ksi_connection *connection,
+    uint32_t device_id, uint64_t generation, ksi_gamepad_state *state, ksi_error *error);
 /* Subscribe with ksi_hook_subscribe on KSI_ROLE_OBSERVER_STREAM. Observation
  * never grabs devices and needs no reply. Overflow requires a state/device refresh. */
 KSI_API ksi_status ksi_observer_next(ksi_connection *connection,

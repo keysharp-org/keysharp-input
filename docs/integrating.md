@@ -101,6 +101,35 @@ virtual output devices are excluded.
 
 See [the complete observer example](../examples/observe.c).
 
+## Gamepads
+
+Gamepads report no text and cannot be typed on, so discovering them and reading
+their sticks and buttons needs no scope, as with pointer position and idle time.
+
+`ksi_gamepads_list(Connection, Visitor, Context, Generation, Error)` pages the
+same way as `ksi_devices_list`, ordered by event node so that addressing "the
+second gamepad" keeps meaning the same device, and reports only devices with
+`KSI_DEVICE_GAMEPAD`: an absolute stick plus at least one code from the joystick
+and gamepad button range, which is how the kernel's joydev driver binds one.
+Because the listing is ungated it omits the device node path and the physical
+and unique identifiers; `ksi_devices_list` reports those under Input Monitoring.
+`button_codes[0..button_count)` lists the device's buttons in the order joydev
+numbers them, so a consumer's button index matches the kernel's own joystick
+interface, and `axes` carries the ranges as for any other device.
+
+`ksi_get_gamepad_state(Connection, DeviceId, Generation, State, Error)` reads
+one device. Pass the generation from the listing to read the device the listing
+described: a hotplug in between returns `BUSY`, and an id that is not a
+currently tracked gamepad returns `NOT_FOUND`. Pass 0 to accept whatever the
+current device set is. `state.buttons` is a bitmap over that device's
+`button_codes`, bit i for `button_codes[i]`, and `state.axes` reports each axis
+value in the order the listing gave, in device units to scale against the
+listed minimum and maximum. Values come from the kernel's current position
+rather than a replayed event stream, so a consumer that starts mid-press still
+sees the button held.
+
+See [the complete gamepad example](../examples/read-gamepad.c).
+
 ## Linux input semantics
 
 - Keyboard events provide Windows-style virtual keys plus raw evdev scan codes.
@@ -146,6 +175,7 @@ This is a Linux backend building block, not a complete SharpHook ABI replacement
 | Observe without suppression | Observer stream; no decisions, grabs, or uinput creation |
 | Mouse move and wheel | Preserve relative/absolute distinction and signed 1/120-detent wheel units |
 | Device discovery and hotplug | Device enumeration, generation, add/remove/change notifications and axis ranges |
+| Gamepads and joysticks | Ungated gamepad listing and polled stick/button state, in joydev button order |
 | Event timestamps | Hook `time_ms` is the underlying device event timestamp; raw events explicitly flag CLOCK_MONOTONIC |
 | Injected events | Callback event flags/extra-info identify synthesis; passive observers exclude this broker's synthesis |
 | Typed text/layout | Obtain session keymap/group separately; translate locally, and distinguish key translation from IME-committed text |

@@ -2,6 +2,7 @@
 #include "../src/device_codec.h"
 
 #include <errno.h>
+#include <linux/input-event-codes.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -211,6 +212,27 @@ static void *observer_server(void *argument)
     ksi_device_encode(payload + KSI_DEVICE_LIST_PREFIX_SIZE, &device);
     if (!send_frame(fd, KSI_OPCODE_DEVICES_LIST, RESPONSE, id, payload,
             KSI_DEVICE_LIST_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE)) goto fail;
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_GAMEPADS_LIST || size != KSI_DEVICE_LIST_REQUEST_SIZE) goto fail;
+    ksi_device_info pad = { .struct_size = sizeof(pad), .device_id = 9u, .name = "Pad",
+        .capabilities = KSI_DEVICE_GAMEPAD, .axis_count = 1u,
+        .axes = {{ .struct_size = sizeof(ksi_device_axis_info), .code = ABS_X,
+            .minimum = -32768, .maximum = 32767 }},
+        .button_count = 2u, .button_codes = { BTN_SOUTH, BTN_EAST } };
+    memset(payload, 0, KSI_DEVICE_LIST_PREFIX_SIZE);
+    write_u64(payload + 8u, 2u); write_u32(payload + 20u, 1u);
+    ksi_device_encode(payload + KSI_DEVICE_LIST_PREFIX_SIZE, &pad);
+    if (!send_frame(fd, KSI_OPCODE_GAMEPADS_LIST, RESPONSE, id, payload,
+            KSI_DEVICE_LIST_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE)) goto fail;
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_GET_GAMEPAD_STATE || size != KSI_GAMEPAD_STATE_REQUEST_SIZE
+        || read_u32(payload) != 9u || read_u64(payload + 8u) != 2u) goto fail;
+    ksi_gamepad_state pad_state = { .struct_size = sizeof(pad_state), .device_id = 9u,
+        .device_generation = 2u, .button_count = 2u, .axis_count = 1u, .buttons = { 0x02u },
+        .axes = {{ .struct_size = sizeof(ksi_gamepad_axis_state), .code = ABS_X, .value = -300 }} };
+    memset(payload, 0, KSI_STATUS_PAYLOAD_SIZE);
+    size = KSI_STATUS_PAYLOAD_SIZE + ksi_gamepad_state_encode(payload + KSI_STATUS_PAYLOAD_SIZE, &pad_state);
+    if (!send_frame(fd, KSI_OPCODE_GET_GAMEPAD_STATE, RESPONSE, id, payload, size)) goto fail;
     memset(payload, 0, KSI_OBSERVER_PREFIX_SIZE);
     write_u32(payload, KSI_OBSERVER_DEVICE_REMOVED); write_u64(payload + 8u, 3u);
     ksi_device_encode(payload + KSI_OBSERVER_PREFIX_SIZE, &device);
@@ -240,6 +262,15 @@ static bool visit_device(const ksi_device_info *device, void *context)
     unsigned int *count = context;
     if (device->device_id == 7u && device->vendor == 0x1234u
         && strcmp(device->name, "Observed keyboard") == 0) (*count)++;
+    return true;
+}
+
+static bool visit_gamepad(const ksi_device_info *device, void *context)
+{
+    unsigned int *count = context;
+    if (device->device_id == 9u && (device->capabilities & KSI_DEVICE_GAMEPAD) != 0u
+        && device->button_count == 2u && device->button_codes[1] == BTN_EAST
+        && device->axes[0].minimum == -32768) (*count)++;
     return true;
 }
 
@@ -279,7 +310,11 @@ static int run_client_test(bool observer)
         ksi_observer_message observation;
         ksi_operations active = 0u;
         unsigned int device_count = 0u;
+        unsigned int gamepad_count = 0u;
+        uint64_t generation = 0u;
+        ksi_gamepad_state gamepad;
         ksi_observer_message_init(&observation);
+        ksi_gamepad_state_init(&gamepad);
         if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
             || ksi_hook_subscribe(connection, KSI_HOOK_KEYBOARD, &active, &error) != KSI_STATUS_OK
             || active != KSI_OPERATION_OBSERVE_KEYBOARD
@@ -288,6 +323,12 @@ static int run_client_test(bool observer)
             || observation.data.input.event.keyboard.device_id != 7u
             || ksi_devices_list(connection, visit_device, &device_count, NULL, &error) != KSI_STATUS_OK
             || device_count != 1u
+            || ksi_gamepads_list(connection, visit_gamepad, &gamepad_count, &generation, &error) != KSI_STATUS_OK
+            || gamepad_count != 1u || generation != 2u
+            || ksi_get_gamepad_state(connection, 9u, generation, &gamepad, &error) != KSI_STATUS_OK
+            || gamepad.button_count != 2u || gamepad.buttons[0] != 0x02u
+            || gamepad.axis_count != 1u || gamepad.axes[0].value != -300
+            || gamepad.axes[0].code != ABS_X
             || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
             || observation.kind != KSI_OBSERVER_DEVICE_REMOVED || observation.device_generation != 3u
             || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK

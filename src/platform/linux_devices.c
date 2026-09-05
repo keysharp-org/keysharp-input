@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -47,6 +48,7 @@ typedef struct ksi_linux_device_info {
     bool requires_compositor_processing;
     bool high_resolution_wheel;
     bool high_resolution_horizontal_wheel;
+    bool is_gamepad;
     uint16_t bustype;
     uint16_t vendor;
     uint16_t product;
@@ -217,6 +219,40 @@ static bool looks_like_mouse_buttons(const unsigned long *key_bits)
         || test_bit(key_bits, BTN_BACK);
 }
 
+static bool looks_like_gamepad(const unsigned long *key_bits, const unsigned long *abs_bits)
+{
+    if (!test_bit(abs_bits, ABS_X)) {
+        return false;
+    }
+
+    for (unsigned int code = BTN_JOYSTICK; code < BTN_DIGI; code++) {
+        if (ksi_linux_key_code_is_gamepad_identity(code) && test_bit(key_bits, (int)code)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* Report the buttons in the order joydev numbers them, so a consumer's button
+ * index matches what the kernel's own joystick interface would report. */
+static void collect_gamepad_buttons(const unsigned long *key_bits, ksi_device_info *public)
+{
+    public->button_count = 0u;
+
+    for (unsigned int code = BTN_JOYSTICK; code <= KEY_MAX; code++) {
+        if (test_bit(key_bits, (int)code) && public->button_count < KSI_DEVICE_BUTTON_CAPACITY) {
+            public->button_codes[public->button_count++] = (uint16_t)code;
+        }
+    }
+
+    for (unsigned int code = BTN_MISC; code < BTN_JOYSTICK; code++) {
+        if (test_bit(key_bits, (int)code) && public->button_count < KSI_DEVICE_BUTTON_CAPACITY) {
+            public->button_codes[public->button_count++] = (uint16_t)code;
+        }
+    }
+}
+
 static bool looks_like_compositor_processed_pointer(const unsigned long *key_bits)
 {
     return test_bit(key_bits, BTN_TOOL_FINGER)
@@ -335,6 +371,7 @@ static int read_device_info(const char *path, ksi_linux_device_info *info)
     info->has_keyboard_keys = info->has_keys && looks_like_keyboard(key_bits);
     info->has_mouse_buttons = info->has_keys && looks_like_mouse_buttons(key_bits);
     info->has_pointer_axes = looks_like_pointer_axes(rel_bits, abs_bits);
+    info->is_gamepad = info->has_keys && looks_like_gamepad(key_bits, abs_bits);
     info->requires_compositor_processing = info->has_absolute
         && looks_like_compositor_processed_pointer(key_bits);
     info->high_resolution_wheel = test_bit(rel_bits, REL_WHEEL_HI_RES);
@@ -363,6 +400,10 @@ static int read_device_info(const char *path, ksi_linux_device_info *info)
     if (info->has_relative) public->capabilities |= KSI_DEVICE_RELATIVE;
     if (info->has_absolute) public->capabilities |= KSI_DEVICE_ABSOLUTE;
     if (info->requires_compositor_processing) public->capabilities |= KSI_DEVICE_RAW_OBSERVATION;
+    if (info->is_gamepad) {
+        public->capabilities |= KSI_DEVICE_GAMEPAD;
+        collect_gamepad_buttons(key_bits, public);
+    }
     if (info->high_resolution_wheel) public->capabilities |= KSI_DEVICE_HIGH_RESOLUTION_WHEEL;
     if (info->high_resolution_horizontal_wheel) public->capabilities |= KSI_DEVICE_HIGH_RESOLUTION_HORIZONTAL_WHEEL;
     if ((public->capabilities & KSI_DEVICE_MOUSE) != 0u && !info->requires_compositor_processing)
@@ -2106,18 +2147,125 @@ uint64_t ksi_linux_devices_generation(void)
     return device_generation;
 }
 
+static const ksi_linux_tracked_device *find_listed_device(size_t index)
+{
+    const ksi_linux_tracked_device *device = &tracked_devices[index];
+    return device->fd >= 0 && !device->injected_source ? device : NULL;
+}
+
 size_t ksi_linux_devices_list(uint32_t offset, ksi_device_info *entries,
     size_t capacity, uint32_t *next_offset)
 {
     size_t count = 0u;
     size_t index = offset;
     for (; index < tracked_device_count && count < capacity; index++) {
-        const ksi_linux_tracked_device *device = &tracked_devices[index];
-        if (device->fd >= 0 && !device->injected_source)
+        const ksi_linux_tracked_device *device = find_listed_device(index);
+        if (device != NULL)
             entries[count++] = device->public_info;
     }
     *next_offset = index < tracked_device_count ? (uint32_t)index : 0u;
     return count;
+}
+
+static long event_node_index(const char *path)
+{
+    const char *name = strrchr(path, '/');
+    name = name != NULL ? name + 1 : path;
+    if (!is_event_device_name(name)) return LONG_MAX;
+    char *end;
+    long index = strtol(name + strlen(KSI_EVENT_PREFIX), &end, 10);
+    return *end == '\0' && index >= 0 ? index : LONG_MAX;
+}
+
+/* Discovery walks the directory in filesystem order, which is neither sorted
+ * nor stable across restarts, so order gamepads by their event node instead: a
+ * consumer that addresses "the second gamepad" must keep meaning the same one. */
+static size_t collect_gamepads(size_t *ordered)
+{
+    size_t count = 0u;
+    for (size_t index = 0u; index < tracked_device_count; index++) {
+        const ksi_linux_tracked_device *device = find_listed_device(index);
+        if (device == NULL || (device->public_info.capabilities & KSI_DEVICE_GAMEPAD) == 0u)
+            continue;
+        long node = event_node_index(device->path);
+        size_t position = count++;
+        for (; position > 0u && event_node_index(tracked_devices[ordered[position - 1u]].path) > node;
+             position--)
+            ordered[position] = ordered[position - 1u];
+        ordered[position] = index;
+    }
+    return count;
+}
+
+size_t ksi_linux_gamepads_list(uint32_t offset, ksi_device_info *entries,
+    size_t capacity, uint32_t *next_offset)
+{
+    size_t ordered[KSI_MAX_TRACKED_DEVICES];
+    size_t total = collect_gamepads(ordered);
+    size_t count = 0u;
+    size_t index = offset;
+    for (; index < total && count < capacity; index++) {
+        /* This listing is ungated, so it carries only what a gamepad consumer
+         * needs. The node path and the physical and unique identifiers stay
+         * behind Input Monitoring in ksi_linux_devices_list. */
+        ksi_device_info *entry = &entries[count++];
+        *entry = tracked_devices[ordered[index]].public_info;
+        memset(entry->path, 0, sizeof(entry->path));
+        memset(entry->physical, 0, sizeof(entry->physical));
+        memset(entry->unique, 0, sizeof(entry->unique));
+    }
+    *next_offset = index < total ? (uint32_t)index : 0u;
+    return count;
+}
+
+bool ksi_linux_gamepad_state(uint32_t device_id, ksi_gamepad_state *state)
+{
+    unsigned long key_state[KSI_BIT_ARRAY_LENGTH(KEY_MAX)];
+
+    for (size_t index = 0u; index < tracked_device_count; index++) {
+        const ksi_linux_tracked_device *device = find_listed_device(index);
+
+        if (device == NULL || device->device_id != device_id
+            || (device->public_info.capabilities & KSI_DEVICE_GAMEPAD) == 0u) {
+            continue;
+        }
+
+        memset(state, 0, sizeof(*state));
+        memset(key_state, 0, sizeof(key_state));
+        state->struct_size = sizeof(*state);
+        state->device_id = device_id;
+        state->device_generation = device_generation;
+        state->button_count = device->public_info.button_count;
+
+        /* The kernel holds the current position of every axis and button, so
+         * one pair of ioctls answers a poll without replaying the event
+         * stream, and a client that starts mid-press still sees it held. */
+        if (ioctl(device->fd, EVIOCGKEY(sizeof(key_state)), key_state) >= 0) {
+            for (uint32_t i = 0u; i < state->button_count; i++) {
+                if (test_bit(key_state, (int)device->public_info.button_codes[i])) {
+                    state->buttons[i >> 3] |= (uint8_t)(1u << (i & 7u));
+                }
+            }
+        }
+
+        for (uint32_t i = 0u; i < device->public_info.axis_count; i++) {
+            struct input_absinfo abs;
+            uint32_t code = device->public_info.axes[i].code;
+
+            if (ioctl(device->fd, EVIOCGABS(code), &abs) != 0) {
+                continue;
+            }
+
+            ksi_gamepad_axis_state *axis = &state->axes[state->axis_count++];
+            axis->struct_size = sizeof(*axis);
+            axis->code = code;
+            axis->value = abs.value;
+        }
+
+        return true;
+    }
+
+    return false;
 }
 
 void ksi_linux_devices_set_physical_key_event_callback(

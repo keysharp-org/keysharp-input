@@ -30,6 +30,9 @@ void ksi_linux_devices_set_raw_observer_callback(ksi_raw_device_callback callbac
 uint64_t ksi_linux_devices_generation(void);
 size_t ksi_linux_devices_list(uint32_t offset, ksi_device_info *entries,
     size_t capacity, uint32_t *next_offset);
+size_t ksi_linux_gamepads_list(uint32_t offset, ksi_device_info *entries,
+    size_t capacity, uint32_t *next_offset);
+bool ksi_linux_gamepad_state(uint32_t device_id, ksi_gamepad_state *state);
 void ksi_linux_devices_set_physical_key_event_callback(
     ksi_physical_key_event_callback callback,
     void *context);

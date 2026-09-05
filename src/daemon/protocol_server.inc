@@ -486,14 +486,12 @@ static void handle_hook_subscription(
         response, response_size);
 }
 
-static void handle_devices_list(ksi_daemon_state *state, ksi_client *client,
-    const ksi_binary_message_view *message)
+typedef size_t (*ksi_device_page_reader)(uint32_t offset, ksi_device_info *entries,
+    size_t capacity, uint32_t *next_offset);
+
+static void send_device_page(ksi_client *client, const ksi_binary_message_view *message,
+    uint16_t opcode, ksi_device_page_reader read_page)
 {
-    if (!input_owner_matches_uid(state, client->uid)
-        || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
-        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
-        return;
-    }
     if (message->payload_size != KSI_DEVICE_LIST_REQUEST_SIZE
         || ksi_wire_read_u32(message->payload + 4u) != 0u) {
         send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE);
@@ -507,7 +505,7 @@ static void handle_devices_list(ksi_daemon_state *state, ksi_client *client,
     }
     ksi_device_info entries[KSI_DEVICE_LIST_PAGE_SIZE];
     uint32_t next = 0u;
-    size_t count = ksi_linux_devices_list(ksi_wire_read_u32(message->payload),
+    size_t count = read_page(ksi_wire_read_u32(message->payload),
         entries, KSI_DEVICE_LIST_PAGE_SIZE, &next);
     uint8_t response[KSI_DEVICE_LIST_PREFIX_SIZE + KSI_DEVICE_LIST_PAGE_SIZE * KSI_DEVICE_INFO_WIRE_SIZE];
     ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
@@ -516,9 +514,63 @@ static void handle_devices_list(ksi_daemon_state *state, ksi_client *client,
     ksi_wire_write_u32(response + 20u, (uint32_t)count);
     for (size_t i = 0u; i < count; i++)
         ksi_device_encode(response + KSI_DEVICE_LIST_PREFIX_SIZE + i * KSI_DEVICE_INFO_WIRE_SIZE, &entries[i]);
-    (void)ipc_send_locked(client->fd, KSI_OPCODE_DEVICES_LIST,
+    (void)ipc_send_locked(client->fd, opcode,
         KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
         response, KSI_DEVICE_LIST_PREFIX_SIZE + count * KSI_DEVICE_INFO_WIRE_SIZE);
+}
+
+static void handle_devices_list(ksi_daemon_state *state, ksi_client *client,
+    const ksi_binary_message_view *message)
+{
+    if (!input_owner_matches_uid(state, client->uid)
+        || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
+        return;
+    }
+    send_device_page(client, message, KSI_OPCODE_DEVICES_LIST, ksi_linux_devices_list);
+}
+
+/* Gamepads report no text and cannot be typed on, so discovery and state are
+ * ungated like pointer position and idle time. Both replies describe gamepads
+ * alone, and the listing drops the identifiers ksi_linux_gamepads_list scrubs. */
+static void handle_gamepads_list(ksi_daemon_state *state, ksi_client *client,
+    const ksi_binary_message_view *message)
+{
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
+        return;
+    }
+    send_device_page(client, message, KSI_OPCODE_GAMEPADS_LIST, ksi_linux_gamepads_list);
+}
+
+static void handle_get_gamepad_state(ksi_daemon_state *state, ksi_client *client,
+    const ksi_binary_message_view *message)
+{
+    if (!input_owner_matches_uid(state, client->uid)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
+        return;
+    }
+    if (message->payload_size != KSI_GAMEPAD_STATE_REQUEST_SIZE
+        || ksi_wire_read_u32(message->payload + 4u) != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    uint64_t expected = ksi_wire_read_u64(message->payload + 8u);
+    if (expected != 0u && expected != ksi_linux_devices_generation()) {
+        send_status(client->fd, message->header, KSI_STATUS_BUSY, KSI_DETAIL_NONE);
+        return;
+    }
+    ksi_gamepad_state gamepad;
+    if (!ksi_linux_gamepad_state(ksi_wire_read_u32(message->payload), &gamepad)) {
+        send_status(client->fd, message->header, KSI_STATUS_NOT_FOUND, KSI_DETAIL_NONE);
+        return;
+    }
+    uint8_t response[KSI_GAMEPAD_STATE_MAX_PAYLOAD_SIZE];
+    ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
+    size_t body = ksi_gamepad_state_encode(response + KSI_STATUS_PAYLOAD_SIZE, &gamepad);
+    (void)ipc_send_locked(client->fd, KSI_OPCODE_GET_GAMEPAD_STATE,
+        KSI_FRAME_FLAG_RESPONSE, message->header->request_id,
+        response, KSI_STATUS_PAYLOAD_SIZE + body);
 }
 
 static void handle_set_block_input(
@@ -1000,6 +1052,12 @@ static bool handle_binary_message(
             return true;
         case KSI_OPCODE_DEVICES_LIST:
             handle_devices_list(state, client, message);
+            return true;
+        case KSI_OPCODE_GAMEPADS_LIST:
+            handle_gamepads_list(state, client, message);
+            return true;
+        case KSI_OPCODE_GET_GAMEPAD_STATE:
+            handle_get_gamepad_state(state, client, message);
             return true;
         case KSI_OPCODE_PERMISSIONS_LIST:
             handle_list_permissions(state, client, message);

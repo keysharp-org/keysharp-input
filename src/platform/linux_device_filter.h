@@ -15,6 +15,14 @@ static inline bool ksi_linux_key_code_is_keyboard(unsigned int code)
         || (code >= KEY_ALS_TOGGLE && code < BTN_TRIGGER_HAPPY);
 }
 
+/* A gamepad is identified the way the kernel's joydev driver binds one: an
+ * absolute stick plus at least one code from the joystick and gamepad button
+ * range. Sticks alone would also match accelerometers and touchscreens. */
+static inline bool ksi_linux_key_code_is_gamepad_identity(unsigned int code)
+{
+    return code >= BTN_JOYSTICK && code < BTN_DIGI;
+}
+
 /* Map Linux's two common names for each auxiliary mouse button to the same
  * Windows-style five-button state mask used by hook events and state queries. */
 static inline uint32_t ksi_linux_pointer_button_mask(unsigned int code)

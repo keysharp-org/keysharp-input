@@ -8,6 +8,8 @@
 #define KSI_DEVICE_PHYSICAL_CAPACITY 256u
 #define KSI_DEVICE_UNIQUE_CAPACITY 128u
 #define KSI_DEVICE_AXIS_CAPACITY 64u
+#define KSI_DEVICE_BUTTON_CAPACITY 128u
+#define KSI_DEVICE_BUTTON_BITMAP_BYTES (KSI_DEVICE_BUTTON_CAPACITY / 8u)
 
 enum {
     KSI_OBSERVER_INPUT = 1u,
@@ -31,6 +33,7 @@ enum {
     KSI_DEVICE_CAN_INTERCEPT_KEYBOARD = 0x0100u,
     KSI_DEVICE_CAN_INTERCEPT_MOUSE = 0x0200u,
     KSI_DEVICE_RAW_OBSERVATION = 0x0400u,
+    KSI_DEVICE_GAMEPAD = 0x0800u,
 };
 
 typedef struct ksi_device_axis_info {
@@ -77,7 +80,35 @@ typedef struct ksi_device_info {
     uint32_t axis_count;
     uint32_t reserved1;
     ksi_device_axis_info axes[KSI_DEVICE_AXIS_CAPACITY];
+    /* Buttons a gamepad reports, in the order the kernel's joydev driver
+     * numbers them: the joystick and gamepad codes first, then the misc range.
+     * Devices without KSI_DEVICE_GAMEPAD report no buttons here; their pointer
+     * buttons are read through ksi_get_pointer_buttons. */
+    uint32_t button_count;
+    uint32_t reserved2;
+    uint16_t button_codes[KSI_DEVICE_BUTTON_CAPACITY];
     uint64_t reserved[4];
 } ksi_device_info;
+
+typedef struct ksi_gamepad_axis_state {
+    uint32_t struct_size;
+    uint32_t code;
+    int32_t value;
+    uint32_t reserved;
+} ksi_gamepad_axis_state;
+
+/* Live gamepad reading. Axes appear in the same order as the device's
+ * ksi_device_info axes, which carries their ranges; buttons is a bitmap over
+ * that device's button_codes, bit i for button_codes[i]. */
+typedef struct ksi_gamepad_state {
+    uint32_t struct_size;
+    uint32_t device_id;
+    uint64_t device_generation;
+    uint32_t button_count;
+    uint32_t axis_count;
+    uint8_t buttons[KSI_DEVICE_BUTTON_BITMAP_BYTES];
+    ksi_gamepad_axis_state axes[KSI_DEVICE_AXIS_CAPACITY];
+    uint64_t reserved[4];
+} ksi_gamepad_state;
 
 #endif

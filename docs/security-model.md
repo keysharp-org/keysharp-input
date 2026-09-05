@@ -43,6 +43,9 @@ not what is ready right now. These masks are intentionally separate.
 - Input Control permits synthesis, input blocking, and hook suppression.
 - A hook that can observe and suppress needs both.
 - Modifier, lock, pointer-position, and idle-time queries need neither.
+- Gamepad discovery and state need neither: a gamepad reports no text and
+  cannot be typed on. That listing carries no device node path and no physical
+  or unique identifier, which stay behind Input Monitoring.
 
 CHECK authorization only reads existing grants. REQUEST takes the shared
 per-application prompt lock and runs `pkcheck` for

@@ -74,6 +74,7 @@ lists and revokes only its two managed scopes.
 | `0x0800` | passive keyboard observation | Input Monitoring |
 | `0x1000` | passive mouse observation | Input Monitoring |
 | `0x2000` | device enumeration | Input Monitoring |
+| `0x4000` | gamepad enumeration and state | none |
 
 Operation availability and granted permission scopes are separate masks.
 
@@ -94,6 +95,8 @@ Operation availability and granted permission scopes are separate masks.
 | `0x1024` | GET_IDLE_TIME | empty | 16 bytes |
 | `0x1025` | GET_MODIFIER_STATE | empty | 12 bytes |
 | `0x1026` | DEVICES_LIST | `{u32 offset,u32 reserved=0,u64 generation}` | paged devices, below |
+| `0x1027` | GAMEPADS_LIST | same | same, gamepads only |
+| `0x1028` | GET_GAMEPAD_STATE | `{u32 device_id,u32 reserved=0,u64 generation}` | gamepad state, below |
 | `0x1030` | OBSERVER_EVENT | server EVENT | observation, below |
 
 On OBSERVER_STREAM, subscribe/unsubscribe operate on passive subscriptions and
@@ -103,13 +106,24 @@ or heartbeat lease. Observer event request IDs are zero.
 DEVICES_LIST succeeds with `{u64 generation,u32 next_offset,u32 count,device[count]}`
 after the status. Pages contain at most eight records. A zero request generation
 starts enumeration; a nonzero mismatched generation returns BUSY. A zero next
-offset terminates enumeration. Each device record is 2720 bytes:
+offset terminates enumeration. Each device record is 2984 bytes:
 `{u32 id,u32 capabilities,u16 bus,u16 vendor,u16 product,u16 version,u64 reserved=0,
 char name[256],char path[512],char physical[256],char unique[128],u32 axis_count,
-u32 reserved=0,axis[64]}`. Each axis is `{u32 code,i32 minimum,i32 maximum,
+u32 reserved=0,axis[64],u32 button_count,u32 reserved=0,u16 button_codes[128]}`.
+Each axis is `{u32 code,i32 minimum,i32 maximum,
 i32 fuzz,i32 flat,i32 resolution}`; populated axes are ordered by code and the
-remaining entries are zero. Strings are
+remaining entries are zero. Button codes are in joydev order: ascending, with at
+most one descent, after which every code stays below the first. Strings are
 NUL terminated and zero padded; the public ABI adds its size tag and reserves.
+
+GAMEPADS_LIST pages identically but reports only devices whose capabilities
+include gamepad, with the path and the physical and unique identifiers zeroed
+because it is ungated. GET_GAMEPAD_STATE succeeds with
+`{u32 device_id,u32 button_count,u64 generation,u32 axis_count,u32 reserved=0,
+u8 buttons[16],axis_value[axis_count]}` after the status, where each axis value
+is `{u32 code,i32 value}`. Bit i of `buttons` is the device's button i; bits at
+or above `button_count` are zero. A device id that is not a currently tracked
+gamepad returns NOT_FOUND, and a nonzero mismatched generation returns BUSY.
 
 OBSERVER_EVENT starts `{u32 kind,u32 reserved=0,u64 device_generation,u64 dropped_events}`.
 Kind INPUT=1 appends the ordinary hook-event payload, with no response expected.

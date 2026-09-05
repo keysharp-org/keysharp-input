@@ -28,7 +28,8 @@ Or link `KeysharpInput::client` after `find_package(KeysharpInput 0.2 CONFIG REQ
 Complete examples demonstrate [typing keys](examples/type-keys.c) and
 [watching and suppressing a key](examples/suppress-key.c). These examples interact
 with your desktop when run.
-The [passive observer](examples/observe.c) demonstrates monitoring without suppressing input.
+The [passive observer](examples/observe.c) demonstrates monitoring without suppressing input,
+and [reading a gamepad](examples/read-gamepad.c) needs no permission at all.
 
 Initialize each public options/result/error structure with its `ksi_*_init` function.
 Check each returned status, and use a connection from one thread at a time.

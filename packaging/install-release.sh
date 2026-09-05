@@ -5,9 +5,9 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=0.2.0
+expected_version=0.3.0
 expected_client_abi_major=0
-expected_client_abi_minor=2
+expected_client_abi_minor=3
 
 usage() {
     echo "Usage: sudo ./install.sh [--skip-if-compatible]"
@@ -387,7 +387,7 @@ installation_complete_for_channel() {
 archive_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 for required in \
     bin/keysharp-input \
-    lib/libkeysharp-input.so.0.2.0 \
+    lib/libkeysharp-input.so.0.3.0 \
     include/keysharp_input/client.h \
     include/keysharp_input/constants.h \
     include/keysharp_input/devices.h \
@@ -439,9 +439,9 @@ cleanup_install_temporary() {
     [ -z "$atomic_temporary" ] || rm -f -- "$atomic_temporary"
 }
 trap cleanup_install_temporary EXIT HUP INT TERM
-atomic_install_file "$archive_dir/lib/libkeysharp-input.so.0.2.0" \
-    /usr/local/lib/libkeysharp-input.so.0.2.0 0755
-atomic_install_symlink libkeysharp-input.so.0.2.0 \
+atomic_install_file "$archive_dir/lib/libkeysharp-input.so.0.3.0" \
+    /usr/local/lib/libkeysharp-input.so.0.3.0 0755
+atomic_install_symlink libkeysharp-input.so.0.3.0 \
     /usr/local/lib/libkeysharp-input.so.0
 atomic_install_symlink libkeysharp-input.so.0 \
     /usr/local/lib/libkeysharp-input.so

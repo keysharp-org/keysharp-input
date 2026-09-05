@@ -1467,7 +1467,17 @@ void ksi_observer_message_init(ksi_observer_message *message)
     init_sized(message, sizeof(*message));
 }
 
-ksi_status ksi_devices_list(ksi_connection *connection,
+void ksi_gamepad_axis_state_init(ksi_gamepad_axis_state *axis)
+{
+    init_sized(axis, sizeof(*axis));
+}
+
+void ksi_gamepad_state_init(ksi_gamepad_state *state)
+{
+    init_sized(state, sizeof(*state));
+}
+
+static ksi_status devices_list_paged(ksi_connection *connection, uint16_t opcode,
     ksi_device_visitor visitor, void *context, uint64_t *snapshot_generation, ksi_error *error)
 {
     if (snapshot_generation != NULL) *snapshot_generation = 0u;
@@ -1482,7 +1492,7 @@ ksi_status ksi_devices_list(ksi_connection *connection,
         ksi_wire_header response;
         write_u32(payload, offset);
         write_u64(payload + 8u, generation);
-        ksi_status status = request(connection, KSI_OPCODE_DEVICES_LIST,
+        ksi_status status = request(connection, opcode,
             payload, sizeof(payload), connection->default_timeout_ms, &response, error);
         if (status != KSI_STATUS_OK) return status;
         status = decode_status(connection->rx, response.payload_size, response.payload_size, error);
@@ -1508,6 +1518,45 @@ ksi_status ksi_devices_list(ksi_connection *connection,
         offset = next;
     } while (offset != 0u);
     if (snapshot_generation != NULL) *snapshot_generation = generation;
+    clear_error(error);
+    return KSI_STATUS_OK;
+}
+
+ksi_status ksi_devices_list(ksi_connection *connection,
+    ksi_device_visitor visitor, void *context, uint64_t *snapshot_generation, ksi_error *error)
+{
+    return devices_list_paged(connection, KSI_OPCODE_DEVICES_LIST,
+        visitor, context, snapshot_generation, error);
+}
+
+ksi_status ksi_gamepads_list(ksi_connection *connection,
+    ksi_device_visitor visitor, void *context, uint64_t *snapshot_generation, ksi_error *error)
+{
+    return devices_list_paged(connection, KSI_OPCODE_GAMEPADS_LIST,
+        visitor, context, snapshot_generation, error);
+}
+
+ksi_status ksi_get_gamepad_state(ksi_connection *connection, uint32_t device_id,
+    uint64_t generation, ksi_gamepad_state *state, ksi_error *error)
+{
+    if (connection == NULL || device_id == 0u || !sized_output_is_valid(state, sizeof(*state)))
+        return invalid_output(error, "gamepad state");
+    uint8_t payload[KSI_GAMEPAD_STATE_REQUEST_SIZE] = { 0 };
+    ksi_wire_header response;
+    write_u32(payload, device_id);
+    write_u64(payload + 8u, generation);
+    ksi_status status = request(connection, KSI_OPCODE_GET_GAMEPAD_STATE,
+        payload, sizeof(payload), connection->default_timeout_ms, &response, error);
+    if (status != KSI_STATUS_OK) return status;
+    status = decode_status(connection->rx, response.payload_size, response.payload_size, error);
+    if (status != KSI_STATUS_OK) return status;
+    if (response.flags != KSI_FRAME_FLAG_RESPONSE
+        || response.payload_size < KSI_GAMEPAD_STATE_PREFIX_SIZE
+        || !ksi_gamepad_state_decode(connection->rx + KSI_STATUS_PAYLOAD_SIZE,
+            response.payload_size - KSI_STATUS_PAYLOAD_SIZE, state)
+        || state->device_id != device_id
+        || (generation != 0u && state->device_generation != generation))
+        return invalid_result(error, "gamepad state");
     clear_error(error);
     return KSI_STATUS_OK;
 }

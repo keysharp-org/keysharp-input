@@ -77,16 +77,16 @@ wait "$upgrade_pid" 2>/dev/null || true
 upgrade_pid=
 
 mkdir -p "$temporary/live-lib"
-printf '%s\n' old > "$temporary/live-lib/libkeysharp-input.so.0.2.0"
+printf '%s\n' old > "$temporary/live-lib/libkeysharp-input.so.0.3.0"
 old_inode=$(stat -c '%i' \
-    "$temporary/live-lib/libkeysharp-input.so.0.2.0")
+    "$temporary/live-lib/libkeysharp-input.so.0.3.0")
 printf '%s\n' new > "$temporary/new-library"
 atomic_install_file "$temporary/new-library" \
-    "$temporary/live-lib/libkeysharp-input.so.0.2.0" 0755
+    "$temporary/live-lib/libkeysharp-input.so.0.3.0" 0755
 new_inode=$(stat -c '%i' \
-    "$temporary/live-lib/libkeysharp-input.so.0.2.0")
+    "$temporary/live-lib/libkeysharp-input.so.0.3.0")
 [ "$old_inode" != "$new_inode" ]
-atomic_install_symlink libkeysharp-input.so.0.2.0 \
+atomic_install_symlink libkeysharp-input.so.0.3.0 \
     "$temporary/live-lib/libkeysharp-input.so.0"
 atomic_install_symlink libkeysharp-input.so.0 \
     "$temporary/live-lib/libkeysharp-input.so"

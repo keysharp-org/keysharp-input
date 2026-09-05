@@ -218,6 +218,28 @@ static bool test_daemon_admission_and_operation_gates(void)
         KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_RESOURCE_EXHAUSTED,
         KSI_DETAIL_NONE, NULL));
 
+    /* Gamepad discovery and state are ungated. This client holds only Input
+     * Control, so the monitoring-gated device list is refused while the gamepad
+     * calls answer. No device is tracked in this harness, so the listing is
+     * empty and the state read reports the id as unknown. */
+    uint8_t device_list[KSI_DEVICE_LIST_REQUEST_SIZE] = { 0 };
+    uint8_t gamepad_request[KSI_GAMEPAD_STATE_REQUEST_SIZE] = { 0 };
+    CHECK(dispatch_request(&state, &client, KSI_OPCODE_DEVICES_LIST, 9u,
+        device_list, sizeof(device_list)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_LIST, 9u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
+
+    CHECK(dispatch_request(&state, &client, KSI_OPCODE_GAMEPADS_LIST, 10u,
+        device_list, sizeof(device_list)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_GAMEPADS_LIST, 10u,
+        KSI_DEVICE_LIST_PREFIX_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+
+    ksi_wire_write_u32(gamepad_request, 1u);
+    CHECK(dispatch_request(&state, &client, KSI_OPCODE_GET_GAMEPAD_STATE, 11u,
+        gamepad_request, sizeof(gamepad_request)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_GET_GAMEPAD_STATE, 11u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_NOT_FOUND, KSI_DETAIL_NONE, NULL));
+
     hook_send_ref_invalidate(client.hook_send_ref);
     hook_send_ref_release(client.hook_send_ref);
     close(sockets[1]);
