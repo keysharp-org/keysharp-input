@@ -36,7 +36,7 @@ file(READ "${SOURCE_DIR}/packaging/install-release.sh" installer)
 foreach(required
     "expected_version=0.2.0"
     "expected_client_abi_major=0"
-    "expected_client_abi_minor=1"
+    "expected_client_abi_minor=2"
     "bin/keysharp-input"
     "lib/libkeysharp-input.so.0.2.0"
     "include/keysharp_input/client.h"
