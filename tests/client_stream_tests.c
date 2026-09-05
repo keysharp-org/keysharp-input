@@ -1,6 +1,7 @@
 #include "keysharp_input/client.h"
 #include "device_codec.h"
 
+#undef NDEBUG
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
