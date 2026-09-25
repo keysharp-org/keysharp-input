@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keysharp-input
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "Standalone privileged Linux input broker"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-input"
     LANGUAGES C)
@@ -231,15 +231,6 @@ endif()
 install(FILES README.md LICENSE PROVENANCE.md
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input
     PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
-install(DIRECTORY examples/
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input/examples)
-install(DIRECTORY docs/
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input/docs
-    FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
-    DIRECTORY_PERMISSIONS
-        OWNER_READ OWNER_WRITE OWNER_EXECUTE
-        GROUP_READ GROUP_EXECUTE
-        WORLD_READ WORLD_EXECUTE)
 if(KEYSHARP_INPUT_NORMALIZED_PREFIX STREQUAL "/usr/local")
     install(PROGRAMS uninstall.sh
         DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-input)

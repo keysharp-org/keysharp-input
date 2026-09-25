@@ -37,6 +37,9 @@ cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DKEYSHARP_INPUT_SETUP_ON_INSTALL=ON
 cmake --build "$build_dir" --parallel
+# Only README, license and uninstaller are installed as docs, so directories an
+# older install left beside them are removed.
+rm -rf -- "$prefix/share/doc/keysharp-input/docs" "$prefix/share/doc/keysharp-input/examples"
 cmake --install "$build_dir"
 
 uninstaller=$prefix/share/doc/keysharp-input/uninstall.sh

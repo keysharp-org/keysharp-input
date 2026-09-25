@@ -59,24 +59,13 @@ rm -f -- \
     /etc/systemd/system/keysharp-input.socket \
     /usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf \
     /usr/share/polkit-1/actions/org.keysharp.input.policy \
-    /etc/udev/rules.d/70-keysharp-input-uaccess.rules \
-    /usr/local/share/doc/keysharp-input/LICENSE \
-    /usr/local/share/doc/keysharp-input/README.md \
-    /usr/local/share/doc/keysharp-input/PROVENANCE.md \
-    /usr/local/share/doc/keysharp-input/docs/app-identity.md \
-    /usr/local/share/doc/keysharp-input/docs/integrating.md \
-    /usr/local/share/doc/keysharp-input/docs/packaging.md \
-    /usr/local/share/doc/keysharp-input/docs/permission-store.md \
-    /usr/local/share/doc/keysharp-input/docs/physical-live-tests.md \
-    /usr/local/share/doc/keysharp-input/docs/protocol.md \
-    /usr/local/share/doc/keysharp-input/docs/security-model.md \
-    /usr/local/share/doc/keysharp-input/uninstall.sh
+    /etc/udev/rules.d/70-keysharp-input-uaccess.rules
 [ -z "$library_payload" ] || rm -f -- "$library_payload"
+# The directory is this package's alone, so what an older install left there goes too.
+rm -rf -- /usr/local/share/doc/keysharp-input
 rmdir --ignore-fail-on-non-empty \
     /usr/local/lib/cmake/KeysharpInput \
-    /usr/local/include/keysharp_input \
-    /usr/local/share/doc/keysharp-input/docs \
-    /usr/local/share/doc/keysharp-input 2>/dev/null || true
+    /usr/local/include/keysharp_input 2>/dev/null || true
 if command -v ldconfig >/dev/null 2>&1; then
     ldconfig
 fi
