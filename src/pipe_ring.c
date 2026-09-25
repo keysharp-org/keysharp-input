@@ -98,6 +98,11 @@ void ksi_pipe_ring_close(ksi_pipe_ring *ring)
 
 bool ksi_pipe_ring_push(ksi_pipe_ring *ring, const void *item)
 {
+    return ksi_pipe_ring_push_reserved(ring, item, 0u);
+}
+
+bool ksi_pipe_ring_push_reserved(ksi_pipe_ring *ring, const void *item, size_t reserve)
+{
     ksi_pipe_ring_implementation *implementation;
     bool pushed = false;
 
@@ -108,7 +113,7 @@ bool ksi_pipe_ring_push(ksi_pipe_ring *ring, const void *item)
     implementation = ring->implementation;
     pthread_mutex_lock(&implementation->mutex);
 
-    if (implementation->count < implementation->capacity) {
+    if (implementation->count + reserve < implementation->capacity) {
         size_t tail = (implementation->head + implementation->count) % implementation->capacity;
         memcpy(
             implementation->buffer + tail * implementation->element_size,

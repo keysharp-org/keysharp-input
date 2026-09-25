@@ -39,17 +39,20 @@ keysharp-input probe
 ```
 
 `info` reports the local library version and ABI without connecting to the service.
-Run `probe` as your graphical user to check the service connection. The service may
-be inactive until its socket receives a connection. To repair disabled units:
+Run `probe` as your graphical user to check the service connection. The installer
+keeps the resident service enabled and active so it can register input devices
+before a client connects. To repair disabled units:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now keysharp-input.socket
+sudo systemctl enable --now keysharp-input.service
 ```
 
 For missing libraries, policy files or device rules, rerun the installer from the
-same channel, or reinstall the package. Do not layer a tar installation over a
-package. Inspect `journalctl -u keysharp-input.service` for device or authorization
+same channel, or reinstall the package. The source and archive installers do not
+overwrite an edited `/etc/udev/rules.d/70-keysharp-input-uaccess.rules`; remove
+it and rerun the installer to restore the shipped rule. Do not layer a tar
+installation over a package. Inspect `journalctl -u keysharp-input.service` for device or authorization
 failures. Holding **Backspace+Escape+Enter** releases grabs, hooks and input blocking.
 
 ## Upgrade and remove

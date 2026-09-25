@@ -60,7 +60,7 @@ in {
         ];
         UMask = "0077";
         DevicePolicy = "closed";
-        DeviceAllow = [ "char-input r" "/dev/uinput rw" ];
+        DeviceAllow = [ "char-input rw" "/dev/uinput rw" ];
       };
     };
   };

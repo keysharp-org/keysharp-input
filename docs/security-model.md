@@ -2,7 +2,18 @@
 
 The root-owned service is the only process that opens physical evdev devices or
 the uinput output device. Client users do not need membership in the `input`
-group.
+group. The service sandbox allows read and write access to input character
+devices: the service reads physical input and its own virtual devices, and writes
+only keyboard LED state to them: it relays what the desktop sets on the generic
+keyboard device to the keyboards it has grabbed, and after releasing or probing
+a grab it restores every device's LEDs, which the kernel console handler resets
+at that point.
+Uinput creates the forwarding and generic synthesis devices. No Keysharp device
+receives a session ACL; the desktop opens them through logind, as it does
+physical devices. An ACL would let any process in the session read their input
+without Input Monitoring, inject input without Input Control, or grab them from
+the service. The installed udev rule only gives forwarding devices their
+source's bus metadata for hardware database lookups.
 
 The system socket is world-connectable so the active desktop user can reach it.
 The service authenticates each peer with `SO_PEERCRED`, admits only the active

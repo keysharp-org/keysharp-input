@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define KSI_CLIENT_ABI_MAJOR 0u
-#define KSI_CLIENT_ABI_MINOR 3u
+#define KSI_CLIENT_ABI_MINOR 4u
 #define KSI_DEFAULT_SOCKET_PATH "/run/keysharp-input/keysharp-input.sock"
 #define KSI_SOCKET_ENV "KEYSHARP_INPUT_SOCKET"
 
@@ -374,6 +374,14 @@ KSI_API ksi_status ksi_get_pointer_position(
     ksi_error *error);
 KSI_API ksi_status ksi_get_key_state(
     ksi_connection *connection,
+    ksi_key_state *state,
+    ksi_error *error);
+/* device_id comes from the device list or a hook event (synthesis carries 0,
+ * the seat); an unknown ID returns NOT_FOUND and a pre-0.4 service INVALID_REQUEST.
+ * The key bitmaps hold every EV_KEY code of that device; modifiers and locks are the seat's. */
+KSI_API ksi_status ksi_get_device_key_state(
+    ksi_connection *connection,
+    uint32_t device_id,
     ksi_key_state *state,
     ksi_error *error);
 KSI_API ksi_status ksi_get_pointer_buttons(

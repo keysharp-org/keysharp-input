@@ -29,6 +29,7 @@ Complete examples demonstrate [typing keys](examples/type-keys.c) and
 [watching and suppressing a key](examples/suppress-key.c). These examples interact
 with your desktop when run.
 The [passive observer](examples/observe.c) demonstrates monitoring without suppressing input,
+[reading key state](examples/read-key-state.c) shows the seat and one device,
 and [reading a gamepad](examples/read-gamepad.c) needs no permission at all.
 
 Initialize each public options/result/error structure with its `ksi_*_init` function.

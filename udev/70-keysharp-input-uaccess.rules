@@ -1,8 +1,11 @@
-# Grant the active session access only to the broker's virtual devices.
+# No Keysharp device gets a session ACL: the desktop opens the broker's devices
+# through logind, as it does physical ones. Forwarding clones carry their
+# source's bus metadata so 70-mouse.rules finds its hwdb entry; systemd already
+# derives Bluetooth from the bus type.
 ACTION!="add|change", GOTO="keysharp_uaccess_end"
 SUBSYSTEM!="input", GOTO="keysharp_uaccess_end"
 
-ATTRS{name}=="Keysharp Virtual Input", TAG+="uaccess"
-ATTRS{name}=="Keysharp Virtual Pointer", TAG+="uaccess"
+ATTRS{phys}=="keysharp-input/forward/*", ATTRS{id/bustype}=="0003", ENV{ID_BUS}="usb"
+ATTRS{phys}=="keysharp-input/forward/*", ATTRS{id/bustype}=="0011", ENV{ID_INPUT_MOUSE}=="1", IMPORT{builtin}="hwdb 'mouse:ps2::name:$attr{name}:'"
 
 LABEL="keysharp_uaccess_end"

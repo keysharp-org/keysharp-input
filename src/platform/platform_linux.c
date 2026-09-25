@@ -2,6 +2,7 @@
 #include "protocol_internal.h"
 
 #include "internal/linux_devices.h"
+#include "internal/linux_forward.h"
 #include "internal/linux_synth.h"
 
 #include <stdbool.h>
@@ -26,15 +27,13 @@ static void linux_prepare_scopes(uint32_t requested_scopes)
         return;
     }
 
-    /* The idle-only service owns no uinput devices. Create them only after an
-     * identified client asks for privileged input functionality, then rescan
-     * synchronously so our devices are tagged before any grab can begin. No
-     * synthesis action can be queued yet because no such capability has been
-     * granted. */
+    /* The idle service owns no uinput devices until an identified client asks for
+     * privileged input; the synchronous rescan then tags ours and registers every
+     * source before any grab. Nothing can be queued yet, as nothing is granted. */
     (void)ksi_linux_synth_start();
 
     if (ksi_linux_synth_is_available()) {
-        ksi_linux_devices_rescan();
+        ksi_linux_devices_enable_forwarding();
     }
 }
 
@@ -80,6 +79,7 @@ static void linux_stop(void)
 {
     ksi_linux_devices_stop();
     ksi_linux_synth_stop();
+    ksi_linux_forward_collect(true);
     puts("linux input backend stopped");
 }
 
@@ -104,71 +104,21 @@ static bool linux_peek_oldest_pending_input(int *out_fd, uint64_t *out_time_ns)
     return ksi_linux_devices_peek_oldest_pending_event(out_fd, out_time_ns);
 }
 
-static bool linux_input_to_hook_event(
-    const ksi_input *input,
-    uint32_t *hook_type,
-    ksi_hook_event_payload *event,
-    size_t *event_size)
-{
-    return ksi_linux_synth_input_to_hook_event(input, hook_type, event, event_size);
-}
-
-static int linux_send_input(const ksi_input *inputs, size_t count, uint32_t flags)
-{
-    return ksi_linux_synth_send_input(inputs, count, flags);
-}
-
-static int linux_replay_hook_event(uint32_t hook_type, const ksi_hook_event_payload *event)
-{
-    return ksi_linux_synth_replay_hook_event(hook_type, event);
-}
-
 static int linux_set_grab_hook_mask(uint32_t hook_mask)
 {
-    /* Releasing keys that were replayed "down" when the keyboard is ungrabbed is no
-     * longer done here: it now runs on the output sequencer thread via a
-     * KSI_OUTPUT_ACTION_RELEASE_ALL action enqueued by update_grab_state when the
-     * keyboard grab is dropped. That keeps release serialized with replay/synth (no
-     * race) and off this (daemon-main-thread) call path (no stall). */
     return ksi_linux_devices_set_grab_hook_mask(hook_mask);
 }
 
-static void linux_release_synthetic_keys(void)
-{
-    ksi_linux_synth_release_all();
-}
-
-/* Main-thread poll (see ksi_linux_synth_needs_recovery). Recovery itself is NOT
- * performed here -- it runs on the output sequencer thread via recreate_synth --
- * so this only reports whether the daemon should enqueue that action. */
-static bool linux_synth_needs_recovery(void)
-{
-    return ksi_linux_synth_needs_recovery();
-}
-
-/* Output-sequencer-thread callback (see recreate_synth in the backend vtable). */
-static void linux_recreate_synth(void)
-{
-    ksi_linux_synth_recreate();
-}
-
+/* Synthetic-device recovery is queued to the output sequencer instead, since
+ * recreating the devices here would race its writes. */
 static void linux_periodic_maintenance(void)
 {
-    /* Synth-device recovery is deliberately NOT driven from here anymore: doing
-     * the stop()+start() on this (main) thread raced the output sequencer. It is
-     * now requested via linux_synth_needs_recovery()/recreate_synth so the work
-     * happens on the sequencer thread. */
     ksi_linux_devices_retry_incomplete_grabs();
 }
 
 static int linux_set_block_input_mask(uint32_t block_mask)
 {
     return ksi_linux_devices_set_block_input_mask(block_mask);
-}
-
-static void linux_set_hook_event_callback(ksi_hook_event_callback callback, void *context)
-{
-    ksi_linux_devices_set_hook_event_callback(callback, context);
 }
 
 static const ksi_platform_backend linux_backend = {
@@ -182,15 +132,8 @@ static const ksi_platform_backend linux_backend = {
     .process_fd = linux_process_fd,
     .get_idle_time = linux_get_idle_time,
     .peek_oldest_pending_input = linux_peek_oldest_pending_input,
-    .input_to_hook_event = linux_input_to_hook_event,
-    .send_input = linux_send_input,
-    .replay_hook_event = linux_replay_hook_event,
     .set_grab_hook_mask = linux_set_grab_hook_mask,
     .set_block_input_mask = linux_set_block_input_mask,
-    .set_hook_event_callback = linux_set_hook_event_callback,
-    .release_synthetic_keys = linux_release_synthetic_keys,
-    .synth_needs_recovery = linux_synth_needs_recovery,
-    .recreate_synth = linux_recreate_synth,
     .periodic_maintenance = linux_periodic_maintenance,
 };
 

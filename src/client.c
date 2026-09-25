@@ -1884,13 +1884,26 @@ ksi_status ksi_get_key_state(
     ksi_key_state *state,
     ksi_error *error)
 {
+    return ksi_get_device_key_state(connection, 0u, state, error);
+}
+
+ksi_status ksi_get_device_key_state(
+    ksi_connection *connection,
+    uint32_t device_id,
+    ksi_key_state *state,
+    ksi_error *error)
+{
     ksi_status status;
+    ksi_wire_header response;
+    uint8_t payload[KSI_KEY_STATE_REQUEST_SIZE];
 
     if (!sized_output_is_valid(state, sizeof(*state))) {
         return invalid_output(error, "key-state");
     }
-    status = query(connection, KSI_OPCODE_GET_KEY_STATE,
-        KSI_KEY_STATE_PAYLOAD_SIZE, error);
+    write_u32(payload, device_id);
+    status = simple_request(connection, KSI_OPCODE_GET_KEY_STATE,
+        device_id != 0u ? payload : NULL, device_id != 0u ? sizeof(payload) : 0u,
+        KSI_STATUS_PAYLOAD_SIZE + KSI_KEY_STATE_PAYLOAD_SIZE, &response, error);
     if (status != KSI_STATUS_OK) {
         return status;
     }

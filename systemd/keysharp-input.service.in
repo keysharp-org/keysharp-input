@@ -21,7 +21,7 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/keysharp-permissions /run/keysharp-permissions
 UMask=0077
 DevicePolicy=closed
-DeviceAllow=char-input r
+DeviceAllow=char-input rw
 DeviceAllow=/dev/uinput rw
 
 [Install]

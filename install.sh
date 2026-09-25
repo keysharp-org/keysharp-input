@@ -34,7 +34,8 @@ fi
 # The install step refreshes the linker cache, creates the permission store, and
 # configures udev and the service itself, so there is nothing to do afterwards.
 cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$prefix"
+    -DCMAKE_INSTALL_PREFIX="$prefix" \
+    -DKEYSHARP_INPUT_SETUP_ON_INSTALL=ON
 cmake --build "$build_dir" --parallel
 cmake --install "$build_dir"
 

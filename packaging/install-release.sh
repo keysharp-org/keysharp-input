@@ -7,7 +7,7 @@ unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
 expected_version=0.3.0
 expected_client_abi_major=0
-expected_client_abi_minor=3
+expected_client_abi_minor=4
 
 usage() {
     echo "Usage: sudo ./install.sh [--skip-if-compatible]"
@@ -168,7 +168,7 @@ service_device_allow_matches() {
             value = substr($0, index($0, "=") + 1)
             sub(/^[[:space:]]*/, "", value)
             sub(/[[:space:]]*$/, "", value)
-            if (value == "char-input r") input++
+            if (value == "char-input rw") input++
             else if (value == "/dev/uinput rw") uinput++
             else invalid = 1
         }
@@ -284,17 +284,17 @@ udev_configuration_matches() {
         line == "SUBSYSTEM!=\"input\", GOTO=\"keysharp_uaccess_end\"" {
             subsystem++; next
         }
-        line == "ATTRS{name}==\"Keysharp Virtual Input\", TAG+=\"uaccess\"" {
-            keyboard++; next
+        line == "ATTRS{phys}==\"keysharp-input/forward/*\", ATTRS{id/bustype}==\"0003\", ENV{ID_BUS}=\"usb\"" {
+            usb++; next
         }
-        line == "ATTRS{name}==\"Keysharp Virtual Pointer\", TAG+=\"uaccess\"" {
-            pointer++; next
+        line == "ATTRS{phys}==\"keysharp-input/forward/*\", ATTRS{id/bustype}==\"0011\", ENV{ID_INPUT_MOUSE}==\"1\", IMPORT{builtin}=\"hwdb \047mouse:ps2::name:$attr{name}:\047\"" {
+            ps2++; next
         }
         line == "LABEL=\"keysharp_uaccess_end\"" { label++; next }
         { invalid = 1 }
         END {
-            if (invalid || action != 1 || subsystem != 1 || keyboard != 1 ||
-                pointer != 1 || label != 1)
+            if (invalid || action != 1 || subsystem != 1 || usb != 1 ||
+                ps2 != 1 || label != 1)
                 exit 1
         }
     ' "$1"
@@ -400,7 +400,6 @@ for required in \
     systemd/keysharp-input.socket \
     tmpfiles/keysharp-input-permissions.conf \
     polkit/org.keysharp.input.policy \
-    udev/70-keysharp-input-uaccess.rules \
     uninstall.sh LICENSE README.md; do
     if [ ! -s "$archive_dir/$required" ]; then
         echo "Portable archive is incomplete: $required is missing." >&2
@@ -476,8 +475,6 @@ install -D -m 0644 "$archive_dir/tmpfiles/keysharp-input-permissions.conf" \
     /usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf
 install -D -m 0644 "$archive_dir/polkit/org.keysharp.input.policy" \
     /usr/share/polkit-1/actions/org.keysharp.input.policy
-install -D -m 0644 "$archive_dir/udev/70-keysharp-input-uaccess.rules" \
-    /etc/udev/rules.d/70-keysharp-input-uaccess.rules
 install -D -m 0644 "$archive_dir/LICENSE" \
     /usr/local/share/doc/keysharp-input/LICENSE
 install -D -m 0644 "$archive_dir/README.md" \
@@ -493,5 +490,7 @@ if command -v systemd-tmpfiles >/dev/null 2>&1; then
         /usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf
 fi
 systemctl daemon-reload
+# The binary owns the /etc udev rule: it replaces what an older release left
+# there and refuses to overwrite an edited one.
 /usr/local/bin/keysharp-input daemon --install-input-access
 echo "Installed keysharp-input $expected_version."

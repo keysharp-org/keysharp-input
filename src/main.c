@@ -87,12 +87,14 @@ static int run_trusted_program(const char *path, char *const argv[])
 }
 
 /* Shared by install/remove so the two paths always agree on the file to manage.
- * Numbered 70- so it lexically precedes systemd's 73-seat-late.rules, which runs
- * the uaccess builtin; a tag added after that rule would have no effect. */
+ * Numbered 70- so it lexically precedes 70-mouse.rules, which reads the ID_BUS it
+ * sets. */
 #define KSI_UACCESS_RULES_PATH "/etc/udev/rules.d/70-keysharp-input-uaccess.rules"
 #define KSI_PACKAGED_UACCESS_RULES_PATH "/usr/lib/udev/rules.d/70-keysharp-input-uaccess.rules"
 /* Remove this exact known unsafe rule only when its contents also match. */
 #define KSI_LEGACY_INSECURE_UACCESS_RULES_PATH "/etc/udev/rules.d/99-keysharp-inputd.rules"
+/* An older release wrote its session ACL rule under the service's former name. */
+#define KSI_FORMER_NAME_UACCESS_RULES_PATH "/etc/udev/rules.d/70-keysharp-inputd-uaccess.rules"
 
 /* uinput module auto-load config written by --install-input-access. Shared with
  * --remove-input-access so removal cleans up exactly what install created and the
@@ -169,23 +171,31 @@ static void print_usage(const char *argv0)
 		argv0);
 }
 
-/* Body of the uaccess udev rule written by --install-input-access.
- * The broker grabs physical devices and re-emits passed events through its
- * uinput devices, so the active session's X/Wayland consumer needs read access
- * to those virtual event nodes. Matching their unique names avoids granting
- * access to unrelated input devices or keyd devices which share the vendor id.
- * ATTRS{} finds the parent input-device name while the tag remains on the event
- * node consumed by the uaccess builtin. */
-static const char KSI_UACCESS_RULES_CONTENTS[] =
+/* KSI_UACCESS_RULES_CONTENTS is generated from udev/70-keysharp-input-uaccess.rules,
+ * which grants no session ACL: one would let any session process read, inject or
+ * grab a Keysharp device's input outside the service's grants. */
+#include "uaccess_rules.h"
+
+/* Texts older releases left in /etc, all granting that ACL: [0] written by the
+ * binary, [1] copied by the archive installer. */
+#define KSI_LEGACY_UACCESS_BODY \
+	"ACTION!=\"add|change\", GOTO=\"keysharp_uaccess_end\"\n" \
+	"SUBSYSTEM!=\"input\", GOTO=\"keysharp_uaccess_end\"\n\n" \
+	"ATTRS{name}==\"Keysharp Virtual Input\", TAG+=\"uaccess\"\n" \
+	"ATTRS{name}==\"Keysharp Virtual Pointer\", TAG+=\"uaccess\"\n\n" \
+	"LABEL=\"keysharp_uaccess_end\"\n"
+static const char *const KSI_LEGACY_UACCESS_RULES_CONTENTS[] = {
 	"# Grants the active-session user an ACL on the broker's virtual devices.\n"
 	"# Replayed events are then readable by the session's X/Wayland consumer.\n"
-	"ACTION!=\"add|change\", GOTO=\"keysharp_uaccess_end\"\n"
-	"SUBSYSTEM!=\"input\", GOTO=\"keysharp_uaccess_end\"\n"
-	"\n"
-	"ATTRS{name}==\"Keysharp Virtual Input\", TAG+=\"uaccess\"\n"
-	"ATTRS{name}==\"Keysharp Virtual Pointer\", TAG+=\"uaccess\"\n"
-	"\n"
-	"LABEL=\"keysharp_uaccess_end\"\n";
+	KSI_LEGACY_UACCESS_BODY,
+	"# Grant the active session access only to the broker's virtual devices.\n"
+	KSI_LEGACY_UACCESS_BODY,
+};
+static const char KSI_FORMER_NAME_UACCESS_RULES_CONTENTS[] =
+	"# Grants the active-session user an ACL on keysharp-inputd virtual devices.\n"
+	"# Replayed events are then readable by the session's X/Wayland consumer.\n"
+	KSI_LEGACY_UACCESS_BODY;
+#undef KSI_LEGACY_UACCESS_BODY
 
 static const char KSI_INSECURE_UACCESS_RULES_CONTENTS[] =
 	"KERNEL==\"event*\", SUBSYSTEM==\"input\", GROUP=\"input\", MODE=\"0660\"\n"
@@ -244,6 +254,18 @@ static int remove_owned_text_file(const char *path, const char *contents)
 	return unlink(path);
 }
 
+static int remove_former_name_uaccess_rule(void)
+{
+	if (remove_owned_text_file(KSI_FORMER_NAME_UACCESS_RULES_PATH,
+		KSI_FORMER_NAME_UACCESS_RULES_CONTENTS) == 0) {
+		return 0;
+	}
+
+	fprintf(stderr, "warning: failed to remove %s: %s\n",
+		KSI_FORMER_NAME_UACCESS_RULES_PATH, strerror(errno));
+	return KSI_SETUP_FILE_ERROR;
+}
+
 static int install_input_access(void)
 {
 	const char *modules_path = KSI_UINPUT_MODULES_PATH;
@@ -276,10 +298,19 @@ static int install_input_access(void)
 			KSI_LEGACY_INSECURE_UACCESS_RULES_PATH, strerror(errno));
 		status |= KSI_SETUP_FILE_ERROR;
 	}
+	status |= remove_former_name_uaccess_rule();
 
-	/* Grant the consuming X/Wayland server read access to the daemon's own
-	 * virtual devices via systemd-logind's uaccess ACL (see the rationale on
-	 * KSI_UACCESS_RULES_CONTENTS above). */
+	/* Clear a rule an older release left so the current text can replace it; an
+	 * edited rule is never overwritten. */
+	for (size_t i = 0u; i < sizeof(KSI_LEGACY_UACCESS_RULES_CONTENTS)
+		/ sizeof(KSI_LEGACY_UACCESS_RULES_CONTENTS[0]); i++) {
+		const char *legacy = KSI_LEGACY_UACCESS_RULES_CONTENTS[i];
+		if (file_matches_text(KSI_UACCESS_RULES_PATH, legacy)
+			&& remove_owned_text_file(KSI_UACCESS_RULES_PATH, legacy) != 0) {
+			fprintf(stderr, "failed to migrate %s: %s\n", KSI_UACCESS_RULES_PATH, strerror(errno));
+			status |= KSI_SETUP_FILE_ERROR;
+		}
+	}
 	if (access(KSI_PACKAGED_UACCESS_RULES_PATH, R_OK) == 0) {
 		if (file_matches_text(KSI_UACCESS_RULES_PATH, KSI_UACCESS_RULES_CONTENTS)) {
 			if (unlink(KSI_UACCESS_RULES_PATH) != 0) {
@@ -295,8 +326,9 @@ static int install_input_access(void)
 		status |= KSI_SETUP_FILE_ERROR;
 	}
 
-	/* Reload rules and re-trigger so the new uaccess tag is applied to any
-	 * already-present virtual devices as well as future ones. */
+	/* Reload rules and re-trigger so devices already present take the current
+	 * rules. A live node keeps an ACL an older rule gave it; the service restart
+	 * below recreates the broker's devices. */
 	{
 		char *const reload_args[] = { "udevadm", "control", "--reload-rules", NULL };
 		char *const input_args[] = { "udevadm", "trigger", "--subsystem-match=input", NULL };
@@ -383,6 +415,7 @@ static int remove_input_access(void)
 		fprintf(stderr, "warning: failed to remove %s: %s\n", KSI_UACCESS_RULES_PATH, strerror(errno));
 		status |= KSI_SETUP_FILE_ERROR;
 	}
+	status |= remove_former_name_uaccess_rule();
 
 	/* Also remove the uinput module-load config install wrote, so removal does
 	 * not leave the kernel auto-loading the uinput module every boot. */

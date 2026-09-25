@@ -96,25 +96,37 @@ static bool synth_batch_is_cleanup(const ksi_input *inputs, uint32_t count)
     return true;
 }
 
-static bool replay_is_cleanup(
-    uint32_t hook_type,
-    const ksi_hook_event_payload *payload)
+/* Output admitted for a former seat owner is dropped on purpose, so callers
+ * treat it as delivered rather than failing open. */
+static bool output_is_stale_locked(const ksi_output_queue *q, uint64_t input_generation)
 {
-    uint32_t message;
+    return input_generation != 0u
+        && (q->state == NULL || input_generation != current_input_generation(q->state));
+}
 
-    if (hook_type == KSI_HOOK_KEYBOARD) {
-        message = payload->event.keyboard.message;
-        return message == KSI_MESSAGE_KEY_UP || message == KSI_MESSAGE_SYSTEM_KEY_UP
-            || (payload->event.keyboard.flags & KSI_KEYBOARD_HOOK_UP) != 0u;
-    }
+static bool output_owner_is_live_locked(const ksi_output_queue *q, const ksi_synth_owner *owner);
 
-    if (hook_type != KSI_HOOK_MOUSE) {
-        return false;
-    }
+static bool output_owner_is_live(ksi_output_queue *q, uint64_t connection_id)
+{
+    const ksi_synth_owner owner = { .connection_id = connection_id };
+    bool live;
 
-    message = payload->event.mouse.message;
-    return message == KSI_MESSAGE_LEFT_BUTTON_UP || message == KSI_MESSAGE_RIGHT_BUTTON_UP
-        || message == KSI_MESSAGE_MIDDLE_BUTTON_UP || message == KSI_MESSAGE_X_BUTTON_UP;
+    pthread_mutex_lock(&q->mutex);
+    live = output_owner_is_live_locked(q, &owner);
+    pthread_mutex_unlock(&q->mutex);
+    return live;
+}
+
+/* A closed connection, or a Modify decision whose hook was revoked, could
+ * otherwise create a hold that nothing releases. */
+static bool output_owner_is_live_locked(const ksi_output_queue *q, const ksi_synth_owner *owner)
+{
+    if (owner == NULL || owner->connection_id == 0u) return true;
+    for (size_t i = 0u; i < q->owner_count; i++)
+        if (q->owners[i].connection_id == owner->connection_id)
+            return owner->hook_type == 0u
+                || (q->owners[i].hooks & hook_type_to_operation(owner->hook_type)) != 0u;
+    return false;
 }
 
 static bool output_queue_pop(ksi_output_queue *q, ksi_output_action *out)
@@ -180,54 +192,78 @@ static void output_queue_close(ksi_output_queue *q)
     }
 }
 
-static bool output_queue_push_replay(
+/* A REPLAY packet goes to the source's outputs, and a key-up in it ends
+ * synthetic holds of that key as a Win32 key-up does. A SOURCE_STATE packet records the
+ * source's key transitions in queue order, whatever a hook decides. */
+static bool output_queue_push_packet(
     ksi_output_queue *q,
-    uint32_t hook_type,
-    const ksi_hook_event_payload *payload,
+    ksi_output_action_type type,
+    const ksi_forward_packet *packet,
     uint64_t input_generation)
 {
-    ksi_output_action action;
+    ksi_output_action action = { .type = type, .input_generation = input_generation };
+    bool cleanup;
+    bool stale;
 
-    if (q == NULL || !q->mutex_initialized || payload == NULL) {
+    if (q == NULL || !q->mutex_initialized || packet == NULL
+        || packet->count > KSI_FORWARD_PACKET_EVENTS) {
         return false;
     }
 
-    memset(&action, 0, sizeof(action));
-    action.type = KSI_OUTPUT_ACTION_REPLAY;
-    action.input_generation = input_generation;
-    action.hook_type = hook_type;
-    action.replay_payload = *payload;
+    if (type == KSI_OUTPUT_ACTION_SOURCE_STATE
+        && (ksi_forward_key_values(packet) & (KSI_FORWARD_KEY_UP | KSI_FORWARD_KEY_DOWN)) == 0u) {
+        return true;
+    }
+    /* Source state writes nothing, so like a release it may use the reserve. */
+    cleanup = type == KSI_OUTPUT_ACTION_SOURCE_STATE
+        || (ksi_forward_key_values(packet) & KSI_FORWARD_KEY_UP) != 0u;
+    action.packet = *packet;
 
     pthread_mutex_lock(&q->mutex);
-
-    if (q->count >= KSI_MAX_OUTPUT_ACTIONS
-            - (replay_is_cleanup(hook_type, payload)
-                ? 0u : KSI_OUTPUT_CLEANUP_RESERVE)
-        || (input_generation != 0u
-            && (q->state == NULL
-                || input_generation != current_input_generation(q->state)))) {
+    stale = output_is_stale_locked(q, input_generation);
+    if (stale || q->count >= KSI_MAX_OUTPUT_ACTIONS - (cleanup ? 0u : KSI_OUTPUT_CLEANUP_RESERVE)) {
         pthread_mutex_unlock(&q->mutex);
-        return false;
+        return stale;
     }
 
     output_queue_push_action_locked(q, &action);
+    if (type == KSI_OUTPUT_ACTION_REPLAY) {
+        ksi_linux_forward_note_output(packet);
+        ksi_linux_synth_physical_release(packet, KSI_FORWARD_ENQUEUED);
+    } else {
+        ksi_linux_forward_note_source(packet, KSI_FORWARD_ENQUEUED);
+    }
     pthread_mutex_unlock(&q->mutex);
 
-    output_queue_wake(q);
+    /* Source state writes nothing, and what later reads it wakes the sequencer. */
+    if (type == KSI_OUTPUT_ACTION_REPLAY) output_queue_wake(q);
     return true;
 }
 
-static bool output_queue_push_synth(
+static bool output_queue_push_replay(
+    ksi_output_queue *q, const ksi_forward_packet *replay, uint64_t input_generation)
+{
+    return output_queue_push_packet(q, KSI_OUTPUT_ACTION_REPLAY, replay, input_generation);
+}
+
+/* A Modify replacement passes its lane's flush generation, so output decided
+ * before a flush cannot be admitted after it. */
+static bool output_queue_push_owned_synth(
     ksi_output_queue *q,
     const ksi_input *inputs,
     uint32_t count,
     uint32_t flags,
-    uint64_t input_generation)
+    uint64_t input_generation,
+    const ksi_synth_owner *owner,
+    const atomic_uint *owner_generation,
+    uint32_t expected_owner_generation)
 {
     ksi_output_action action;
     size_t synth_bytes;
     size_t synth_limit;
     bool cleanup;
+    bool stale;
+    bool closed;
 
     if (q == NULL || !q->mutex_initialized
         || (count > 0u && inputs == NULL)) {
@@ -241,6 +277,7 @@ static bool output_queue_push_synth(
     memset(&action, 0, sizeof(action));
     action.type = KSI_OUTPUT_ACTION_SYNTH;
     action.input_generation = input_generation;
+    if (owner != NULL) action.synth_owner = *owner;
     action.synth_flags = flags;
     action.synth_count = count;
 
@@ -256,10 +293,18 @@ static bool output_queue_push_synth(
 
     pthread_mutex_lock(&q->mutex);
 
-    if ((input_generation != 0u
-            && (q->state == NULL
-                || input_generation != current_input_generation(q->state)))
-        || q->count >= KSI_MAX_OUTPUT_ACTIONS
+    stale = output_is_stale_locked(q, input_generation);
+    closed = !output_owner_is_live_locked(q, owner);
+    if (stale || (closed && owner->hook_type != 0u)) {
+        pthread_mutex_unlock(&q->mutex);
+        free(action.synth_inputs);
+        /* Dropped on purpose; a refused Modify decision passes its event instead. */
+        return stale;
+    }
+
+    if ((owner_generation != NULL
+            && atomic_load(owner_generation) != expected_owner_generation)
+        || q->count + (closed ? 1u : 0u) >= KSI_MAX_OUTPUT_ACTIONS
             - (cleanup ? 0u : KSI_OUTPUT_CLEANUP_RESERVE)
         || synth_bytes > synth_limit
         || q->synth_bytes > synth_limit - synth_bytes) {
@@ -271,7 +316,17 @@ static bool output_queue_push_synth(
     output_queue_push_action_locked(q, &action);
 
     /* Publish enqueue-time logical state in the same order as queued output. */
-    ksi_linux_synth_note_enqueued_synth(inputs, count);
+    ksi_linux_synth_note_enqueued_synth(inputs, count, owner);
+
+    /* A Send acknowledged before its connection closed still plays, and what it
+     * holds is released after it. A hook-routed fragment waits for the release
+     * marker behind its batch, so the batch plays whole. */
+    if (closed && (flags & KSI_INTERNAL_SYNTH_BATCH_FRAGMENT) == 0u) {
+        const ksi_output_action release = { .type = KSI_OUTPUT_ACTION_RELEASE_SYNTH_OWNER,
+            .synth_owner = { .connection_id = owner->connection_id } };
+        output_queue_push_action_locked(q, &release);
+        ksi_linux_synth_release_owner(&release.synth_owner, KSI_FORWARD_ENQUEUED);
+    }
 
     pthread_mutex_unlock(&q->mutex);
 
@@ -279,12 +334,27 @@ static bool output_queue_push_synth(
     return true;
 }
 
+/* connection_id owns what the batch holds, so a disconnect releases it. */
+static bool output_queue_push_synth(
+    ksi_output_queue *q,
+    const ksi_input *inputs,
+    uint32_t count,
+    uint32_t flags,
+    uint64_t input_generation,
+    uint64_t connection_id)
+{
+    const ksi_synth_owner owner = { .connection_id = connection_id };
+
+    return output_queue_push_owned_synth(
+        q, inputs, count, flags, input_generation, &owner, NULL, 0u);
+}
+
 static bool output_queue_push_simple(ksi_output_queue *q, ksi_output_action_type type)
 {
     ksi_output_action action = { .type = type };
 
     if (q == NULL || !q->mutex_initialized
-        || (type != KSI_OUTPUT_ACTION_RELEASE_ALL
+        || (type != KSI_OUTPUT_ACTION_RELEASE_ALL && type != KSI_OUTPUT_ACTION_RELEASE_GENERIC
             && type != KSI_OUTPUT_ACTION_RECREATE_SYNTH)) {
         return false;
     }
@@ -298,9 +368,10 @@ static bool output_queue_push_simple(ksi_output_queue *q, ksi_output_action_type
 
     output_queue_push_action_locked(q, &action);
 
+    /* Each leaves the generic devices with no held state. */
+    ksi_linux_synth_reset_enqueued_synth();
     if (type == KSI_OUTPUT_ACTION_RELEASE_ALL) {
-        /* Release-all drops every synthetic key once accepted. */
-        ksi_linux_synth_reset_enqueued_synth();
+        ksi_linux_forward_release_all(KSI_FORWARD_ENQUEUED);
     }
 
     pthread_mutex_unlock(&q->mutex);
@@ -315,9 +386,94 @@ static bool output_queue_push_release_all(ksi_output_queue *q)
     return output_queue_push_simple(q, KSI_OUTPUT_ACTION_RELEASE_ALL);
 }
 
+/* Releases the holds of every owner matching filter; zero fields match any
+ * value, and an all-zero filter is refused. Cleanup may use the reserve. */
+static bool output_queue_push_release_owner(
+    ksi_output_queue *q, const ksi_synth_owner *filter)
+{
+    static const ksi_synth_owner none;
+    ksi_output_action action = { .type = KSI_OUTPUT_ACTION_RELEASE_SYNTH_OWNER };
+
+    if (q == NULL || !q->mutex_initialized || filter == NULL
+        || memcmp(filter, &none, sizeof(none)) == 0) return false;
+    action.synth_owner = *filter;
+    pthread_mutex_lock(&q->mutex);
+    if (q->count >= KSI_MAX_OUTPUT_ACTIONS) {
+        pthread_mutex_unlock(&q->mutex);
+        return false;
+    }
+    output_queue_push_action_locked(q, &action);
+    ksi_linux_synth_release_owner(filter, KSI_FORWARD_ENQUEUED);
+    pthread_mutex_unlock(&q->mutex);
+    output_queue_wake(q);
+    return true;
+}
+
 static bool output_queue_push_recreate_synth(ksi_output_queue *q)
 {
     return output_queue_push_simple(q, KSI_OUTPUT_ACTION_RECREATE_SYNTH);
+}
+
+static bool output_queue_push_release_generic(ksi_output_queue *q)
+{
+    return output_queue_push_simple(q, KSI_OUTPUT_ACTION_RELEASE_GENERIC);
+}
+
+/* Ends a source's grab at this queue position: admitted output moves to the
+ * next target now, written output when the action drains. */
+static uint64_t output_queue_push_end_grab(ksi_output_queue *q, uint64_t target, uint8_t *kept)
+{
+    ksi_output_action action = { .type = KSI_OUTPUT_ACTION_END_GRAB };
+    bool queued;
+
+    pthread_mutex_lock(&q->mutex);
+    action.next_target = ksi_linux_forward_end_grab(target, kept);
+    queued = q->count < KSI_MAX_OUTPUT_ACTIONS;
+    if (queued) {
+        output_queue_push_action_locked(q, &action);
+    } else {
+        /* A full queue cannot order it, so written output moves now too, and
+         * keeps what admitted output kept rather than its own lagging view. */
+        ksi_linux_forward_apply_end_grab(action.next_target, kept);
+    }
+    pthread_mutex_unlock(&q->mutex);
+
+    if (queued) output_queue_wake(q);
+    return action.next_target;
+}
+
+/* Closes a source at this queue position: admitted output forgets it now,
+ * written output when the action drains. */
+static void output_queue_push_close(ksi_output_queue *q, uint64_t target)
+{
+    ksi_output_action action = { .type = KSI_OUTPUT_ACTION_CLOSE_SOURCE, .next_target = target };
+    bool queued;
+
+    pthread_mutex_lock(&q->mutex);
+    ksi_linux_forward_close(target);
+    queued = q->count < KSI_MAX_OUTPUT_ACTIONS;
+    if (queued) output_queue_push_action_locked(q, &action);
+    else ksi_linux_forward_apply_close(target);
+    pthread_mutex_unlock(&q->mutex);
+
+    if (queued) output_queue_wake(q);
+}
+
+/* Runs whenever a connection opens or closes or its hooks change, before a
+ * release of what it held is queued. */
+static void output_queue_sync_owners(ksi_daemon_state *state)
+{
+    ksi_output_queue *q = &state->output_queue;
+
+    if (!q->mutex_initialized) return;
+    pthread_mutex_lock(&q->mutex);
+    q->owner_count = 0u;
+    for (nfds_t i = 0u; i < state->client_count; i++) {
+        q->owners[q->owner_count].connection_id = state->clients[i].connection_id;
+        q->owners[q->owner_count++].hooks = state->clients[i].hook_subscriptions
+            & (uint32_t)~state->clients[i].quarantined_hooks;
+    }
+    pthread_mutex_unlock(&q->mutex);
 }
 
 static void output_queue_wait_for_inflight(ksi_output_queue *q)
@@ -561,35 +717,19 @@ static int synthetic_hook_queue_init(ksi_synthetic_hook_queue *q)
     return 0;
 }
 
-static void synthetic_hook_queue_append_locked(
-    ksi_synthetic_hook_queue *q,
-    const ksi_input *input,
-    uint64_t queued_at_ns,
-    ksi_synth_completion *completion,
-    uint64_t input_generation)
-{
-    size_t tail = (q->head + q->count) % KSI_MAX_SYNTH_HOOK_ACTIONS;
-    q->items[tail].input = *input;
-    q->items[tail].queued_at_ns = queued_at_ns;
-    q->items[tail].completion = completion;
-    q->items[tail].input_generation = input_generation;
-    q->items[tail].batch_start = false;  /* push() marks the batch's first node */
-    q->count++;
-}
-
+/* Appends the nodes one input expands to, each a copy of batch. */
 static void synthetic_hook_queue_append_input_locked(
     ksi_synthetic_hook_queue *q,
     const ksi_input *input,
-    uint64_t queued_at_ns,
-    ksi_synth_completion *completion,
-    uint64_t input_generation)
+    const ksi_synthetic_hook_item *batch)
 {
     ksi_input expanded[KSI_SYNTHETIC_HOOK_MAX_EXPANSION];
     size_t count = ksi_synthetic_hook_expand_input(input, expanded);
 
     for (size_t i = 0u; i < count; i++) {
-        synthetic_hook_queue_append_locked(
-            q, &expanded[i], queued_at_ns, completion, input_generation);
+        ksi_synthetic_hook_item *item = &q->items[(q->head + q->count++) % KSI_MAX_SYNTH_HOOK_ACTIONS];
+        *item = *batch;
+        item->input = expanded[i];
     }
 }
 
@@ -600,8 +740,13 @@ static bool synthetic_hook_queue_push(
     size_t node_count,
     uint64_t queued_at_ns,
     ksi_synth_completion *completion,
-    uint64_t input_generation)
+    uint64_t input_generation,
+    uint64_t connection_id)
 {
+    const ksi_synthetic_hook_item batch = { .queued_at_ns = queued_at_ns,
+        .completion = completion, .input_generation = input_generation,
+        .connection_id = connection_id };
+
     if (q == NULL || (count > 0u && inputs == NULL)) {
         return false;
     }
@@ -620,8 +765,7 @@ static bool synthetic_hook_queue_push(
     size_t start_tail = (q->head + q->count) % KSI_MAX_SYNTH_HOOK_ACTIONS;
 
     for (uint32_t i = 0u; i < count; i++) {
-        synthetic_hook_queue_append_input_locked(
-            q, &inputs[i], queued_at_ns, completion, input_generation);
+        synthetic_hook_queue_append_input_locked(q, &inputs[i], &batch);
     }
 
     /* Mark the first node of this client batch so the daemon re-arms its
@@ -639,6 +783,22 @@ static bool synthetic_hook_queue_push(
     }
 
     return true;
+}
+
+/* Queues the point where a closed connection's accepted output ends. */
+static bool synthetic_hook_queue_push_release(ksi_synthetic_hook_queue *q, uint64_t connection_id)
+{
+    const ksi_synthetic_hook_item marker = { .queued_at_ns = monotonic_ns(),
+        .connection_id = connection_id, .release_owner = true };
+    bool pushed;
+
+    if (!q->mutex_initialized) return false;
+    pthread_mutex_lock(&q->mutex);
+    pushed = q->count < KSI_MAX_SYNTH_HOOK_ACTIONS;
+    if (pushed) q->items[(q->head + q->count++) % KSI_MAX_SYNTH_HOOK_ACTIONS] = marker;
+    pthread_mutex_unlock(&q->mutex);
+    if (pushed && q->wake_write_fd >= 0) wake_pipe_write(q->wake_write_fd);
+    return pushed;
 }
 
 static bool synthetic_hook_queue_peek_time(
@@ -662,47 +822,26 @@ static bool synthetic_hook_queue_peek_time(
     return found;
 }
 
-static bool synthetic_hook_queue_pop(
-    ksi_synthetic_hook_queue *q,
-    ksi_input *input,
-    uint64_t *queued_at_ns,
-    ksi_synth_completion **completion,
-    bool *batch_start,
-    uint64_t *input_generation)
+static bool synthetic_hook_queue_pop(ksi_synthetic_hook_queue *q, ksi_synthetic_hook_item *out)
 {
-    ksi_synthetic_hook_item item;
     bool found = false;
 
-    if (q == NULL || input == NULL || queued_at_ns == NULL
-        || completion == NULL || batch_start == NULL || input_generation == NULL
-        || !q->mutex_initialized) {
+    if (q == NULL || out == NULL || !q->mutex_initialized) {
         return false;
     }
 
     pthread_mutex_lock(&q->mutex);
 
     if (q->count != 0u) {
-        item = q->items[q->head];
+        *out = q->items[q->head];
         memset(&q->items[q->head], 0, sizeof(q->items[q->head]));
         q->head = (q->head + 1u) % KSI_MAX_SYNTH_HOOK_ACTIONS;
         q->count--;
         found = true;
-    } else {
-        memset(&item, 0, sizeof(item));
     }
 
     pthread_mutex_unlock(&q->mutex);
-
-    if (!found) {
-        return false;
-    }
-
-    *input = item.input;
-    *queued_at_ns = item.queued_at_ns;
-    *completion = item.completion;
-    *batch_start = item.batch_start;
-    *input_generation = item.input_generation;
-    return true;
+    return found;
 }
 
 static void synthetic_hook_queue_wake(const ksi_synthetic_hook_queue *q)
@@ -755,6 +894,61 @@ static void request_fail_open(ksi_daemon_state *state)
 }
 
 /* Drain queued backend writes until shutdown is requested and the queue is empty. */
+/* Writes one admitted action; the sequencer calls it in queue order under
+ * execution_mutex. */
+static void apply_output_action(ksi_daemon_state *state, ksi_output_action *action)
+{
+    /* A seat change drops what the former owner admitted; the unscoped
+     * RELEASE_ALL queued behind it releases whatever was already written. */
+    if (action->input_generation != 0u
+        && action->input_generation != current_input_generation(state)) {
+        free(action->synth_inputs);
+        return;
+    }
+
+    switch (action->type) {
+    case KSI_OUTPUT_ACTION_REPLAY:
+        if (ksi_linux_forward_write(&action->packet) != 0) {
+            fprintf(stderr, "sequencer: replay failed\n");
+        }
+        ksi_linux_synth_physical_release(&action->packet, KSI_FORWARD_APPLIED);
+        break;
+    case KSI_OUTPUT_ACTION_SOURCE_STATE:
+        ksi_linux_forward_note_source(&action->packet, KSI_FORWARD_APPLIED);
+        break;
+    case KSI_OUTPUT_ACTION_SYNTH:
+        if (ksi_linux_synth_send_input(action->synth_inputs, action->synth_count,
+                action->synth_flags, &action->synth_owner) != 0) {
+            fprintf(stderr, "sequencer: synth failed\n");
+        }
+        free(action->synth_inputs);
+        break;
+    case KSI_OUTPUT_ACTION_RELEASE_SYNTH_OWNER:
+        ksi_linux_synth_release_owner(&action->synth_owner, KSI_FORWARD_APPLIED);
+        break;
+    case KSI_OUTPUT_ACTION_RELEASE_ALL:
+        ksi_linux_synth_release_all();
+        ksi_linux_forward_release_all(KSI_FORWARD_APPLIED);
+        break;
+    case KSI_OUTPUT_ACTION_RELEASE_GENERIC:
+        ksi_linux_synth_release_all();
+        break;
+    case KSI_OUTPUT_ACTION_RECREATE_SYNTH:
+        /* Here, so recreating the devices cannot race their writes. */
+        ksi_linux_synth_recreate();
+        break;
+    case KSI_OUTPUT_ACTION_END_GRAB:
+        ksi_linux_forward_apply_end_grab(action->next_target, NULL);
+        break;
+    case KSI_OUTPUT_ACTION_CLOSE_SOURCE:
+        ksi_linux_forward_apply_close(action->next_target);
+        break;
+    }
+
+    /* Idle cost is two atomic loads; see ksi_linux_synth_maintain_output. */
+    ksi_linux_synth_maintain_output();
+}
+
 static void *output_sequencer_thread_main(void *arg)
 {
     ksi_daemon_state *state = arg;
@@ -778,48 +972,14 @@ static void *output_sequencer_thread_main(void *arg)
 
         while (output_queue_pop(&state->output_queue, &action)) {
             pthread_mutex_lock(&state->output_queue.execution_mutex);
-
-            /* A seat transition increments this epoch before releasing grabs.
-             * Drop every delayed action admitted by the former owner. The
-             * following unscoped RELEASE_ALL remains in the same FIFO and
-             * cleans any key which had already reached uinput. */
-            if (action.input_generation != 0u
-                && action.input_generation != current_input_generation(state)) {
-                free(action.synth_inputs);
-                pthread_mutex_unlock(&state->output_queue.execution_mutex);
-                continue;
-            }
-
-            if (action.type == KSI_OUTPUT_ACTION_REPLAY) {
-                if (state->backend != NULL && state->backend->replay_hook_event != NULL) {
-                    if (state->backend->replay_hook_event(action.hook_type, &action.replay_payload) != 0) {
-                        fprintf(stderr, "sequencer: replay failed\n");
-                    }
-                }
-            } else if (action.type == KSI_OUTPUT_ACTION_SYNTH) {
-                if (state->backend != NULL && state->backend->send_input != NULL) {
-                    if (state->backend->send_input(action.synth_inputs, action.synth_count, action.synth_flags) != 0) {
-                        fprintf(stderr, "sequencer: synth failed\n");
-                    }
-                }
-
-                free(action.synth_inputs);
-            } else if (action.type == KSI_OUTPUT_ACTION_RELEASE_ALL) {
-                if (state->backend != NULL && state->backend->release_synthetic_keys != NULL) {
-                    state->backend->release_synthetic_keys();
-                }
-            } else if (action.type == KSI_OUTPUT_ACTION_RECREATE_SYNTH) {
-                /* Recover a broken synthetic-output device ON THIS THREAD so the
-                 * stop()+start() (which closes/reopens the uinput fds and clears
-                 * the key-down table) never races the sequencer's own writes. */
-                if (state->backend != NULL && state->backend->recreate_synth != NULL) {
-                    state->backend->recreate_synth();
-                }
-            }
-
+            apply_output_action(state, &action);
             pthread_mutex_unlock(&state->output_queue.execution_mutex);
         }
 
+        /* Also runs on the poll timeout so a retired clone's drain completes. */
+        pthread_mutex_lock(&state->output_queue.execution_mutex);
+        ksi_linux_synth_maintain_output();
+        pthread_mutex_unlock(&state->output_queue.execution_mutex);
         keep = atomic_load(&state->sequencer_running) != 0;
 
         if (!keep) {
@@ -835,8 +995,11 @@ static void *output_sequencer_thread_main(void *arg)
 
 /* Hook lane queues: event pointers in, one decision slot out. */
 
+/* Cancels queued input. Release markers stay, since the holds they end remain. */
 static void synthetic_hook_queue_abort(ksi_synthetic_hook_queue *q)
 {
+    size_t kept = 0u;
+
     if (q == NULL || !q->mutex_initialized) {
         return;
     }
@@ -844,14 +1007,17 @@ static void synthetic_hook_queue_abort(ksi_synthetic_hook_queue *q)
     pthread_mutex_lock(&q->mutex);
 
     for (size_t i = 0u; i < q->count; i++) {
-        size_t idx = (q->head + i) % KSI_MAX_SYNTH_HOOK_ACTIONS;
-        synth_completion_fail(q->items[idx].completion,
-            KSI_STATUS_CANCELLED, KSI_DETAIL_NONE);
-        memset(&q->items[idx], 0, sizeof(q->items[idx]));
+        ksi_synthetic_hook_item item = q->items[(q->head + i) % KSI_MAX_SYNTH_HOOK_ACTIONS];
+
+        memset(&q->items[(q->head + i) % KSI_MAX_SYNTH_HOOK_ACTIONS], 0, sizeof(item));
+        if (item.release_owner) {
+            q->items[(q->head + kept++) % KSI_MAX_SYNTH_HOOK_ACTIONS] = item;
+        } else {
+            synth_completion_fail(item.completion, KSI_STATUS_CANCELLED, KSI_DETAIL_NONE);
+        }
     }
 
-    q->head = 0u;
-    q->count = 0u;
+    q->count = kept;
     pthread_mutex_unlock(&q->mutex);
 }
 
@@ -1213,30 +1379,20 @@ static void lane_post_hook_failure(
     }
 }
 
-static bool lane_event_enqueue_egress(ksi_hook_lane *lane, const ksi_lane_event *event)
+static bool enqueue_egress(ksi_daemon_state *state, const ksi_lane_egress *egress,
+    uint64_t input_generation)
 {
-    if (lane == NULL || event == NULL) {
-        return false;
+    if (egress->type == KSI_LANE_EGRESS_REPLAY) {
+        return output_queue_push_replay(&state->output_queue, &egress->replay, input_generation);
     }
 
-    if (event->egress.type == KSI_LANE_EGRESS_NONE) {
-        return true;
+    if (egress->type == KSI_LANE_EGRESS_SYNTH) {
+        return output_queue_push_synth(&state->output_queue,
+            egress->synth_inputs, egress->synth_count,
+            egress->synth_flags, input_generation, egress->connection_id);
     }
 
-    if (event->egress.type == KSI_LANE_EGRESS_REPLAY) {
-        return output_queue_push_replay(&lane->state->output_queue,
-            event->hook_type, &event->payload, event->input_generation);
-    }
-
-    if (event->egress.type == KSI_LANE_EGRESS_SYNTH) {
-        return output_queue_push_synth(&lane->state->output_queue,
-            event->egress.synth_inputs,
-            event->egress.synth_count,
-            event->egress.synth_flags,
-            event->input_generation);
-    }
-
-    return false;
+    return true;
 }
 
 static bool lane_process_event(ksi_hook_lane *lane, ksi_lane_event *event);
@@ -1324,7 +1480,7 @@ static bool lane_fail_open_nested_transaction(
 
     ok = output_queue_push_synth(&lane->state->output_queue,
         inputs, count, KSI_SYNTH_BYPASS_HOOK,
-        transaction->input_generation);
+        transaction->input_generation, transaction->origin_connection_id);
     free(inputs);
     return ok;
 }
@@ -1380,7 +1536,7 @@ static bool lane_process_nested_transaction(
 
             if (!output_queue_push_synth(
                     &lane->state->output_queue, &member->input, 1u, flags,
-                    transaction->input_generation)) {
+                    transaction->input_generation, transaction->origin_connection_id)) {
                 ok = false;
                 break;
             }
@@ -1399,6 +1555,11 @@ static bool lane_process_nested_transaction(
     }
 
 complete:
+    /* No release marker orders a closed connection's recursive batch. */
+    if (!output_owner_is_live(&lane->state->output_queue, transaction->origin_connection_id)) {
+        release_connection_output(lane->state, transaction->origin_connection_id, 0u);
+    }
+
     if (transaction != NULL && transaction->completion != NULL) {
         if (ok) {
             synth_completion_complete(transaction->completion);
@@ -1566,6 +1727,64 @@ static ksi_subscriber_result lane_call_subscriber(
     return KSI_SUBSCRIBER_SKIPPED;
 }
 
+/* Queues what the final decision leaves for output; false when it could not
+ * be admitted. A physical event then fails open. */
+static bool lane_emit_output(ksi_hook_lane *lane, const ksi_lane_event *event,
+    uint32_t final_decision, const ksi_lane_decision *decision)
+{
+    ksi_output_queue *q = &lane->state->output_queue;
+    bool passed = final_decision == KSI_HOOK_PASS;
+    bool ok = true;
+
+    if (final_decision == KSI_HOOK_MODIFY && decision->input_count > 0u) {
+        /* The event may be one fragment of a hook-routed client batch, such as half
+         * of a SendText surrogate pair, so the replacement keeps the batch's pending
+         * high surrogate. */
+        const ksi_forward_packet *source = &event->egress.replay;
+        /* Every Modify hold carries its hook class. A replacement of physical
+         * input is also owned by the key or button it replaces, which ends a
+         * key packet, so that key's release ends it. */
+        uint32_t last = source->count != 0u ? source->count - 1u : 0u;
+        bool key = event->physical_input && source->count != 0u
+            && source->events[last].type == EV_KEY;
+        const ksi_synth_owner owner = {
+            .target = event->physical_input ? source->target : 0u,
+            .connection_id = decision->responder_connection_id,
+            .hook_type = event->hook_type,
+            .source_type = key ? EV_KEY : 0u,
+            .source_code = key ? source->events[last].code : 0u,
+        };
+
+        passed = !output_queue_push_owned_synth(q, decision->inputs, decision->input_count,
+            KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_BATCH_FRAGMENT,
+            event->input_generation, &owner, &lane->flush_generation, event->generation);
+    }
+
+    if (passed && !enqueue_egress(lane->state, &event->egress, event->input_generation)) {
+        ok = passed = false;
+        fprintf(stderr, "lane: egress enqueue failed for event %llu\n",
+            (unsigned long long)event->event_id);
+    }
+
+    /* A suppressed release still reaches the outputs, which ignore keys the source
+     * does not hold there, so no passed press is stranded. It follows the decision's
+     * output, so a hold this release's Modify made ends with it. */
+    ksi_forward_packet suppressed = event->egress.replay;
+    suppressed.flags |= KSI_FORWARD_SUPPRESSED;
+    if (event->physical_input && !(passed && event->egress.type == KSI_LANE_EGRESS_REPLAY)
+        && (ksi_forward_key_values(&suppressed) & KSI_FORWARD_KEY_UP) != 0u
+        && !output_queue_push_replay(q, &suppressed, event->input_generation)) {
+        ok = false;
+        fprintf(stderr, "lane: physical release cleanup enqueue failed for event %llu\n",
+            (unsigned long long)event->event_id);
+    }
+
+    if (!ok && event->physical_input) {
+        request_fail_open(lane->state);
+    }
+    return ok;
+}
+
 /* Lane thread only; uses the subscriber snapshot captured in `event`. */
 static bool lane_process_event(ksi_hook_lane *lane, ksi_lane_event *event)
 {
@@ -1622,39 +1841,7 @@ finalize:
         synthetic_ok = false;
     }
 
-    if (final_decision == KSI_HOOK_PASS) {
-        if (!lane_event_enqueue_egress(lane, event)) {
-            synthetic_ok = false;
-            fprintf(stderr, "lane: egress enqueue failed for event %llu\n",
-                (unsigned long long)event->event_id);
-
-            if (event->egress.type == KSI_LANE_EGRESS_REPLAY) {
-                request_fail_open(lane->state);
-            }
-        }
-    } else if (final_decision == KSI_HOOK_MODIFY
-        && decision.input_count > 0u) {
-        /* BATCH_FRAGMENT: the modified event may be one fragment of a synthetic
-         * client batch being routed through this hook (e.g. a SendText emoji's
-         * low-surrogate unit). Carrying the flag keeps the daemon's per-batch
-         * pending-high-surrogate reset from firing between the pair's fragments,
-         * mirroring the PASS synth-egress sites (hook_ingress.inc). */
-        if (!output_queue_push_synth(&lane->state->output_queue,
-                decision.inputs, decision.input_count,
-                KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_BATCH_FRAGMENT,
-                event->input_generation)) {
-            bool fallback_ok;
-            fprintf(stderr, "lane: modify synth enqueue failed for event %llu\n",
-                (unsigned long long)event->event_id);
-
-            fallback_ok = lane_event_enqueue_egress(lane, event);
-            synthetic_ok = fallback_ok;
-
-            if (!fallback_ok && event->egress.type == KSI_LANE_EGRESS_REPLAY) {
-                request_fail_open(lane->state);
-            }
-        }
-    }
+    synthetic_ok = lane_emit_output(lane, event, final_decision, &decision) && synthetic_ok;
 
     lane_event_release_send_refs(event);
 

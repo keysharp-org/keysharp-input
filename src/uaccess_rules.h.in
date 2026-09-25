@@ -1,0 +1,10 @@
+/* Generated from udev/70-keysharp-input-uaccess.rules. */
+#ifndef KEYSHARP_INPUT_UACCESS_RULES_H
+#define KEYSHARP_INPUT_UACCESS_RULES_H
+
+static const char KSI_UACCESS_RULES_CONTENTS[] =
+	"@KSI_UACCESS_RULES_LITERAL@";
+_Static_assert(sizeof(KSI_UACCESS_RULES_CONTENTS) == @KSI_UACCESS_RULES_LENGTH@u + 1u,
+	"the literal must decode to the rules file byte for byte");
+
+#endif

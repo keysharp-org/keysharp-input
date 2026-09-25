@@ -47,9 +47,32 @@ static void *consume(void *argument)
     return NULL;
 }
 
+/* A reserve keeps slots free for pushes that may use them. */
+static bool reserved_push_leaves_room(void)
+{
+    ksi_pipe_ring ring;
+    unsigned int value = 7u;
+    bool ok;
+
+    if (ksi_pipe_ring_init(&ring, sizeof(value), 4u) != 0) return false;
+    ok = ksi_pipe_ring_push_reserved(&ring, &value, 2u)
+        && ksi_pipe_ring_push_reserved(&ring, &value, 2u)
+        && !ksi_pipe_ring_push_reserved(&ring, &value, 2u)
+        && ksi_pipe_ring_push(&ring, &value)
+        && ksi_pipe_ring_push(&ring, &value)
+        && !ksi_pipe_ring_push(&ring, &value);
+    ksi_pipe_ring_close(&ring);
+    return ok;
+}
+
 int main(void)
 {
     ring_stress_context context;
+
+    if (!reserved_push_leaves_room()) {
+        fputs("FAIL pipe ring reserve\n", stderr);
+        return EXIT_FAILURE;
+    }
     pthread_t producer;
     pthread_t consumer;
 
@@ -77,6 +100,6 @@ int main(void)
     }
 
     ksi_pipe_ring_close(&context.ring);
-    puts("PASS pipe ring concurrent FIFO stress");
+    puts("PASS pipe ring reserve and concurrent FIFO stress");
     return EXIT_SUCCESS;
 }

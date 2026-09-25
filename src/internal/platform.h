@@ -30,22 +30,8 @@ typedef struct ksi_platform_backend {
     /* Kernel CLOCK_MONOTONIC timestamp in nanoseconds, used only for admission
      * ordering. Public hook timestamps retain their Windows-compatible units. */
     bool (*peek_oldest_pending_input)(int *out_fd, uint64_t *out_time_ns);
-    bool (*input_to_hook_event)(
-        const ksi_input *input,
-        uint32_t *hook_type,
-        ksi_hook_event_payload *event,
-        size_t *event_size);
-    int (*send_input)(const ksi_input *inputs, size_t count, uint32_t flags);
-    int (*replay_hook_event)(uint32_t hook_type, const ksi_hook_event_payload *event);
     int (*set_grab_hook_mask)(uint32_t hook_mask);
     int (*set_block_input_mask)(uint32_t block_mask);
-    void (*set_hook_event_callback)(ksi_hook_event_callback callback, void *context);
-    /* Called only by the output sequencer, serialized with replay and synthesis. */
-    void (*release_synthetic_keys)(void);
-    /* Main-thread detector; recreation stays on the output sequencer. */
-    bool (*synth_needs_recovery)(void);
-    /* Called only by the output sequencer after a synthetic write failure. */
-    void (*recreate_synth)(void);
     /* Lets the backend retry transient failures from the daemon's main thread.
      * The backend rate-limits its work. May be NULL. */
     void (*periodic_maintenance)(void);

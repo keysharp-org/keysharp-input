@@ -90,7 +90,7 @@ Operation availability and granted permission scopes are separate masks.
 | `0x1012` | SET_BLOCK_INPUT | `{u32 mask,u32 reserved=0}` | `{u32 effective,u32 reserved=0}` |
 | `0x1020` | GET_INDICATOR_STATE | empty | 4 bytes |
 | `0x1021` | GET_POINTER_POSITION | empty | 28 bytes |
-| `0x1022` | GET_KEY_STATE | empty | 200 bytes |
+| `0x1022` | GET_KEY_STATE | empty or `{u32 device_id}` | 200 bytes |
 | `0x1023` | GET_POINTER_BUTTONS | empty | 12 bytes |
 | `0x1024` | GET_IDLE_TIME | empty | 16 bytes |
 | `0x1025` | GET_MODIFIER_STATE | empty | 12 bytes |
@@ -102,6 +102,13 @@ Operation availability and granted permission scopes are separate masks.
 On OBSERVER_STREAM, subscribe/unsubscribe operate on passive subscriptions and
 return observation operation bits. They acquire no grabs and have no decision
 or heartbeat lease. Observer event request IDs are zero.
+
+GET_KEY_STATE with no payload or device ID zero reports the seat. A positive ID
+selects one listed device and returns NOT_FOUND after its removal; broker-owned
+outputs are never selectable. Both key bitmaps hold every `EV_KEY` code a
+source reports. The modifier mask and toggle bytes always describe the seat.
+The query requires Input Monitoring, including when only modifiers or toggle
+keys are of interest.
 
 DEVICES_LIST succeeds with `{u64 generation,u32 next_offset,u32 count,device[count]}`
 after the status. Pages contain at most eight records. A zero request generation

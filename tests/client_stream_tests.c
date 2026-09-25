@@ -107,6 +107,13 @@ OUTPUT_CALL(modifier_state, ksi_modifier_state,
 
 #undef OUTPUT_CALL
 
+static ksi_status call_device_key_state(ksi_connection *connection, ksi_error *error)
+{
+    ksi_key_state state;
+    ksi_key_state_init(&state);
+    return ksi_get_device_key_state(connection, 19u, &state, error);
+}
+
 typedef struct round_trip_case {
     uint16_t opcode;
     uint16_t flags;
@@ -124,6 +131,7 @@ static const uint8_t block_payload[KSI_BLOCK_INPUT_PAYLOAD_SIZE] = {
     LE32(3u), LE32(0u),
 };
 static const uint8_t hook_reply_payload[KSI_HOOK_DECISION_PREFIX_SIZE] = { 0 };
+static const uint8_t device_state_payload[] = { LE32(19u) };
 
 static const round_trip_case cases[] = {
     { KSI_OPCODE_AUTHORIZE, 0u, 1u, call_authorize, authorize_payload,
@@ -138,6 +146,8 @@ static const round_trip_case cases[] = {
       NULL, 0u, KSI_STATUS_PAYLOAD_SIZE + KSI_POINTER_POSITION_PAYLOAD_SIZE },
     { KSI_OPCODE_GET_KEY_STATE, 0u, 1u, call_key_state, NULL, 0u,
       KSI_STATUS_PAYLOAD_SIZE + KSI_KEY_STATE_PAYLOAD_SIZE },
+    { KSI_OPCODE_GET_KEY_STATE, 0u, 1u, call_device_key_state, device_state_payload, sizeof(device_state_payload),
+      KSI_STATUS_PAYLOAD_SIZE + KSI_KEY_STATE_PAYLOAD_SIZE },
     { KSI_OPCODE_GET_POINTER_BUTTONS, 0u, 1u, call_pointer_buttons,
       NULL, 0u, KSI_STATUS_PAYLOAD_SIZE + KSI_POINTER_BUTTONS_PAYLOAD_SIZE },
     { KSI_OPCODE_GET_IDLE_TIME, 0u, 1u, call_idle_time, NULL, 0u,
@@ -146,7 +156,7 @@ static const round_trip_case cases[] = {
       NULL, 0u, KSI_STATUS_PAYLOAD_SIZE + KSI_MODIFIER_STATE_PAYLOAD_SIZE },
 };
 
-_Static_assert(sizeof(cases) / sizeof(cases[0]) == 9u,
+_Static_assert(sizeof(cases) / sizeof(cases[0]) == 10u,
                "every previously untested request API needs a round trip");
 
 static void check_case(const round_trip_case *test)

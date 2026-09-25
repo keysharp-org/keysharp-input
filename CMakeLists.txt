@@ -72,10 +72,25 @@ add_executable(keysharp-input-service
     src/wake_pipe.c
     src/worker_pool.c)
 
+# The binary writes this rule on the portable and source channels, so its text is
+# generated from the packaged file rather than kept as a second copy.
+set(KEYSHARP_INPUT_UACCESS_RULES
+    "${CMAKE_CURRENT_SOURCE_DIR}/udev/70-keysharp-input-uaccess.rules")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${KEYSHARP_INPUT_UACCESS_RULES}")
+file(READ "${KEYSHARP_INPUT_UACCESS_RULES}" KSI_UACCESS_RULES_LITERAL)
+string(LENGTH "${KSI_UACCESS_RULES_LITERAL}" KSI_UACCESS_RULES_LENGTH)
+string(REPLACE "\\" "\\\\" KSI_UACCESS_RULES_LITERAL "${KSI_UACCESS_RULES_LITERAL}")
+string(REPLACE "\"" "\\\"" KSI_UACCESS_RULES_LITERAL "${KSI_UACCESS_RULES_LITERAL}")
+string(REPLACE "\n" "\\n\"\n\t\"" KSI_UACCESS_RULES_LITERAL "${KSI_UACCESS_RULES_LITERAL}")
+configure_file(src/uaccess_rules.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/uaccess_rules.h @ONLY)
+
 target_include_directories(keysharp-input-service
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 target_compile_definitions(keysharp-input-service PRIVATE
     _GNU_SOURCE
@@ -94,6 +109,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(keysharp-input-service PRIVATE
         src/platform/linux_devices.c
         src/platform/linux_synth.c
+        src/platform/linux_forward.c
+        src/platform/linux_output.c
         src/platform/platform_linux.c
         src/platform/vk_evdev.c)
     target_compile_definitions(keysharp-input-service PRIVATE KSI_PLATFORM_LINUX=1)
@@ -322,7 +339,7 @@ if(BUILD_TESTING)
         src/wake_pipe.c
         src/worker_pool.c
         src/platform/linux_devices.c
-        src/platform/linux_synth.c
+        src/platform/linux_output.c
         src/platform/platform_linux.c
         src/platform/vk_evdev.c)
     target_include_directories(keysharp-input-daemon-admission-tests PRIVATE
@@ -458,6 +475,8 @@ if(BUILD_TESTING)
     add_executable(keysharp-input-linux-device-state-tests
         tests/linux_device_state_tests.c
         src/platform/linux_synth.c
+        src/platform/linux_forward.c
+        src/platform/linux_output.c
         src/platform/vk_evdev.c)
     target_include_directories(keysharp-input-linux-device-state-tests PRIVATE include src)
     target_compile_definitions(keysharp-input-linux-device-state-tests PRIVATE
@@ -470,6 +489,21 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME keysharp-input-linux-device-state-tests
         COMMAND keysharp-input-linux-device-state-tests)
+
+    add_executable(keysharp-input-linux-forward-tests
+        tests/linux_forward_tests.c
+        src/platform/linux_output.c
+        src/platform/vk_evdev.c)
+    target_include_directories(keysharp-input-linux-forward-tests PRIVATE include src)
+    target_compile_definitions(keysharp-input-linux-forward-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(keysharp-input-linux-forward-tests PRIVATE
+        Threads::Threads PkgConfig::LIBEVDEV KeysharpPermissions::permissions)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(keysharp-input-linux-forward-tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME keysharp-input-linux-forward-tests COMMAND keysharp-input-linux-forward-tests)
 
     add_executable(keysharp-input-owned-text-file-tests
         tests/owned_text_file_tests.c

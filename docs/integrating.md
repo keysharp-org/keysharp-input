@@ -12,7 +12,7 @@ find_package(KeysharpInput 0.2 CONFIG REQUIRED)
 target_link_libraries(my-client PRIVATE KeysharpInput::client)
 ```
 
-The public ABI is 0.2 and the library SONAME is `libkeysharp-input.so.0`.
+The public ABI is 0.4 and the library SONAME is `libkeysharp-input.so.0`.
 `ksi_client_abi_major()` and `ksi_client_abi_minor()` provide runtime
 introspection. Socket protocol 2.0 is an implementation detail of this ABI.
 
@@ -163,6 +163,108 @@ See [the complete gamepad example](../examples/read-gamepad.c).
 - After `SYN_DROPPED`, the broker processes libevdev synchronization differences,
   including lost key releases, before normal event delivery resumes. Relative
   movement from an incomplete report cannot be reconstructed and is discarded.
+
+## Device key state
+
+`ksi_get_key_state` reports the seat. `ksi_get_device_key_state` (client ABI
+0.4) selects one source by the positive ID from `ksi_devices_list` or a hook or
+observer event; zero selects the seat, and events from synthesis carry zero, so
+check the ID before a device query. Unknown or removed IDs return
+`KSI_STATUS_NOT_FOUND`, and a service older than ABI 0.4 answers a device query
+with `KSI_STATUS_INVALID_REQUEST`. Both queries require Input Monitoring.
+
+Physical state is read from the kernel for every source, so it also covers
+sources another remapper has grabbed. The bitmaps hold every `EV_KEY` code a
+source reports, including touch and tool codes, and the seat is their union:
+releasing a key on one keyboard leaves another keyboard's hold intact.
+Broker-owned outputs never count as sources.
+
+Logical state is what the desktop receives: an ungrabbed source's keys, what
+a grabbed source holds downstream, and synthesis. A key the source held when its
+grab ended counts only if it still holds it downstream, until the source releases
+it, since the desktop never saw it pressed on the source itself. A source another interceptor
+owns contributes physical state only, but the broker learns of that owner only
+by trying to grab the source, so this holds while a hook or BlockInput wants
+the source. A device query's bitmaps describe that source alone, without
+synthesis, while its modifier mask and lock bytes describe the seat, which is
+what hooks use to name keypad keys. Logical state follows admitted output, so a
+query after a Send returns sees its result before paced output drains. A batch
+that goes through another client's hooks is admitted only once they pass it.
+
+See [the complete device-state example](../examples/read-key-state.c).
+
+## Forwarding and synthesis devices
+
+The keyboard keys of every intercepted keyboard, with their scan codes and
+repeats, are written to the generic `Keysharp Virtual Input` device, which also
+carries all client synthesis and hook Modify replacements except absolute
+pointer moves, and the buttons pressed after one in the same batch, which use
+`Keysharp Virtual Pointer` and are released there. Compositors read each
+device's queued events as a group, so only events on one device keep the order
+they were written in: sharing the keyboard device keeps a remap such as `+c::d`,
+which sends Shift up, `d` and Shift down around a Shift the user holds, in
+order, and a modifier held on one keyboard applies to keys from another. The
+device holds a key while synthesis or any keyboard holds it, so the desktop sees
+one press when the first holder presses and one release when the last lets go.
+While a keyboard is intercepted, the desktop sees its keys as coming from that
+device, so settings matched to one keyboard, such as a per-device layout, do not
+apply to them.
+
+Everything else an intercepted source reports, such as a mouse's motion and
+buttons, a combined device's pointer, or a keyboard's switches, is replayed
+through the source's own uinput clone, which keeps the source's name,
+bus/vendor/product IDs, input properties, axis ranges and motion units, and
+carries the physical path prefix `keysharp-input/forward/`. A clone has no
+keyboard keys or LEDs, and a keyboard's clone has no joystick buttons either, so
+udev never takes it for a controller; a keyboard with nothing else to report
+gets none. A
+game controller is never a keyboard, even when it reports a key such as
+`KEY_RECORD`, so keyboard hooks do not take it and it gets no clone.
+
+The installed udev rule keeps USB and PS/2 mouse hwdb DPI lookup working on
+clones, and systemd's own rules cover Bluetooth. Settings matched by an
+event-node path, physical connection path or device instance, and live
+compositor configuration, are not carried over. The lock LEDs the desktop sets
+on the generic keyboard device are relayed to every intercepted keyboard, since
+a compositor that keeps lock state per keyboard lights only the device that
+received the keys. A clone's switches follow
+its source whether or not it is grabbed, since logind reads them from clones
+too; force feedback is not relayed. No Keysharp device gets a session ACL: the
+desktop opens them through logind like physical devices.
+
+Clones are created when a client first asks for privileged input. A source is
+grabbed only once udev has initialized its outputs, the generic keyboard device
+for a keyboard and its clone if it has one, and once its keys and buttons are
+released. A touch or pen contact does not delay the grab, so the desktop may
+keep a contact that was in progress until the grab ends. Ending a grab releases
+what the source holds downstream that it no longer holds; a key still held stays
+down until the source releases it. When a source disappears, what it held
+downstream is released at once, and its clone is removed after a 100 ms drain;
+a running downstream remapper sees those releases, while a stopped one must
+recover its own state.
+
+Holds on the generic devices belong to their sender: a Send hold to its
+connection, and a Modify hold also to its hook and to the physical source key
+it replaced. A Modify hold also ends when that source's grab ends or the source
+disappears. Unsubscribing, a hook quarantine or a disconnect ends only the
+matching holds, after which Modify output from that hook is refused. Batches a
+connection sent before it closed still play whole, and what they hold is
+released after them. When the last client disconnects, every generic hold ends,
+while keys still physically held stay down until they are released.
+
+A sender's release of a key it holds ends only its own hold. A release from a
+sender that does not hold the key ends every generic hold of it and releases it
+for the sources still holding it, as a Win32 key-up does; a later synthetic
+press from anyone puts it back for them, and the physical release ends it. A physical key-up from an intercepted source that reaches the
+desktop ends every hold of that key the same way. A key-up a hook suppresses
+ends only the Modify holds derived from it.
+
+The system unit starts after `keyd.service`, so keyd grabs its hardware first and
+the broker intercepts keyd's virtual devices. The generic devices carry keyd's
+vendor ID, as does a clone of keyd's virtual pointer, so keyd leaves them alone.
+While another process grabs output carrying the broker's traffic, or a source's
+own clone, new grabs are deferred so one stream is not intercepted twice. A source
+another program has grabbed is retried every 3 seconds.
 
 ## Adapting a general hook library
 

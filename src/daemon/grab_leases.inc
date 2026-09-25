@@ -672,11 +672,14 @@ static int update_grab_state(ksi_daemon_state *state)
     uint32_t block_mask = active_block_input_mask(state);
     uint64_t ready;
     uint32_t effective_hook_mask;
-    bool keyboard_grabbed;
     bool interception_active;
     int result;
 
-    if (state == NULL || state->backend == NULL) {
+    if (state == NULL) {
+        return 0;
+    }
+    output_queue_sync_owners(state);
+    if (state->backend == NULL) {
         return 0;
     }
 
@@ -739,32 +742,26 @@ static int update_grab_state(ksi_daemon_state *state)
 
     state->interception_active = interception_active;
 
-    /* When the keyboard grab is released, any key the daemon replayed "down" on the
-     * uinput virtual device would be stranded there: the user's physical key-up lands
-     * on the now-ungrabbed real device and does not cancel the uinput key, so the
-     * compositor keeps seeing it held. Enqueue the release on the OUTPUT SEQUENCER
-     * thread (not here) so it is serialized with replay/synth -- no race on the synth
-     * state -- and the daemon main thread never blocks doing it. Fires only on the
-     * held->released edge so a steady grab does not repeatedly release. */
-    /* Use the EFFECTIVE hook mask (post fail-open) so the held->released edge
-     * fires -- and the stranded-key RELEASE_ALL below runs -- when a dead synth
-     * drops the keyboard grab, not only on a client unsubscribe. */
-    keyboard_grabbed = (effective_hook_mask & KSI_OPERATION_HOOK_KEYBOARD) != 0
-        || (block_mask & KSI_BLOCK_KEYBOARD) != 0;
+    /* MODIFY holds belong to their hook class. Releasing one class must not
+     * disturb direct SendInput holds or a forwarding device still used by the
+     * other class (notably combined keyboard/mouse devices). */
+    static const uint32_t hook_types[] = { KSI_HOOK_KEYBOARD, KSI_HOOK_MOUSE };
 
-    if (state->keyboard_grab_active && !keyboard_grabbed) {
-        /* Only consume the held->released edge once the release is actually queued.
-         * If the enqueue fails (queue saturated / OOM), leave keyboard_grab_active set
-         * so the next update_grab_state call -- there are many callers and the queue
-         * drains continuously -- retries, rather than stranding a key "down" on uinput
-         * with no recovery until the next grab cycle. */
-        if (output_queue_push_release_all(&state->output_queue)) {
-            state->keyboard_grab_active = false;
-        } else {
-            fprintf(stderr, "keysharp-input: failed to enqueue synthetic key release on keyboard ungrab; will retry\n");
+    for (size_t i = 0u; i < sizeof(hook_types) / sizeof(hook_types[0]); i++) {
+        uint32_t operation = hook_type_to_operation(hook_types[i]);
+
+        if ((effective_hook_mask & operation) != 0u) {
+            state->owned_hook_mask |= operation;
+        } else if ((state->owned_hook_mask & operation) != 0u) {
+            const ksi_synth_owner owner = { .hook_type = hook_types[i] };
+
+            if (output_queue_push_release_owner(&state->output_queue, &owner)) {
+                state->owned_hook_mask &= ~operation;
+            } else {
+                fprintf(stderr,
+                    "keysharp-input: failed to enqueue hook-owned synthetic release; will retry\n");
+            }
         }
-    } else {
-        state->keyboard_grab_active = keyboard_grabbed;
     }
 
     if (!interception_active && state->reader_realtime) {
@@ -932,8 +929,7 @@ static void apply_fail_open_if_requested(ksi_daemon_state *state)
         return;
     }
 
-    fprintf(stderr,
-        "keysharp-input: safety-critical command queue overflow; clearing hooks and BlockInput\n");
+    fprintf(stderr, "keysharp-input: failing open; clearing hooks and BlockInput\n");
     clear_hook_state(state);
 
     if (update_grab_state(state) != 0) {
@@ -1042,6 +1038,9 @@ static void record_client_hook_failure(
     client->last_hook_quarantine_ms[lane_index] = now;
     client->quarantined_hooks |= lane_bit;
     hook_send_ref_mark_stalled(client->hook_send_ref, lane_index);
+    output_queue_sync_owners(state);
+    release_connection_output(state, client->connection_id, hook_type);
+
     retry_after_ms = 1000u << (client->consecutive_hook_failures[lane_index] > 5u
         ? 4u
         : client->consecutive_hook_failures[lane_index] - 1u);

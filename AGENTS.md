@@ -13,7 +13,8 @@ Three things ship together:
 - `keysharp-input` — the CLI and the service binary (`daemon`, `probe`, `info`,
   `permissions`).
 - `libkeysharp-input.so.0` — the public client library, header `keysharp_input/client.h`.
-- systemd units, a polkit action, and a uaccess udev rule.
+- systemd units, a polkit action, and a udev rule giving forwarding clones their
+  source's bus metadata.
 
 The public client ABI version is declared in `include/keysharp_input/client.h`. The socket wire protocol is private and is an
 implementation detail of that ABI; `docs/protocol.md` documents it for service

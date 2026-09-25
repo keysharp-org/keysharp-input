@@ -8,7 +8,6 @@
 /* These bits describe work already admitted by the daemon. They never cross
  * the client protocol boundary. */
 #define KSI_INTERNAL_SYNTH_BATCH_FRAGMENT 0x00000002u
-#define KSI_INTERNAL_SYNTH_REPLAY 0x00000004u
 #define KSI_INTERNAL_SYNTH_BATCH_START 0x00000008u
 /* Readiness of the second uinput device (ABS_X/ABS_Y). Deliberately outside the
  * public KSI_OPERATION_ALL range: it is only ever OR-ed into

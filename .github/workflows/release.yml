@@ -151,8 +151,6 @@ jobs:
           install -D -m 0644 systemd/keysharp-input-permissions.conf \
             "$root/tmpfiles/keysharp-input-permissions.conf"
           install -D -m 0644 polkit/org.keysharp.input.policy "$root/polkit/org.keysharp.input.policy"
-          install -D -m 0644 udev/70-keysharp-input-uaccess.rules \
-            "$root/udev/70-keysharp-input-uaccess.rules"
           install -d -m 0755 "$root/docs"
           install -m 0644 docs/*.md "$root/docs/"
           cp -R examples "$root/examples"

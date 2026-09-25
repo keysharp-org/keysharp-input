@@ -96,15 +96,17 @@ service_configuration_matches \
     "$source_dir/systemd/keysharp-input.service.in" \
     '@CMAKE_INSTALL_FULL_BINDIR@/keysharp-input' \
     '@KEYSHARP_INPUT_TMPFILES_CONFIG@'
-sed 's/NoNewPrivileges=yes/NoNewPrivileges=no/' \
-    "$source_dir/systemd/keysharp-input.service.in" \
-    > "$temporary/weakened.service"
-if service_configuration_matches "$temporary/weakened.service" \
-    '@CMAKE_INSTALL_FULL_BINDIR@/keysharp-input' \
-    '@KEYSHARP_INPUT_TMPFILES_CONFIG@'; then
-    echo "a weakened system service was accepted" >&2
-    exit 1
-fi
+for weakening in 's/NoNewPrivileges=yes/NoNewPrivileges=no/' \
+    's/DeviceAllow=char-input rw/DeviceAllow=char-input r/'; do
+    sed "$weakening" "$source_dir/systemd/keysharp-input.service.in" \
+        > "$temporary/weakened.service"
+    if service_configuration_matches "$temporary/weakened.service" \
+        '@CMAKE_INSTALL_FULL_BINDIR@/keysharp-input' \
+        '@KEYSHARP_INPUT_TMPFILES_CONFIG@'; then
+        echo "a weakened system service was accepted: $weakening" >&2
+        exit 1
+    fi
+done
 socket_configuration_matches "$source_dir/systemd/keysharp-input.socket"
 sed 's/SocketMode=0666/SocketMode=0600/' \
     "$source_dir/systemd/keysharp-input.socket" > "$temporary/wrong.socket"
@@ -123,6 +125,17 @@ if policy_configuration_matches "$temporary/weakened.policy"; then
     exit 1
 fi
 udev_configuration_matches "$source_dir/udev/70-keysharp-input-uaccess.rules"
+# Rules that drop the hwdb lookup or grant the session a Keysharp device.
+for weakening in '/keysharp-input\/forward/d' '/^SUBSYSTEM!=/a\
+ATTRS{phys}=="keysharp-input/forward/*", TAG+="uaccess"' '/^SUBSYSTEM!=/a\
+ATTRS{name}=="Keysharp Virtual Input", TAG+="uaccess"'; do
+    sed "$weakening" "$source_dir/udev/70-keysharp-input-uaccess.rules" \
+        > "$temporary/weakened.rules"
+    if udev_configuration_matches "$temporary/weakened.rules"; then
+        echo "a weakened udev rule was accepted: $weakening" >&2
+        exit 1
+    fi
+done
 
 printf '%s\n' '#!/bin/sh' \
     "printf '%s\\n' client_abi_major=$expected_client_abi_major client_abi_minor=$expected_client_abi_minor" \

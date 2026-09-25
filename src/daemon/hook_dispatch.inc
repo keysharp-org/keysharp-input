@@ -1,31 +1,27 @@
+/* A key or button transition, or a report's end, must not overtake input still
+ * queued in its lane: a release would precede its press, or a report would be
+ * ended before its key. */
+static bool keeps_lane_order(const ksi_lane_egress *egress, bool physical_input)
+{
+    const ksi_forward_packet *packet = &egress->replay;
+
+    return physical_input
+        && ((ksi_forward_key_values(packet) & (KSI_FORWARD_KEY_UP | KSI_FORWARD_KEY_DOWN)) != 0u
+            || (packet->count == 1u && packet->events[0].type == EV_SYN
+                && packet->events[0].code == SYN_REPORT));
+}
+
+/* Passes an event its lane could not take. One that keeps lane order fails
+ * open instead, and ending the grab releases what the source's outputs hold. */
 static void complete_hook_dispatch_fallback(
     ksi_daemon_state *state,
-    uint32_t hook_type,
-    const void *event,
-    size_t event_size,
     const ksi_lane_egress *egress,
     ksi_synth_completion *completion,
+    bool physical_input,
     uint64_t input_generation)
 {
-    bool ok = true;
-
-    if (egress != NULL) {
-        if (egress->type == KSI_LANE_EGRESS_SYNTH) {
-            ok = output_queue_push_synth(&state->output_queue,
-                egress->synth_inputs,
-                egress->synth_count,
-                egress->synth_flags,
-                input_generation);
-        } else if (egress->type == KSI_LANE_EGRESS_REPLAY) {
-            ksi_hook_event_payload payload;
-
-            memset(&payload, 0, sizeof(payload));
-            payload.hook_type = hook_type;
-            memcpy(&payload.event, event, event_size);
-            ok = output_queue_push_replay(
-                &state->output_queue, hook_type, &payload, input_generation);
-        }
-    }
+    bool ok = !keeps_lane_order(egress, physical_input)
+        && enqueue_egress(state, egress, input_generation);
 
     if (completion != NULL) {
         if (ok) {
@@ -38,7 +34,7 @@ static void complete_hook_dispatch_fallback(
         synthetic_hook_queue_complete_inflight(state);
     }
 
-    if (!ok && egress != NULL && egress->type == KSI_LANE_EGRESS_REPLAY) {
+    if (!ok && physical_input) {
         request_fail_open(state);
     }
 }
@@ -76,11 +72,11 @@ static ksi_lane_event *create_hook_lane_event(
     event_id = state->next_event_id++;
     lane_index = hook_type_to_lane_index(hook_type);
 
-    /* Windows installs each hook TYPE at the head of its own chain. Connection
-     * age is not install age: an older process which unsubscribes/re-subscribes
-     * becomes newest for that type. Collect by monotonic subscription ordinal;
-     * connection id is only a deterministic fallback for zeroed test fixtures. */
+    /* As on Windows, the newest subscription to a hook type runs first, ordered by
+     * subscription ordinal rather than connection age (the id breaks ties in zeroed
+     * fixtures). Raw report fragments carry no hook payload, so they collect none. */
     for (nfds_t i = state->client_count;
+            event_size != 0u &&
             i-- > 0 && candidate_count < KSI_MAX_CLIENTS; ) {
         const ksi_client *c = &state->clients[i];
         ksi_lane_subscriber candidate;
@@ -133,12 +129,10 @@ static ksi_lane_event *create_hook_lane_event(
     lane_event->synthetic_completion = completion;
     lane_event->nesting_depth = nesting_depth;
 
-    if (egress != NULL) {
-        lane_event->egress = *egress;
-    }
+    lane_event->egress = *egress;
 
     lane_event->payload.hook_type = hook_type;
-    memcpy(&lane_event->payload.event, event, event_size);
+    if (event_size != 0u) memcpy(&lane_event->payload.event, event, event_size);
     lane_event->payload_size =
         sizeof(lane_event->payload.hook_type)
         + sizeof(lane_event->payload.reserved)
@@ -161,35 +155,22 @@ static ksi_lane_event *create_hook_lane_event(
 static void enqueue_hook_lane_event(ksi_daemon_state *state, ksi_lane_event *event)
 {
     ksi_hook_lane *lane = lane_for_hook_type(state, event->hook_type);
+    size_t reserve = keeps_lane_order(&event->egress, event->physical_input)
+        ? 0u : KSI_LANE_TRANSITION_RESERVE;
 
     if (event->physical_input) {
         atomic_fetch_add(&state->physical_hook_inflight, 1u);
     }
 
-    if (!ksi_pipe_ring_push(&lane->action_queue.ring, &event)) {
-        bool egress_ok = lane_event_enqueue_egress(lane, event);
-
-        if (!egress_ok && event->egress.type == KSI_LANE_EGRESS_REPLAY) {
-            request_fail_open(state);
-        }
-
+    if (!ksi_pipe_ring_push_reserved(&lane->action_queue.ring, &event, reserve)) {
         fprintf(stderr, "keysharp-input: hook lane queue full; bypassed hook event %llu\n",
             (unsigned long long)event->event_id);
         lane_event_release_send_refs(event);
+        complete_hook_dispatch_fallback(state, &event->egress, event->synthetic_completion,
+            event->physical_input, event->input_generation);
 
         if (event->physical_input) {
             atomic_fetch_sub(&state->physical_hook_inflight, 1u);
-        }
-
-        if (event->synthetic_completion != NULL) {
-            if (egress_ok) {
-                synth_completion_complete(event->synthetic_completion);
-            } else {
-                synth_completion_fail(event->synthetic_completion,
-                    KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
-            }
-
-            synthetic_hook_queue_complete_inflight(state);
         }
 
         lane_event_dispose(event);
@@ -212,8 +193,7 @@ static void dispatch_hook_event_to_lane(
 
     if (lane_event == NULL) {
         complete_hook_dispatch_fallback(
-            state, hook_type, event, event_size, egress, completion,
-            input_generation);
+            state, egress, completion, physical_input, input_generation);
         return;
     }
 
@@ -221,46 +201,65 @@ static void dispatch_hook_event_to_lane(
     enqueue_hook_lane_event(state, lane_event);
 }
 
-static bool physical_key_is_down(const uint8_t *keys, uint32_t code)
+static void push_source_state(ksi_daemon_state *state, const ksi_forward_packet *packet)
 {
-    return (keys[code >> 3u] & (uint8_t)(1u << (code & 7u))) != 0u;
+    if (!output_queue_push_packet(&state->output_queue, KSI_OUTPUT_ACTION_SOURCE_STATE,
+            packet, current_input_generation(state))) {
+        request_fail_open(state);
+    }
 }
 
-static bool panic_chord_is_down(const uint8_t *physical_keys)
-{
-    return physical_key_is_down(physical_keys, KEY_BACKSPACE)
-        && physical_key_is_down(physical_keys, KEY_ESC)
-        && physical_key_is_down(physical_keys, KEY_ENTER);
-}
-
-static void daemon_handle_physical_key_event(void *context, uint32_t scan_code)
+/* Raw fragments share their class's lane, so each report keeps its order. A
+ * release from an ungrabbed source has no hook form and nothing of its source
+ * waits in a lane, so it is queued directly. */
+static bool daemon_forward_physical_event(
+    void *context, uint32_t hook_type, const ksi_forward_packet *replay)
 {
     ksi_daemon_state *state = context;
-    ksi_key_state_payload key_state;
+    ksi_lane_egress egress = { .type = KSI_LANE_EGRESS_REPLAY, .replay = *replay };
+    uint64_t input_generation = current_input_generation(state);
 
-    if (state == NULL || !state->interception_active
-        || (scan_code != KEY_BACKSPACE && scan_code != KEY_ESC && scan_code != KEY_ENTER)) {
-        return;
+    if ((replay->flags & KSI_FORWARD_UNGRABBED) != 0u) {
+        return output_queue_push_packet(&state->output_queue, KSI_OUTPUT_ACTION_SOURCE_STATE,
+                replay, input_generation)
+            && output_queue_push_replay(&state->output_queue, replay, input_generation);
     }
-
-    if (!ksi_linux_devices_get_key_state(&key_state)
-        || !panic_chord_is_down(key_state.physical_keys)) {
-        return;
+    /* Input read while no seat owner is active reaches nobody. */
+    if (state->input_owner_enforced
+        && !atomic_load_explicit(&state->active_input_uid_valid, memory_order_acquire)) {
+        return true;
     }
+    push_source_state(state, replay);
+    dispatch_hook_event_to_lane(state, hook_type, NULL, 0u, &egress, NULL, true, input_generation);
+    return true;
+}
 
+static uint64_t daemon_end_forward_grab(void *context, uint64_t target, uint8_t *kept)
+{
+    return output_queue_push_end_grab(&((ksi_daemon_state *)context)->output_queue, target, kept);
+}
+
+static void daemon_close_forward(void *context, uint64_t target)
+{
+    output_queue_push_close(&((ksi_daemon_state *)context)->output_queue, target);
+}
+
+/* The main loop applies it, since the reader may be switching a grab. */
+static void daemon_handle_panic(void *context)
+{
+    ksi_daemon_state *state = context;
+
+    if (!state->interception_active) return;
     fprintf(stderr, "keysharp-input: physical input panic chord activated\n");
-    clear_hook_state(state);
-
-    if (update_grab_state(state) != 0) {
-        fprintf(stderr, "keysharp-input: panic chord failed to release grabs\n");
-    }
+    request_fail_open(state);
 }
 
 static void daemon_handle_hook_event(
     void *context,
     uint32_t hook_type,
     const void *event,
-    size_t event_size)
+    size_t event_size,
+    const ksi_forward_packet *replay)
 {
     ksi_daemon_state *state = context;
     uint32_t subscription_bit = hook_type_to_operation(hook_type);
@@ -274,6 +273,8 @@ static void daemon_handle_hook_event(
         return;
     }
 
+    push_source_state(state, replay);
+
     block_bit = hook_type == KSI_HOOK_KEYBOARD
         ? KSI_BLOCK_KEYBOARD
         : KSI_BLOCK_MOUSE;
@@ -281,36 +282,16 @@ static void daemon_handle_hook_event(
         ? ((((const ksi_keyboard_hook_event *)event)->flags & KSI_KEYBOARD_HOOK_INJECTED) != 0)
         : ((((const ksi_mouse_hook_event *)event)->flags & KSI_MOUSE_HOOK_INJECTED) != 0);
 
-    /* Input blocking suppresses application delivery while the owning hook
-     * continues to receive events so it can turn blocking off. Dispatch the
-     * event normally, then suppress egress regardless of its hook decision. */
+    /* The hook that blocks input still sees events so it can unblock; only egress
+     * is suppressed. Events of a class nobody hooks (a combined device grabbed for
+     * the other class) still take their lane, which keeps each report in order. */
     bool block_active = !is_injected && (active_block_input_mask(state) & block_bit) != 0;
+    ksi_lane_egress egress = {
+        .type = (is_injected || block_active) ? KSI_LANE_EGRESS_NONE : KSI_LANE_EGRESS_REPLAY,
+        .replay = *replay,
+    };
 
-    if (!any_matching_hook_subscriptions(state, hook_type)) {
-        /* Mixed devices may be grabbed for the other input class. BlockInput with
-         * no matching hook subscription drops the event from applications. */
-        if (!is_injected && !block_active) {
-            ksi_hook_event_payload payload;
-            memset(&payload, 0, sizeof(payload));
-            payload.hook_type = hook_type;
-            memcpy(&payload.event, event, event_size);
-
-            if (!output_queue_push_replay(&state->output_queue, hook_type, &payload,
-                    current_input_generation(state))) {
-                fprintf(stderr, "keysharp-input: replay enqueue of unhooked grabbed input failed\n");
-                request_fail_open(state);
-            }
-        }
-        return;
-    }
-
-    {
-        ksi_lane_egress egress;
-
-        memset(&egress, 0, sizeof(egress));
-        egress.type = (is_injected || block_active) ? KSI_LANE_EGRESS_NONE : KSI_LANE_EGRESS_REPLAY;
-        dispatch_hook_event_to_lane(
-            state, hook_type, event, event_size, &egress, NULL, true,
-            current_input_generation(state));
-    }
+    dispatch_hook_event_to_lane(
+        state, hook_type, event, event_size, &egress, NULL, true,
+        current_input_generation(state));
 }

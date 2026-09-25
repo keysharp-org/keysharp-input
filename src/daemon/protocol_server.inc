@@ -477,6 +477,11 @@ static void handle_hook_subscription(
         return;
     }
 
+    if (message->header->opcode != KSI_OPCODE_SUBSCRIBE_HOOK
+        && (old_subscriptions & subscription_bit) != 0u) {
+        release_connection_output(state, client->connection_id, payload.hook_type);
+    }
+
     renew_client_lease(client);
     uint8_t response[KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE];
     size_t response_size = ksi_protocol_encode_u32_result(
@@ -833,7 +838,7 @@ static void handle_synthesize_input(
         if ((synth_flags & KSI_SYNTH_BYPASS_HOOK) != 0u
             || count == 0u) {
             if (!output_queue_push_synth(&state->output_queue, inputs,
-                    count, synth_flags, input_generation)) {
+                    count, synth_flags, input_generation, client->connection_id)) {
                 send_status(client->fd, message->header,
                     KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
                 return;
@@ -869,7 +874,6 @@ static void handle_synthesize_input(
             free(transaction);
             return;
         }
-
         transaction->count = (uint32_t)expanded_count;
         transaction->depth = depth;
         transaction->origin_generation = atomic_load(&active_lane->flush_generation);
@@ -902,7 +906,7 @@ static void handle_synthesize_input(
 
             if (!create_synthetic_lane_event(state, &member->input, i == 0u,
                     depth, NULL, &member->event,
-                    input_generation)) {
+                    input_generation, client->connection_id)) {
                 synth_completion_fail(completion,
                     KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
                 transaction->completion = NULL;
@@ -947,7 +951,6 @@ static void handle_synthesize_input(
                 KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             return;
         }
-
         if (!synthetic_hook_queue_push(
                 &state->synthetic_hook_queue,
                 inputs,
@@ -955,7 +958,8 @@ static void handle_synthesize_input(
                 expanded_count,
                 monotonic_ns(),
                 completion,
-                input_generation)) {
+                input_generation,
+                client->connection_id)) {
             synth_completion_fail(completion,
                 KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             send_status(client->fd, message->header,
@@ -968,8 +972,7 @@ static void handle_synthesize_input(
         return;
     } else {
         if (!output_queue_push_synth(&state->output_queue,
-                inputs, count, synth_flags,
-                input_generation)) {
+                inputs, count, synth_flags, input_generation, client->connection_id)) {
             send_status(client->fd, message->header,
                 KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             return;
@@ -1208,9 +1211,7 @@ static void handle_get_key_state(
 {
     ksi_key_state_payload result;
     uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_KEY_STATE_PAYLOAD_SIZE];
-    bool caps = false, num = false, scroll = false;
-
-    if (message->payload_size != 0u) {
+    if (message->payload_size != 0u && message->payload_size != KSI_KEY_STATE_REQUEST_SIZE) {
         send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST,
             KSI_DETAIL_PAYLOAD_SIZE);
         return;
@@ -1222,20 +1223,12 @@ static void handle_get_key_state(
         return;
     }
 
-    /* Refresh the indicator state directly from hardware (EVIOCGLED) before
-     * reading it, so callers get the current LED state rather than the
-     * potentially stale EV_LED-derived cache. This is important for toggle-key
-     * checks immediately after a synthetic CapsLock/NumLock/ScrollLock event
-     * (e.g. the ToggleKeyState call in SendKeys), where the compositor's LED
-     * acknowledgement may not yet have produced an EV_LED event. */
-    ksi_linux_devices_refresh_indicator_state();
-
-    memset(&result, 0, sizeof(result));
-    (void)ksi_linux_devices_get_key_state(&result);
-    ksi_linux_devices_get_indicator_state(&caps, &num, &scroll);
-    result.caps_lock   = caps   ? 1u : 0u;
-    result.num_lock    = num    ? 1u : 0u;
-    result.scroll_lock = scroll ? 1u : 0u;
+    uint32_t device_id = message->payload_size == KSI_KEY_STATE_REQUEST_SIZE
+        ? ksi_wire_read_u32(message->payload) : 0u;
+    if (!ksi_linux_devices_get_device_key_state(device_id, &result) && device_id != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_NOT_FOUND, KSI_DETAIL_NONE);
+        return;
+    }
 
     ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
     (void)ksi_protocol_encode_key_state(
@@ -1264,7 +1257,6 @@ static void handle_get_modifier_state(
         return;
     }
 
-    ksi_linux_devices_refresh_indicator_state();
     memset(&result, 0, sizeof(result));
     (void)ksi_linux_devices_get_modifier_state(&result);
     ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
@@ -1408,6 +1400,7 @@ static void add_client(
     client->connected_at_ms = monotonic_ms();
     client->last_activity_ms = client->connected_at_ms;
     state->client_count++;
+    output_queue_sync_owners(state);
 
     if (g_verbose) {
         printf("accepted client fd=%d pid=%ld uid=%ld gid=%ld\n",

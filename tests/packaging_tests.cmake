@@ -109,4 +109,29 @@ foreach(required
     endif()
 endforeach()
 
+# The binary is the one writer of the /etc rule and its text is generated from the
+# packaged file, so neither the installer nor main.c may carry a copy.
+string(FIND "${main_source}" "#include \"uaccess_rules.h\"" found)
+if(found EQUAL -1 OR main_source MATCHES "KSI_UACCESS_RULES_CONTENTS\\[\\][ \t]*=")
+    message(FATAL_ERROR "main.c must take the uaccess rule from the generated header")
+endif()
+string(FIND "${installer}" "$archive_dir/udev/" found)
+if(NOT found EQUAL -1)
+    message(FATAL_ERROR "portable installer copies the udev rule the binary owns")
+endif()
+
+# The rule finds forwarding clones by the phys prefix the service gives them.
+file(READ "${SOURCE_DIR}/src/internal/linux_forward.h" forward_header)
+string(REGEX MATCH "#define KSI_FORWARD_PHYS_PREFIX \"([^\"]+)\""
+    prefix_declaration "${forward_header}")
+if(NOT prefix_declaration)
+    message(FATAL_ERROR "forwarding phys prefix could not be read")
+endif()
+set(forward_phys_match "ATTRS{phys}==\"${CMAKE_MATCH_1}*\"")
+file(READ "${SOURCE_DIR}/udev/70-keysharp-input-uaccess.rules" udev_rule)
+string(FIND "${udev_rule}" "${forward_phys_match}" found)
+if(found EQUAL -1)
+    message(FATAL_ERROR "udev rule is missing ${forward_phys_match}")
+endif()
+
 message(STATUS "keysharp-input packaging contract passed")

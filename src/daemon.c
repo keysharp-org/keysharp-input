@@ -42,7 +42,7 @@
 #include "device_codec.h"
 
 #define KSI_MAX_CLIENTS 64
-#define KSI_MAX_BACKEND_FDS 160
+#define KSI_MAX_BACKEND_FDS KSI_LINUX_MAX_POLL_FDS
 #define KSI_MAX_POLL_FDS (4 + KSI_MAX_BACKEND_FDS + KSI_MAX_CLIENTS)
 #define KSI_MAX_PENDING_COMMANDS 256
 #define KSI_MAX_MODIFY_INPUTS KSI_MAX_SYNTH_INPUTS
@@ -50,6 +50,9 @@
 /* Per-lane consecutive hook failures before the client is disconnected. */
 #define KSI_MAX_CONSECUTIVE_HOOK_FAILURES 5u
 #define KSI_MAX_LANE_ACTIONS 512u
+/* Lane slots kept for key and button transitions, which must not bypass a
+ * full lane; other events carry no held state and may. */
+#define KSI_LANE_TRANSITION_RESERVE 64u
 /* Cap on read() iterations per client per poll pass. Without it a client that
  * streams unanswered frames (e.g. one-way HEARTBEATs) keeps the evdev-reader
  * thread in the client read loop, starving physical-device ingestion — the
@@ -117,6 +120,7 @@ static ksi_worker_pool g_permission_worker_pool;
 typedef struct ksi_permission_task ksi_permission_task;
 static void free_permission_task(void *context);
 static uint64_t monotonic_ms(void);
+static uint64_t monotonic_ns(void);
 
 typedef enum ksi_client_state {
     KSI_CLIENT_STATE_IDENTIFYING,     /* process identity resolution running on worker thread */
@@ -266,13 +270,26 @@ static void command_queue_destroy(ksi_daemon_command_queue *q)
  * helper functions live later in the file, alongside the sequencer thread. */
 typedef enum ksi_output_action_type {
     KSI_OUTPUT_ACTION_REPLAY = 0,
+    KSI_OUTPUT_ACTION_SOURCE_STATE,
     KSI_OUTPUT_ACTION_SYNTH,
-    /* Release keys held by replay/synth, serialized with normal output. */
+    KSI_OUTPUT_ACTION_RELEASE_SYNTH_OWNER,
+    /* Release every key held on the generic devices, for synthesis and for
+     * every source, and on the forwarding clones, serialized with normal
+     * output. */
     KSI_OUTPUT_ACTION_RELEASE_ALL,
     /* Recreate a broken synthetic-output device. Runs the stop+start on the
      * output sequencer thread so it honors the single-thread invariant for the
      * uinput fds / key-down table instead of racing them from the main thread. */
     KSI_OUTPUT_ACTION_RECREATE_SYNTH,
+    /* Moves a source's written output to next_target once it is ungrabbed;
+     * see ksi_linux_forward_end_grab. */
+    KSI_OUTPUT_ACTION_END_GRAB,
+    /* Release every synthetic hold. Holds of keys still physically down end
+     * with their forwarded releases. */
+    KSI_OUTPUT_ACTION_RELEASE_GENERIC,
+    /* Retires the outputs of the source next_target names; see
+     * ksi_linux_forward_close. */
+    KSI_OUTPUT_ACTION_CLOSE_SOURCE,
 } ksi_output_action_type;
 
 typedef struct ksi_output_action {
@@ -280,8 +297,9 @@ typedef struct ksi_output_action {
     /* Zero is reserved for daemon-internal safety actions. Client/physical
      * output is tagged with the active-seat generation which admitted it. */
     uint64_t input_generation;
-    uint32_t hook_type;
-    ksi_hook_event_payload replay_payload;
+    ksi_forward_packet packet;
+    uint64_t next_target;
+    ksi_synth_owner synth_owner;
     uint32_t synth_flags;
     uint32_t synth_count;
     ksi_input *synth_inputs;
@@ -302,6 +320,13 @@ typedef struct ksi_output_queue {
     int wake_read_fd;
     int wake_write_fd;
     struct ksi_daemon_state *state;
+    /* Connections that may still admit output, with the hook operations they
+     * hold; a Modify decision needs its hook. Rebuilt by output_queue_sync_owners. */
+    struct {
+        uint64_t connection_id;
+        uint32_t hooks;
+    } owners[KSI_MAX_CLIENTS];
+    size_t owner_count;
 } ksi_output_queue;
 
 typedef struct ksi_synth_completion {
@@ -323,6 +348,9 @@ typedef enum ksi_lane_egress_type {
 
 typedef struct ksi_lane_egress {
     ksi_lane_egress_type type;
+    ksi_forward_packet replay;
+    /* The client whose synthesis this is; it owns what the output holds. */
+    uint64_t connection_id;
     uint32_t synth_flags;
     uint32_t synth_count;
     ksi_input synth_inputs[1];
@@ -333,7 +361,11 @@ typedef struct ksi_synthetic_hook_item {
     uint64_t queued_at_ns;
     ksi_synth_completion *completion;
     uint64_t input_generation;
+    uint64_t connection_id;
     bool batch_start;  /* marks the client-batch surrogate boundary */
+    /* Where a closed connection's accepted output ends: its holds are
+     * released here, after its batches have played whole. */
+    bool release_owner;
 } ksi_synthetic_hook_item;
 
 typedef struct ksi_synthetic_hook_queue {
@@ -416,7 +448,6 @@ static inline size_t ksi_lane_decision_size(uint32_t input_count)
     return offsetof(ksi_lane_decision, inputs) + (size_t)input_count * sizeof(ksi_input);
 }
 
-/* If a lane is full, new physical events bypass hooks and replay fail-open. */
 typedef struct ksi_lane_action_queue {
     ksi_pipe_ring ring;
 } ksi_lane_action_queue;
@@ -494,8 +525,8 @@ typedef struct ksi_daemon_state {
     /* Independent hook lanes; shared subscribers are serialized by hook_send_ref. */
     ksi_hook_lane keyboard_lane;
     ksi_hook_lane mouse_lane;
-    /* Used to enqueue RELEASE_ALL on keyboard grab held->released. */
-    bool keyboard_grab_active;
+    /* Hook classes whose source-owned MODIFY output may still be held. */
+    uint32_t owned_hook_mask;
     bool interception_active;
     /* The main evdev reader needs real-time priority only while it owns an
      * interception grab. Idle observation remains ordinary SCHED_OTHER work. */
@@ -518,11 +549,17 @@ static void record_client_hook_failure(
     uint32_t reason);
 static void lane_flush_passthrough(ksi_hook_lane *lane);
 static bool output_queue_push_release_all(ksi_output_queue *q);
+static bool output_queue_push_release_generic(ksi_output_queue *q);
+static bool synthetic_hook_queue_push_release(ksi_synthetic_hook_queue *q, uint64_t connection_id);
+static bool output_queue_push_release_owner(
+    ksi_output_queue *q, const ksi_synth_owner *owner);
 static bool input_owner_matches_uid(
     const ksi_daemon_state *state, uid_t uid);
 static void update_observer_callbacks(ksi_daemon_state *state);
 static uint64_t current_input_generation(const ksi_daemon_state *state);
 static uint64_t advance_input_generation(ksi_daemon_state *state);
+static void request_fail_open(ksi_daemon_state *state);
+static uint32_t hook_type_to_operation(uint32_t hook_type);
 
 /* Per-hook-type failure-counter slot: 0 keyboard, 1 mouse. */
 static size_t hook_type_to_lane_index(uint32_t hook_type)
@@ -825,8 +862,7 @@ static void run_backend_maintenance(ksi_daemon_state *state)
         backend->periodic_maintenance();
     }
 
-    if (backend->synth_needs_recovery != NULL
-        && backend->synth_needs_recovery()
+    if (ksi_linux_synth_needs_recovery()
         && !output_queue_push_recreate_synth(&state->output_queue)) {
         fprintf(stderr, "keysharp-input: failed to enqueue synthetic output device recovery\n");
     }
@@ -989,12 +1025,11 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         return 1;
     }
 
-    if (backend->set_hook_event_callback != NULL) {
-        backend->set_hook_event_callback(daemon_handle_hook_event, daemon_state);
-    }
+    ksi_linux_devices_set_hook_event_callback(daemon_handle_hook_event, daemon_state);
+    ksi_linux_devices_set_forward_event_callback(daemon_forward_physical_event,
+        daemon_end_forward_grab, daemon_close_forward, daemon_state);
 
-    ksi_linux_devices_set_physical_key_event_callback(
-        daemon_handle_physical_key_event, daemon_state);
+    ksi_linux_devices_set_panic_callback(daemon_handle_panic, daemon_state);
 
     if (ksi_worker_pool_init(&g_worker_pool) != 0
         || ksi_worker_pool_init(&g_identify_worker_pool) != 0
@@ -1010,11 +1045,10 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         ksi_worker_pool_destroy(&g_identify_worker_pool);
         ksi_worker_pool_destroy(&g_permission_worker_pool);
 
-        if (backend->set_hook_event_callback != NULL) {
-            backend->set_hook_event_callback(NULL, NULL);
-        }
+        ksi_linux_devices_set_hook_event_callback(NULL, NULL);
+        ksi_linux_devices_set_forward_event_callback(NULL, NULL, NULL, NULL);
 
-        ksi_linux_devices_set_physical_key_event_callback(NULL, NULL);
+        ksi_linux_devices_set_panic_callback(NULL, NULL);
 
         (void)lane_shutdown(&daemon_state->keyboard_lane, 0u);
         (void)lane_shutdown(&daemon_state->mouse_lane, 0u);
@@ -1084,7 +1118,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         backend_start = count;
         backend_count = backend->poll_fds == NULL
             ? 0
-            : backend->poll_fds(&fds[count], KSI_MAX_POLL_FDS - count);
+            : backend->poll_fds(&fds[count], KSI_MAX_BACKEND_FDS);
         count += backend_count;
 
         client_start = count;
@@ -1187,11 +1221,10 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     ksi_linux_devices_set_observer_callback(NULL, NULL, NULL);
     ksi_linux_devices_set_raw_observer_callback(NULL, NULL);
 
-    if (backend->set_hook_event_callback != NULL) {
-        backend->set_hook_event_callback(NULL, NULL);
-    }
+    ksi_linux_devices_set_hook_event_callback(NULL, NULL);
+    ksi_linux_devices_set_forward_event_callback(NULL, NULL, NULL, NULL);
 
-    ksi_linux_devices_set_physical_key_event_callback(NULL, NULL);
+    ksi_linux_devices_set_panic_callback(NULL, NULL);
 
     /* Release grabs before any shutdown step that may block. */
     clear_hook_state(daemon_state);
@@ -1199,6 +1232,9 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     if (update_grab_state(daemon_state) != 0) {
         fprintf(stderr, "keysharp-input: failed to release grabs before shutdown waits\n");
     }
+    /* Keys held when the grabs ended stay down on the sink, and queued output
+     * can take long to drain, so shutdown ends both now. */
+    (void)fence_permission_output(daemon_state);
 
     uint64_t shutdown_deadline_ms = monotonic_ms() + KSI_SHUTDOWN_TIMEOUT_MS;
 

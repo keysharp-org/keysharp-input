@@ -5,7 +5,9 @@
 #include "linux_device_filter.h"
 #include "../protocol_internal.h"
 #include "vk_evdev.h"
+#include "linux_key_bits.h"
 #include "linux_wheel.h"
+#include "linux_output.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,53 +20,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <time.h>
 #include <unistd.h>
 
-#define KSI_UINPUT_PATH "/dev/uinput"
-
-/* Synthetic-output pacing.
- *
- * uinput gives the producer no backpressure: write() always succeeds, and when
- * a consumer's per-fd evdev ring fills (≈64 events on a typical keyboard) the
- * kernel discards queued events and raises SYN_DROPPED on *that consumer*. A
- * back-to-back burst (e.g. a long Send) therefore silently loses keystrokes —
- * the compositor never gets a chance to drain between our writes.
- *
- * Since the overflow cannot be observed from here, the practical mitigation is
- * to keep the number of in-flight (un-drained) events safely below the ring and
- * briefly yield so the consumer's event loop runs. We count emitted events and
- * clock_nanosleep() once a chunk's worth has been written. The check runs after
- * every event (not per high-level input), so the chunk size IS the per-cycle
- * footprint — there is no extra overshoot from a single input expanding into a
- * burst (e.g. a Unicode char ≈32 events).
- *
- * Smaller, more frequent pauses tolerate delayed consumer scheduling better
- * while preserving the same nominal throughput. Short sends never reach the
- * threshold and pay nothing, so the common case runs at full speed.
- *
- * The counter is shared across every output path on the sequencer thread: bulk
- * client synthesis and single-event passthrough replay. It persists across
- * back-to-back emits so a sustained replay burst reaches the pacing threshold
- * even though each replay call contains only one event. Mouse motion floods,
- * key autorepeat, and interleaved grabbed devices can overflow the consumer ring
- * in the same way as a long Send, so both paths use the same pacing stream.
- *
- * Isolated input must stay free (no per-keystroke latency), so the counter is
- * reset whenever the gap since the previous emit exceeds KSI_SYNTH_PACE_IDLE_
- * RESET_NS: an idle gap that long means the consumer has had ample time to
- * drain, so nothing we sent is still in flight and the next event starts a
- * fresh chunk. A single passed keystroke (or one every few hundred ms) therefore
- * never accumulates toward the threshold and never sleeps, while a genuine
- * sub-millisecond flood does. Client Sends separated by human-scale time also
- * begin with a fresh counter. */
-#define KSI_SYNTH_PACE_EVENTS 16
-#define KSI_SYNTH_PACE_SLEEP_NS (350L * 1000L) /* 0.35 ms */
-/* Idle gap after which the consumer is assumed fully drained (nothing of ours
- * in flight) and the pacing counter is reset. Comfortably above the pace sleep
- * (0.35 ms) so a paced burst is never mistaken for idle, comfortably below any
- * human-perceptible key/mouse cadence so isolated input always resets. */
-#define KSI_SYNTH_PACE_IDLE_RESET_NS (8L * 1000L * 1000L) /* 8 ms */
 #define KSI_VK_PACKET 0xE7u
 
 /* Relative mouse: keyboard keys + BTN_* + REL_X/Y/WHEEL. */
@@ -78,95 +35,202 @@ static pthread_mutex_t synth_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int32_t wheel_remainder;
 static int32_t horizontal_wheel_remainder;
 
-/* All uinput writes and the ACTUAL-device synthesis state they touch (uinput_fd,
- * uinput_abs_fd, synthesized_keys_down and the pacing counters) are accessed on a
- * single thread -- the output sequencer, which drains replay, client synthesis,
- * the release-all action (KSI_OUTPUT_ACTION_RELEASE_ALL) AND the recreate action
- * (KSI_OUTPUT_ACTION_RECREATE_SYNTH) in arrival order. ksi_linux_synth_stop() /
- * ksi_linux_synth_start() therefore run on the sequencer thread in exactly two
- * situations, both of which keep this state single-threaded: (1) at shutdown,
- * after the sequencer thread has been joined (daemon.c); (2) mid-run via
- * ksi_linux_synth_recreate(), which the sequencer itself invokes when it drains a
- * RECREATE_SYNTH action -- NEVER from the main thread, whose only role is to
- * ENQUEUE that action. So there is no concurrent access and no lock is needed here.
- * (If a caller is ever added that touches this state off the sequencer thread while
- * it is running, reintroduce serialization.) synthesized_keys_down tracks what is
- * actually held on the uinput device so release_all can drop any key left "down"
- * when the grab is dropped. */
-static bool synthesized_keys_down[KEY_MAX + 1];
+/* The output sequencer owns generic device writes, recovery and held-key state.
+ * Startup and shutdown access this state only while that thread is stopped.
+ * Key state on the generic keyboard device is the sink's; see linux_forward. */
 
-/* enqueued_synth_* is the exception to the single-thread rule above: it tracks
- * the LOGICAL synthetic input state at the hook / output-queue boundary, updated when a
- * synth batch is ENQUEUED (see ksi_linux_synth_note_enqueued_synth, called from the
- * daemon's output-queue push path on the main/lane threads) rather than when it drains
- * to uinput, and read by GET_KEY_STATE/GET_POINTER_BUTTONS — so it needs its own lock. A query therefore
- * reports the state that WILL exist once the queue empties, race-free regardless of how
- * far the paced drain has progressed. This mirrors Windows, where SendInput is
- * synchronous and the modifier state is already in effect the instant SendInput returns
- * — here the logical state is likewise settled the instant the batch is accepted,
- * without waiting for the physical drain. */
-static bool enqueued_synth_keys_down[KEY_MAX + 1];
-static uint32_t enqueued_synth_pointer_buttons;
-static pthread_mutex_t enqueued_synth_keys_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define KSI_SYNTH_CLAIM_CAPACITY 1024u
+
+typedef struct synth_claim {
+    ksi_synth_owner owner;
+    uint8_t keys[KSI_KEY_BITMAP_BYTES];
+} synth_claim;
+
+typedef struct synth_holds {
+    ksi_forward_view view;
+    uint32_t epoch; /* forwarding epoch of the last dead-target sweep */
+    size_t used;
+    uint16_t holders[KEY_MAX + 1];
+    uint8_t held[KSI_KEY_BITMAP_BYTES]; /* keys with at least one holder */
+    synth_claim claims[KSI_SYNTH_CLAIM_CAPACITY];
+} synth_holds;
+
+/* applied follows written output on the sequencer. enqueued follows admitted
+ * output in queue order, so a query sees a Send's result once it is accepted,
+ * as it would after a synchronous Win32 SendInput. */
+static synth_holds applied = { .view = KSI_FORWARD_APPLIED };
+static synth_holds enqueued = { .view = KSI_FORWARD_ENQUEUED };
+static pthread_mutex_t enqueued_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int resolve_synth_key_code(const ksi_keybdinput *input, int *out_value);
 static uint16_t mouse_data_to_xbutton(uint32_t mouse_data);
+static int update_generic_key(uint16_t code);
 static uint16_t pending_high_surrogate;
-/* Pacing state (see pacing note). synth_pacing_active gates the actual sleep and
- * is held while ANY output that funnels through ksi_linux_synth_send_input is
- * being written -- that is both bulk client synthesis and single-event
- * passthrough replay, since replay_*_hook_event route through send_input too.
- * synth_pace_events is the shared, persistent chunk counter; last_emit_ns is the
- * monotonic timestamp of the previous emit, used to reset the counter after an
- * idle gap. All three are touched only on the sequencer thread (see note above),
- * so no lock is needed. */
 static bool synth_pacing_active;
-static unsigned synth_pace_events; /* events emitted since the last yield */
-static uint64_t last_emit_ns;      /* monotonic time of the previous emit, for idle reset */
 
-static void pace_synthetic_output(void)
+static bool owner_matches(const ksi_synth_owner *owner, const ksi_synth_owner *filter)
 {
-    struct timespec pause = { 0, KSI_SYNTH_PACE_SLEEP_NS };
-    struct timespec remaining;
-    int result;
+    return (filter->target == 0u || owner->target == filter->target)
+        && (filter->connection_id == 0u || owner->connection_id == filter->connection_id)
+        && (filter->hook_type == 0u || owner->hook_type == filter->hook_type)
+        && (filter->source_type == 0u || owner->source_type == filter->source_type)
+        && (filter->source_code == 0u || owner->source_code == filter->source_code);
+}
 
-    do {
-        result = clock_nanosleep(CLOCK_MONOTONIC, 0, &pause, &remaining);
+/* A Modify replacement must not outlive its source's grab. */
+static bool owner_is_dead(const ksi_synth_owner *owner, ksi_forward_view view)
+{
+    return owner != NULL && owner->target != 0u && ksi_linux_forward_failed(owner->target, view);
+}
 
-        if (result == EINTR) {
-            pause = remaining;
+/* A dead owner keeps only its releases, so both views agree whichever side of
+ * the source's end admitted the batch. */
+static bool keep_release(ksi_input *input)
+{
+    if (input->type == KSI_INPUT_KEYBOARD)
+        return (input->data.keyboard.flags & (KSI_KEY_UP | KSI_KEY_UNICODE)) == KSI_KEY_UP;
+    input->data.mouse.flags &= KSI_MOUSE_LEFT_UP | KSI_MOUSE_RIGHT_UP
+        | KSI_MOUSE_MIDDLE_UP | KSI_MOUSE_X_UP;
+    return input->data.mouse.flags != 0u;
+}
+
+static synth_claim *find_claim(synth_holds *holds, const ksi_synth_owner *owner)
+{
+    for (size_t i = 0u; i < holds->used; i++)
+        if (memcmp(&holds->claims[i].owner, owner, sizeof(*owner)) == 0) return &holds->claims[i];
+    return NULL;
+}
+
+/* Returns whether the key has no holder left. */
+static bool remove_holder(synth_holds *holds, uint16_t code)
+{
+    if (--holds->holders[code] != 0u) return false;
+    ksi_set_key_bit(holds->held, code, false);
+    return true;
+}
+
+static int hold_key(synth_holds *holds, const ksi_synth_owner *owner, uint16_t code)
+{
+    synth_claim *claim = find_claim(holds, owner);
+
+    if (claim == NULL) {
+        if (holds->used == KSI_SYNTH_CLAIM_CAPACITY) {
+            errno = ENOSPC;
+            return -1;
         }
-    } while (result == EINTR);
+        claim = &holds->claims[holds->used++];
+        memset(claim->keys, 0, sizeof(claim->keys));
+        claim->owner = *owner;
+    }
+    if (!ksi_key_bit(claim->keys, code)) {
+        ksi_set_key_bit(claim->keys, code, true);
+        if (holds->holders[code]++ == 0u) ksi_set_key_bit(holds->held, code, true);
+    }
+    return 0;
 }
 
-static uint64_t monotonic_ms(void)
+static void drop_key(synth_holds *holds, synth_claim *claim, uint16_t code)
 {
-    struct timespec time_value;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &time_value) != 0) {
-        return 0;
-    }
-
-    return ((uint64_t)time_value.tv_sec * 1000u) + ((uint64_t)time_value.tv_nsec / 1000000u);
+    ksi_set_key_bit(claim->keys, code, false);
+    (void)remove_holder(holds, code);
+    if (!ksi_any_key_bit(claim->keys)) *claim = holds->claims[--holds->used];
 }
 
-/* Monotonic nanoseconds, for the sub-millisecond idle-gap check in the pacer.
- * Returns 0 on failure, which the caller treats as "no measurable gap" (it never
- * triggers an idle reset), so a clock hiccup fails safe toward more pacing. */
-static uint64_t monotonic_ns(void)
+/* Ends every hold of code. Iterating backwards keeps swap-removal from
+ * skipping a claim. */
+static void release_code(synth_holds *holds, uint16_t code)
 {
-    struct timespec time_value;
+    for (size_t i = holds->used; ksi_key_bit(holds->held, code) && i-- > 0u; )
+        if (ksi_key_bit(holds->claims[i].keys, code))
+            drop_key(holds, &holds->claims[i], code);
+}
 
-    if (clock_gettime(CLOCK_MONOTONIC, &time_value) != 0) {
+/* Records in released each key that no owner holds after the removal. */
+static void remove_claim(synth_holds *holds, synth_claim *claim, uint8_t *released)
+{
+    for (size_t byte = 0u; byte < sizeof(claim->keys); byte++) {
+        for (unsigned int bits = claim->keys[byte]; bits != 0u; bits &= bits - 1u) {
+            uint16_t code = (uint16_t)(byte * 8u + (unsigned int)__builtin_ctz(bits));
+            if (remove_holder(holds, code) && released != NULL)
+                ksi_set_key_bit(released, code, true);
+        }
+    }
+    *claim = holds->claims[--holds->used];
+}
+
+/* A null filter selects claims whose source target has ended. */
+static void drop_claims(synth_holds *holds, const ksi_synth_owner *filter, uint8_t *released)
+{
+    for (size_t i = holds->used; i-- > 0u; ) {
+        const ksi_synth_owner *owner = &holds->claims[i].owner;
+        if (filter != NULL ? owner_matches(owner, filter) : owner_is_dead(owner, holds->view))
+            remove_claim(holds, &holds->claims[i], released);
+    }
+}
+
+static void sweep_dead_targets(synth_holds *holds, uint8_t *released)
+{
+    uint32_t epoch = ksi_linux_forward_epoch();
+
+    if (holds->epoch == epoch) return;
+    holds->epoch = epoch;
+    drop_claims(holds, NULL, released);
+}
+
+/* One key transition in queue order, for either view. A press restores a hold
+ * synthesis displaced (if restore) or holds the key for its owner; a release ends
+ * the owner's hold, or else, as a Win32 key-up does, the key everywhere. */
+static int apply_key(synth_holds *holds, uint16_t code, bool down, bool restore,
+    const ksi_synth_owner *owner)
+{
+    static const ksi_synth_owner anonymous;
+    synth_claim *claim;
+
+    if (owner == NULL) owner = &anonymous;
+    if (down)
+        return restore && ksi_linux_forward_restore_key(code, holds->view) ? 0 : hold_key(holds, owner, code);
+
+    claim = find_claim(holds, owner);
+    if (claim != NULL && ksi_key_bit(claim->keys, code)) {
+        drop_key(holds, claim, code);
         return 0;
     }
+    ksi_linux_forward_release_key(code, holds->view);
+    release_code(holds, code);
+    return 0;
+}
 
-    return ((uint64_t)time_value.tv_sec * 1000000000ull) + (uint64_t)time_value.tv_nsec;
+typedef struct button_transition {
+    uint16_t button;
+    bool down;
+} button_transition;
+
+static bool moves_absolutely(const ksi_mouseinput *input)
+{
+    return (input->flags & (KSI_MOUSE_MOVE | KSI_MOUSE_ABSOLUTE)) == (KSI_MOUSE_MOVE | KSI_MOUSE_ABSOLUTE);
+}
+
+/* Zero names an unsupported X button. */
+static size_t button_transitions(const ksi_mouseinput *input, button_transition out[8])
+{
+    static const struct { uint32_t flag; uint16_t button; bool down; } buttons[] = {
+        { KSI_MOUSE_LEFT_DOWN, BTN_LEFT, true }, { KSI_MOUSE_LEFT_UP, BTN_LEFT, false },
+        { KSI_MOUSE_RIGHT_DOWN, BTN_RIGHT, true }, { KSI_MOUSE_RIGHT_UP, BTN_RIGHT, false },
+        { KSI_MOUSE_MIDDLE_DOWN, BTN_MIDDLE, true }, { KSI_MOUSE_MIDDLE_UP, BTN_MIDDLE, false },
+        { KSI_MOUSE_X_DOWN, 0u, true }, { KSI_MOUSE_X_UP, 0u, false },
+    };
+    size_t count = 0u;
+
+    for (size_t i = 0u; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+        if ((input->flags & buttons[i].flag) != 0u)
+            out[count++] = (button_transition){ buttons[i].button != 0u
+                ? buttons[i].button : mouse_data_to_xbutton(input->mouse_data), buttons[i].down };
+    return count;
 }
 
 static uint64_t synth_hook_time_ms(uint32_t input_time)
 {
-    return input_time != 0u ? (uint64_t)input_time : monotonic_ms();
+    return input_time != 0u ? (uint64_t)input_time : ksi_linux_monotonic_ms();
 }
 
 static uint32_t keyboard_indicator_flags_for_hook(void)
@@ -193,76 +257,15 @@ static uint32_t keyboard_indicator_flags_for_hook(void)
     return flags;
 }
 
+/* After a failure only hold bookkeeping continues, so both key-state views
+ * stay in step until recovery rebuilds the devices. */
 static int emit_event_to(int fd, uint16_t type, uint16_t code, int32_t value)
 {
-    struct input_event event;
-    ssize_t nwritten;
-
-    if (fd < 0) {
-        return -1;
-    }
-
-    memset(&event, 0, sizeof(event));
-    event.type = type;
-    event.code = code;
-    event.value = value;
-
-    /* Retry on EINTR: a signal delivered during the write syscall returns -1
-     * with errno=EINTR.  Without the retry the rest of a synthesis batch is
-     * silently dropped, which manifests as only a few characters being typed.
-     *
-     * We do NOT retry EAGAIN even though the fd is O_NONBLOCK: a write() to
-     * /dev/uinput never blocks and never returns EAGAIN. uinput's write handler
-     * copies the events into the kernel input core and returns immediately -- it
-     * has no bounded producer-side buffer to fill (the ring that CAN overflow is
-     * the *consumer's* evdev fd, which write() here cannot see, hence the pacing
-     * below). O_NONBLOCK is set only so the open()/setup path can't stall. A
-     * poll-retry would therefore never fire and is not warranted. */
-    do {
-        nwritten = write(fd, &event, sizeof(event));
-    } while (nwritten < 0 && errno == EINTR);
-
-    if (nwritten != (ssize_t)sizeof(event)) {
-        /* A write() to /dev/uinput does not block and does not return EAGAIN
-         * (see the comment above), so landing here means something is
-         * actually wrong with the device -- e.g. the kernel tore it down out
-         * from under us. Latch it so ksi_linux_synth_is_available() stops
-         * silently advertising a broken output, and so the periodic recovery
-         * check (ksi_linux_synth_needs_recovery -> a RECREATE_SYNTH action drained
-         * by ksi_linux_synth_recreate on the sequencer thread) rebuilds the uinput
-         * devices instead of leaving them dead for the rest of the process's life. */
-        synth_write_failed = true;
-        return -1;
-    }
-
-    /* Pace synthesis AND passthrough replay against the consumer's finite evdev
-     * ring. The counter is shared and persists across calls (see pacing note),
-     * so a sustained back-to-back burst -- whether one long Send or a flood of
-     * single-event replays -- is throttled the same way. Checked after every
-     * emitted event so the chunk size is the exact per-cycle footprint. Yielding
-     * mid-report (between a key and its SYN) is harmless: the consumer applies
-     * nothing until the SYN, and we drop nothing. */
-    if (synth_pacing_active) {
-        uint64_t now_ns = monotonic_ns();
-
-        /* An idle gap this long means the consumer has drained everything we
-         * sent, so nothing is in flight and the next event starts a fresh chunk.
-         * Isolated keystrokes never reach the threshold, while a sustained
-         * sub-millisecond burst still accumulates. */
-        if (last_emit_ns != 0 && now_ns != 0
-            && now_ns - last_emit_ns >= KSI_SYNTH_PACE_IDLE_RESET_NS) {
-            synth_pace_events = 0;
-        }
-
-        last_emit_ns = now_ns;
-
-        if (++synth_pace_events >= KSI_SYNTH_PACE_EVENTS) {
-            pace_synthetic_output();
-            synth_pace_events = 0;
-        }
-    }
-
-    return 0;
+    const struct input_event event = { .type = type, .code = code, .value = value };
+    int result = synth_write_failed ? -1 : ksi_linux_output_write(fd, &event, 1u);
+    if (result != 0) synth_write_failed = true;
+    else if (synth_pacing_active) ksi_linux_output_pace(1u);
+    return result;
 }
 
 static int emit_event(uint16_t type, uint16_t code, int32_t value)
@@ -285,171 +288,83 @@ static int emit_sync(void)
     return emit_event(EV_SYN, SYN_REPORT, 0);
 }
 
-static int send_key_code(int key_code, int value)
+/* Returns the number of events written, or -1. */
+static int paced(int written)
 {
-    if (emit_event(EV_KEY, (uint16_t)key_code, value) != 0) {
-        return -1;
-    }
+    if (written > 0 && synth_pacing_active) ksi_linux_output_pace((size_t)written);
+    return written;
+}
 
-    /* Update bookkeeping as soon as the EV_KEY write lands, not only on full
-     * success: the kernel's input core applies a key event to its internal
-     * per-device state table immediately, independent of whether a following
-     * SYN_REPORT event is ever written. Doing this before (rather than only
-     * after) the SYN write means a SYN write failure can never leave
-     * synthesized_keys_down understating a key the kernel already considers
-     * held, which would otherwise let it survive a release-all sweep and
-     * strand it stuck down on the virtual device. */
-    if (key_code >= 0 && key_code <= KEY_MAX) {
-        synthesized_keys_down[key_code] = value != 0;
-    }
+static int sink_key(uint16_t code, bool held)
+{
+    return paced(ksi_linux_forward_sink_key(code, held));
+}
 
-    return emit_sync();
+/* A keystroke that leaves every hold as it was. */
+static int tap_sink_key(uint16_t code)
+{
+    return paced(ksi_linux_forward_sink_tap(code));
+}
+
+static int send_key_code(int key_code, int value, const ksi_synth_owner *owner)
+{
+    uint16_t code = ksi_canonical_button((uint16_t)key_code);
+
+    return apply_key(&applied, code, value != 0, true, owner) == 0 && update_generic_key(code) >= 0 ? 0 : -1;
 }
 
 void ksi_linux_synth_add_logical_key_state(uint8_t *keys, size_t key_bytes)
 {
-    if (keys == NULL) {
-        return;
-    }
-
-    /* Report the enqueue-time logical state (what will be held once the queue
-     * drains), not the drain-time synthesized_keys_down (which lags behind the
-     * paced output and would momentarily show a transient modifier — e.g. the
-     * Shift held to type capital letters — as still down, sticking it in the
-     * caller's logical modifier state until the next send). */
-    pthread_mutex_lock(&enqueued_synth_keys_mutex);
-
-    for (int key_code = 0; key_code <= KEY_MAX; key_code++) {
-        if (!enqueued_synth_keys_down[key_code]) {
-            continue;
-        }
-
-        size_t byte_index = (size_t)key_code >> 3;
-
-        if (byte_index >= key_bytes) {
-            continue;
-        }
-
-        keys[byte_index] |= (uint8_t)(1u << (key_code & 7));
-    }
-
-    pthread_mutex_unlock(&enqueued_synth_keys_mutex);
+    pthread_mutex_lock(&enqueued_mutex);
+    sweep_dead_targets(&enqueued, NULL);
+    for (size_t i = 0u; i < key_bytes && i < sizeof(enqueued.held); i++)
+        keys[i] |= enqueued.held[i];
+    pthread_mutex_unlock(&enqueued_mutex);
 }
 
-void ksi_linux_synth_add_logical_pointer_button_state(uint32_t *buttons)
+/* Mirrors a batch accepted into the output queue, under the queue lock so the
+ * mirror follows queue order. Unicode sequences leave nothing held. */
+void ksi_linux_synth_note_enqueued_synth(
+    const ksi_input *inputs, size_t count, const ksi_synth_owner *owner)
 {
-    if (buttons == NULL) {
-        return;
-    }
+    if (inputs == NULL) return;
 
-    pthread_mutex_lock(&enqueued_synth_keys_mutex);
-    *buttons |= enqueued_synth_pointer_buttons;
-    pthread_mutex_unlock(&enqueued_synth_keys_mutex);
-}
-
-static uint32_t mouse_button_to_mask(uint16_t button)
-{
-    switch (button) {
-        case BTN_LEFT:   return 1u << 0;
-        case BTN_RIGHT:  return 1u << 1;
-        case BTN_MIDDLE: return 1u << 2;
-        case BTN_SIDE:   return 1u << 3;
-        case BTN_EXTRA:  return 1u << 4;
-        default:         return 0u;
-    }
-}
-
-static void note_enqueued_synth_mouse_button(uint16_t button, bool down)
-{
-    uint32_t mask = mouse_button_to_mask(button);
-
-    if (mask == 0) {
-        return;
-    }
-
-    if (down) {
-        enqueued_synth_pointer_buttons |= mask;
-    } else {
-        enqueued_synth_pointer_buttons &= ~mask;
-    }
-}
-
-static void note_enqueued_synth_mouse(const ksi_mouseinput *input)
-{
-    uint16_t xbutton;
-
-    if (input == NULL) {
-        return;
-    }
-
-    if ((input->flags & KSI_MOUSE_LEFT_DOWN) != 0)   note_enqueued_synth_mouse_button(BTN_LEFT, true);
-    if ((input->flags & KSI_MOUSE_LEFT_UP) != 0)     note_enqueued_synth_mouse_button(BTN_LEFT, false);
-    if ((input->flags & KSI_MOUSE_RIGHT_DOWN) != 0)  note_enqueued_synth_mouse_button(BTN_RIGHT, true);
-    if ((input->flags & KSI_MOUSE_RIGHT_UP) != 0)    note_enqueued_synth_mouse_button(BTN_RIGHT, false);
-    if ((input->flags & KSI_MOUSE_MIDDLE_DOWN) != 0) note_enqueued_synth_mouse_button(BTN_MIDDLE, true);
-    if ((input->flags & KSI_MOUSE_MIDDLE_UP) != 0)   note_enqueued_synth_mouse_button(BTN_MIDDLE, false);
-
-    xbutton = mouse_data_to_xbutton(input->mouse_data);
-
-    if ((input->flags & KSI_MOUSE_X_DOWN) != 0) note_enqueued_synth_mouse_button(xbutton, true);
-    if ((input->flags & KSI_MOUSE_X_UP) != 0)   note_enqueued_synth_mouse_button(xbutton, false);
-}
-
-/* Update the enqueue-time logical synthetic key state for a batch that was just
- * accepted into the output queue. Called from the daemon's output-queue push path
- * (under the queue lock, so these updates are ordered identically to the queue
- * insertions). Only persistent keyboard/mouse button transitions affect the state;
- * unicode units and pointer movement are ignored. */
-void ksi_linux_synth_note_enqueued_synth(const ksi_input *inputs, size_t count)
-{
-    if (inputs == NULL) {
-        return;
-    }
-
-    pthread_mutex_lock(&enqueued_synth_keys_mutex);
-
-    for (size_t i = 0; i < count; i++) {
+    pthread_mutex_lock(&enqueued_mutex);
+    sweep_dead_targets(&enqueued, NULL);
+    bool dead = owner_is_dead(owner, KSI_FORWARD_ENQUEUED);
+    bool moved_absolutely = false;
+    for (size_t i = 0u; i < count; i++) {
+        ksi_input input = inputs[i];
         int value;
         int key_code;
 
-        if (inputs[i].type == KSI_INPUT_MOUSE) {
-            note_enqueued_synth_mouse(&inputs[i].data.mouse);
+        if (dead && !keep_release(&input)) continue;
+        if (input.type == KSI_INPUT_MOUSE) {
+            button_transition buttons[8];
+            size_t buttons_count = button_transitions(&input.data.mouse, buttons);
+            moved_absolutely |= moves_absolutely(&input.data.mouse);
+            for (size_t b = 0u; b < buttons_count; b++)
+                if (buttons[b].button != 0u)
+                    (void)apply_key(&enqueued, buttons[b].button, buttons[b].down, !moved_absolutely, owner);
             continue;
         }
 
-        if (inputs[i].type != KSI_INPUT_KEYBOARD) {
-            continue;
-        }
-
-        key_code = resolve_synth_key_code(&inputs[i].data.keyboard, &value);
-        if (key_code >= 0 && key_code <= KEY_MAX) {
-            enqueued_synth_keys_down[key_code] = value != 0;
-        }
+        key_code = input.type == KSI_INPUT_KEYBOARD
+            ? resolve_synth_key_code(&input.data.keyboard, &value) : -1;
+        if (key_code >= 0 && key_code <= KEY_MAX)
+            (void)apply_key(&enqueued, ksi_canonical_button((uint16_t)key_code), value != 0, true, owner);
     }
-
-    pthread_mutex_unlock(&enqueued_synth_keys_mutex);
+    pthread_mutex_unlock(&enqueued_mutex);
 }
 
-/* Clear the enqueue-time logical state. Called when a RELEASE_ALL action is
- * enqueued (the grab is being dropped, so every synthetic key will be released),
- * keeping the logical state consistent with what release_all will do on drain. */
 void ksi_linux_synth_reset_enqueued_synth(void)
 {
-    pthread_mutex_lock(&enqueued_synth_keys_mutex);
-    memset(enqueued_synth_keys_down, 0, sizeof(enqueued_synth_keys_down));
-    enqueued_synth_pointer_buttons = 0u;
-    pthread_mutex_unlock(&enqueued_synth_keys_mutex);
+    pthread_mutex_lock(&enqueued_mutex);
+    enqueued.used = 0u;
+    memset(enqueued.holders, 0, sizeof(enqueued.holders));
+    memset(enqueued.held, 0, sizeof(enqueued.held));
+    pthread_mutex_unlock(&enqueued_mutex);
 }
-
-static int send_key_stroke(int key_code)
-{
-    if (send_key_code(key_code, 1) != 0) {
-        return -1;
-    }
-
-    return send_key_code(key_code, 0);
-}
-
 
 static int hex_digit_to_key(char digit)
 {
@@ -494,11 +409,12 @@ static int hex_digit_to_key(char digit)
     return -1;
 }
 
+/* The Ctrl+Shift+U entry sequence is transient: the sink writes a modifier
+ * only if no one holds it, and each returns to what synthesis's owners hold. */
 static int send_unicode_input(uint32_t codepoint)
 {
     char hex[9];
     int length;
-    int result = 0;
 
     if (codepoint == 0 || codepoint > 0x10FFFFu) {
         fprintf(stderr, "keysharp-input: unsupported unicode codepoint U+%x\n", codepoint);
@@ -512,25 +428,13 @@ static int send_unicode_input(uint32_t codepoint)
         return -1;
     }
 
-    if (send_key_code(KEY_LEFTCTRL, 1) != 0
-        || send_key_code(KEY_LEFTSHIFT, 1) != 0
-        || send_key_code(KEY_U, 1) != 0) {
-        result = -1;
-    }
+    bool failed = sink_key(KEY_LEFTCTRL, true) < 0 || sink_key(KEY_LEFTSHIFT, true) < 0
+        || tap_sink_key(KEY_U) < 0;
 
-    if (send_key_code(KEY_U, 0) != 0) {
-        result = -1;
-    }
+    failed |= update_generic_key(KEY_LEFTSHIFT) < 0;
+    failed |= update_generic_key(KEY_LEFTCTRL) < 0;
 
-    if (send_key_code(KEY_LEFTSHIFT, 0) != 0) {
-        result = -1;
-    }
-
-    if (send_key_code(KEY_LEFTCTRL, 0) != 0) {
-        result = -1;
-    }
-
-    if (result != 0) {
+    if (failed) {
         fprintf(stderr, "keysharp-input: failed to start unicode input sequence U+%x: %s\n", codepoint, strerror(errno));
         return -1;
     }
@@ -538,13 +442,13 @@ static int send_unicode_input(uint32_t codepoint)
     for (int i = 0; i < length; i++) {
         int key_code = hex_digit_to_key(hex[i]);
 
-        if (key_code < 0 || send_key_stroke(key_code) != 0) {
+        if (key_code < 0 || tap_sink_key((uint16_t)key_code) < 0) {
             fprintf(stderr, "keysharp-input: failed to emit unicode hex digit '%c' for U+%x: %s\n", hex[i], codepoint, strerror(errno));
             return -1;
         }
     }
 
-    if (send_key_stroke(KEY_SPACE) != 0) {
+    if (tap_sink_key(KEY_SPACE) < 0) {
         fprintf(stderr, "keysharp-input: failed to commit unicode input U+%x: %s\n", codepoint, strerror(errno));
         return -1;
     }
@@ -646,9 +550,7 @@ static int scan_to_evdev_key(uint16_t scan, bool extended)
         }
     }
 
-    /* For non-extended PS/2 AT scan codes the numbering is identical to
-     * Linux evdev keycodes.  This path also handles replayed hook events
-     * where the scan field already contains a raw evdev keycode. */
+    /* Non-extended PS/2 AT scan codes share Linux evdev numbering. */
     if (scan <= KEY_MAX) {
         return scan;
     }
@@ -658,12 +560,8 @@ static int scan_to_evdev_key(uint16_t scan, bool extended)
 
 static int enable_keyboard_keys(void)
 {
-    /* A grabbed keyboard is replayed through this device. Enable the complete
-     * Linux keyboard-key ranges so keys without a Windows VK counterpart
-     * (brightness, privacy, macro and similar hardware controls) pass through
-     * instead of disappearing while a client hook is installed. Keep BTN_*
-     * ranges off the keyboard device so libinput does not classify it as a
-     * mouse, tablet, joystick or gamepad. */
+    /* Scan-code synthesis supports keyboard keys without Windows VK mappings.
+     * Exclude other device classes' buttons from this capability set. */
     for (int key = KEY_RESERVED + 1; key <= KEY_MAX; key++) {
         if (ksi_linux_key_code_is_keyboard((unsigned int)key)
             && enable_key(key) != 0) {
@@ -678,11 +576,22 @@ static int configure_uinput_device(void)
 {
     struct uinput_setup setup;
 
-    /* Intentionally do not enable EV_REP. Keyboard synthesis emits only the
-     * explicit down/up transitions requested by the caller. */
+    /* No EV_REP: synthesis emits only the transitions it is asked for. As the sink,
+     * the device also carries grabbed keyboards' scan codes and the lock LEDs the
+     * desktop drives, which the reader relays to those keyboards. */
     if (enable_event(EV_KEY) != 0
-        || enable_event(EV_REL) != 0) {
+        || enable_event(EV_REL) != 0
+        || enable_event(EV_MSC) != 0
+        || enable_event(EV_LED) != 0
+        || ioctl(uinput_fd, UI_SET_MSCBIT, MSC_SCAN) < 0) {
         return -1;
+    }
+
+    for (int led = LED_NUML; led <= LED_KANA; led++) {
+        if (ioctl(uinput_fd, UI_SET_LEDBIT, led) < 0) {
+            fprintf(stderr, "keysharp-input: uinput UI_SET_LEDBIT(%d) failed: %s\n", led, strerror(errno));
+            return -1;
+        }
     }
 
     if (enable_keyboard_keys() != 0) {
@@ -822,6 +731,7 @@ static int start_synth_devices(void)
         return 0;
     }
 
+    ksi_linux_forward_attach_sink(uinput_fd);
     puts("keysharp-input: uinput relative mouse device created");
 
     uinput_abs_fd = open(KSI_UINPUT_PATH, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
@@ -856,6 +766,7 @@ int ksi_linux_synth_start(void)
 static void stop_synth_devices(void)
 {
     ksi_linux_synth_release_all();
+    ksi_linux_forward_attach_sink(-1);
     wheel_remainder = horizontal_wheel_remainder = 0;
 
     if (uinput_fd >= 0) {
@@ -887,9 +798,15 @@ bool ksi_linux_synth_is_started(void)
     return uinput_fd >= 0;
 }
 
+/* The sink latches its own write failures, whoever wrote. */
+static bool synth_failed(void)
+{
+    return synth_write_failed || (uinput_fd >= 0 && !ksi_linux_forward_sink_ready());
+}
+
 bool ksi_linux_synth_is_available(void)
 {
-    return !synth_lifecycle_busy && ksi_linux_synth_is_started() && !synth_write_failed;
+    return !synth_lifecycle_busy && ksi_linux_synth_is_started() && !synth_failed();
 }
 
 bool ksi_linux_synth_absolute_is_available(void)
@@ -897,31 +814,22 @@ bool ksi_linux_synth_absolute_is_available(void)
     return !synth_lifecycle_busy && uinput_abs_fd >= 0 && !synth_write_failed;
 }
 
-/* Rate limit for synth recovery: recreating the uinput devices is real
- * ioctl/UI_DEV_DESTROY/UI_DEV_CREATE work, not something to repeat on every
- * single main-loop tick if the underlying problem persists. */
+/* Recreating the devices is real ioctl work, so a persistent failure is
+ * retried at this interval rather than on every main-loop pass. */
 #define KSI_SYNTH_RETRY_INTERVAL_MS 3000u
-/* Main-thread-only (written and read only in ksi_linux_synth_needs_recovery). */
 static uint64_t last_synth_retry_ms;
 
-/* MAIN THREAD. Polled from the daemon's periodic maintenance. Notices the latch
- * set by emit_event_to() and reports (at most once per KSI_SYNTH_RETRY_INTERVAL_MS)
- * that a recreation should be requested. It deliberately does NOT touch the device:
- * the actual stop()+start() must happen on the output sequencer thread, so the
- * daemon reacts to a true return by enqueuing a KSI_OUTPUT_ACTION_RECREATE_SYNTH
- * action (which drains into ksi_linux_synth_recreate below). Without this split,
- * a uinput write failure had no consequence beyond a log line and a dropped
- * event -- the daemon kept advertising synth/hook capability and kept writing to
- * the same broken fd for the rest of its life. */
+/* Main thread. The daemon answers true by queueing RECREATE_SYNTH, because
+ * only the sequencer may stop and restart the devices it writes. */
 bool ksi_linux_synth_needs_recovery(void)
 {
     uint64_t now;
 
-    if (synth_lifecycle_busy || !synth_write_failed) {
+    if (synth_lifecycle_busy || !synth_failed()) {
         return false;
     }
 
-    now = monotonic_ms();
+    now = ksi_linux_monotonic_ms();
 
     if (now != 0 && last_synth_retry_ms != 0
         && now - last_synth_retry_ms < KSI_SYNTH_RETRY_INTERVAL_MS) {
@@ -932,12 +840,7 @@ bool ksi_linux_synth_needs_recovery(void)
     return true;
 }
 
-/* OUTPUT SEQUENCER THREAD ONLY. Drains a KSI_OUTPUT_ACTION_RECREATE_SYNTH action.
- * Runs on the sequencer so stop() (release_all + close(uinput_fd)/uinput_fd=-1)
- * and start() (reopen) cannot race the sequencer's own writes to the very fds /
- * key-down table they mutate. Preserves the write-failure re-latch so a failed
- * reopen keeps needs_recovery() returning true on the next pass instead of the
- * daemon silently sitting on a dead synth output. */
+/* A failed reopen re-latches the failure so the next recovery poll retries. */
 void ksi_linux_synth_recreate(void)
 {
     pthread_mutex_lock(&synth_lifecycle_mutex);
@@ -946,12 +849,7 @@ void ksi_linux_synth_recreate(void)
     stop_synth_devices();
     synth_write_failed = false;
     (void)start_synth_devices();
-
-    if (uinput_fd < 0) {
-        /* ksi_linux_synth_start() already logged the specific reason. Mark
-         * broken again so the next needs_recovery() poll re-requests recovery. */
-        synth_write_failed = true;
-    }
+    if (uinput_fd < 0) synth_write_failed = true;
     synth_lifecycle_busy = false;
     pthread_mutex_unlock(&synth_lifecycle_mutex);
 }
@@ -1172,7 +1070,8 @@ bool ksi_linux_synth_input_to_hook_event(
     return false;
 }
 
-static int send_keyboard_input(const ksi_keybdinput *input)
+static int send_keyboard_input(
+    const ksi_keybdinput *input, const ksi_synth_owner *owner)
 {
     int key_code;
     int value;
@@ -1197,7 +1096,7 @@ static int send_keyboard_input(const ksi_keybdinput *input)
 
     /* SendInput/keybd_event semantics are explicit transitions only. Do not
      * emit EV_KEY value 2: that marks autorepeat from a held physical key. */
-    if (send_key_code(key_code, value) != 0) {
+    if (send_key_code(key_code, value, owner) != 0) {
         fprintf(stderr, "keysharp-input: failed to emit keyboard input: %s\n", strerror(errno));
         return -1;
     }
@@ -1208,42 +1107,6 @@ static int send_keyboard_input(const ksi_keybdinput *input)
             input->scan,
             key_code,
             value == 0 ? "up" : "down");
-    }
-
-    return 0;
-}
-
-void ksi_linux_synth_release_all(void)
-{
-    bool emitted = false;
-
-    if (uinput_fd < 0) {
-        memset(synthesized_keys_down, 0, sizeof(synthesized_keys_down));
-        return;
-    }
-
-    for (int key_code = 0; key_code <= KEY_MAX; key_code++) {
-        if (!synthesized_keys_down[key_code]) {
-            continue;
-        }
-
-        if (emit_event(EV_KEY, (uint16_t)key_code, 0) == 0) {
-            if (g_verbose) printf("keysharp-input: release synthetic key evdev=%d\n", key_code);
-            emitted = true;
-        }
-
-        synthesized_keys_down[key_code] = false;
-    }
-
-    if (emitted && emit_sync() != 0) {
-        fprintf(stderr, "keysharp-input: failed to sync synthetic key release: %s\n", strerror(errno));
-    }
-}
-
-static int send_mouse_button(int fd, uint16_t button, bool down)
-{
-    if (emit_event_to(fd, EV_KEY, button, down ? 1 : 0) != 0) {
-        return -1;
     }
 
     return 0;
@@ -1264,13 +1127,9 @@ static uint16_t mouse_data_to_xbutton(uint32_t mouse_data)
     return 0;
 }
 
-/* Which synthetic device (absolute vs relative) currently holds each pressed
- * mouse button, indexed by (button - BTN_LEFT). Lets a button-UP release on the
- * same device its DOWN went to even across batches, so a `Click x,y Down` (down
- * routed to the abs device) followed by a move-less `Click Up` cannot strand a
- * button held down on the absolute device — release_all only sweeps keyboard
- * keys, never mouse buttons. Touched only on the single output-sequencer thread,
- * so it needs no locking. */
+/* Which device holds each pressed button, indexed by (button - BTN_LEFT), so a
+ * release goes where its press went even across batches: a `Click x,y Down` on
+ * the absolute device then a move-less `Click Up` cannot strand the button. */
 #define KSI_TRACKED_BTN_BASE BTN_LEFT
 #define KSI_TRACKED_BTN_COUNT 8
 static bool button_held_on_abs[KSI_TRACKED_BTN_COUNT];
@@ -1286,48 +1145,115 @@ static bool *tracked_button_slot(uint16_t btn)
     return &button_held_on_abs[idx];
 }
 
-/* Route one button transition to the correct device and flag that device's SYN.
- * A DOWN uses this batch's device (the abs device iff this batch positioned and
- * that device exists) and records where it went; an UP releases on the recorded
- * device, falling back to the relative device when there is no record or the abs
- * device has since disappeared. */
-static int route_mouse_button(uint16_t btn, bool down, bool abs_active,
-                              bool *abs_pending, bool *rel_pending)
+/* Brings the generic devices in line with synthesis's holds of code. A button
+ * pressed on the absolute device is released there; every other hold is the
+ * sink's. Returns the number of sink events written, or -1. */
+static int update_generic_key(uint16_t code)
 {
-    bool *slot = tracked_button_slot(btn);
-    bool on_abs = down ? abs_active : (slot != NULL ? *slot : abs_active);
-    int fd;
+    bool *slot = tracked_button_slot(code);
+    bool held = applied.holders[code] != 0u;
 
-    if (on_abs && uinput_abs_fd >= 0) {
-        fd = uinput_abs_fd;
-    } else {
-        fd = uinput_fd;
-        on_abs = false;
-    }
-
-    if (send_mouse_button(fd, btn, down) != 0) {
-        return -1;
-    }
-
-    if (slot != NULL) {
-        *slot = down ? on_abs : false;
-    }
-
-    if (on_abs) {
-        *abs_pending = true;
-    } else {
-        *rel_pending = true;
-    }
-
-    return 0;
+    if (slot == NULL || !*slot) return sink_key(code, held);
+    if (held) return 0;
+    *slot = false;
+    /* A recreated device starts with nothing held. */
+    if (uinput_abs_fd < 0) return 0;
+    return emit_event_to(uinput_abs_fd, EV_KEY, code, 0) == 0 && emit_abs_sync() == 0 ? 0 : -1;
 }
 
-static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_move)
+static void release_unheld(const uint8_t *released)
 {
-    uint16_t xbutton;
+    for (size_t byte = 0u; byte < KSI_KEY_BITMAP_BYTES; byte++)
+        for (unsigned int bits = released[byte] & (uint8_t)~applied.held[byte]; bits != 0u; bits &= bits - 1u)
+            (void)update_generic_key((uint16_t)(byte * 8u + (unsigned int)__builtin_ctz(bits)));
+}
+
+void ksi_linux_synth_maintain_output(void)
+{
+    uint8_t released[KSI_KEY_BITMAP_BYTES] = {0};
+
+    ksi_linux_forward_collect(false);
+    if (applied.epoch == ksi_linux_forward_epoch()) return;
+    sweep_dead_targets(&applied, released);
+    release_unheld(released);
+}
+
+void ksi_linux_synth_release_owner(const ksi_synth_owner *filter, ksi_forward_view view)
+{
+    uint8_t released[KSI_KEY_BITMAP_BYTES] = {0};
+
+    if (filter == NULL) return;
+    if (view == KSI_FORWARD_ENQUEUED) pthread_mutex_lock(&enqueued_mutex);
+    drop_claims(view == KSI_FORWARD_APPLIED ? &applied : &enqueued, filter, released);
+    if (view == KSI_FORWARD_ENQUEUED) pthread_mutex_unlock(&enqueued_mutex);
+    else release_unheld(released);
+}
+
+void ksi_linux_synth_physical_release(const ksi_forward_packet *packet, ksi_forward_view view)
+{
+    synth_holds *holds = view == KSI_FORWARD_APPLIED ? &applied : &enqueued;
+    uint8_t released[KSI_KEY_BITMAP_BYTES] = {0};
+
+    if ((ksi_forward_key_values(packet) & KSI_FORWARD_KEY_UP) == 0u) return;
+
+    if (view == KSI_FORWARD_ENQUEUED) pthread_mutex_lock(&enqueued_mutex);
+    for (uint32_t i = 0u; i < packet->count && i < KSI_FORWARD_PACKET_EVENTS; i++) {
+        uint16_t code = packet->events[i].code;
+        const ksi_synth_owner derived = { .target = packet->target,
+            .source_type = EV_KEY, .source_code = code };
+
+        if (packet->events[i].type != EV_KEY || packet->events[i].value != 0 || code > KEY_MAX)
+            continue;
+        if (packet->target != 0u) drop_claims(holds, &derived, released);
+        if ((packet->flags & KSI_FORWARD_SUPPRESSED) != 0u) continue;
+        code = ksi_canonical_button(code);
+        if (ksi_key_bit(holds->held, code)) ksi_set_key_bit(released, code, true);
+        release_code(holds, code);
+    }
+    if (view == KSI_FORWARD_ENQUEUED) pthread_mutex_unlock(&enqueued_mutex);
+    else release_unheld(released);
+}
+
+void ksi_linux_synth_release_all(void)
+{
+    applied.used = 0u;
+    memset(applied.holders, 0, sizeof(applied.holders));
+    memset(applied.held, 0, sizeof(applied.held));
+    for (uint16_t i = 0u; i < KSI_TRACKED_BTN_COUNT; i++)
+        if (button_held_on_abs[i]) (void)update_generic_key((uint16_t)(KSI_TRACKED_BTN_BASE + i));
+    ksi_linux_forward_sink_clear_synth();
+}
+
+/* A press after this batch's absolute move goes, with its release, to the
+ * absolute device, so the click lands at the move and restores no clone hold.
+ * Other buttons are the sink's, whose write also ends this input's motion report. */
+static int route_mouse_button(uint16_t btn, bool down, bool moved_absolutely, bool abs_active,
+    bool *abs_pending, bool *rel_pending, const ksi_synth_owner *owner)
+{
+    bool *slot = tracked_button_slot(btn);
+    bool was_held = applied.holders[btn] != 0u;
+    int written;
+
+    if (apply_key(&applied, btn, down, !moved_absolutely, owner) != 0) return -1;
+    if (!was_held && applied.holders[btn] != 0u && abs_active && slot != NULL) {
+        *slot = *abs_pending = true;
+        return emit_event_to(uinput_abs_fd, EV_KEY, btn, 1);
+    }
+    written = update_generic_key(btn);
+    if (written > 0) *rel_pending = false;
+    return written < 0 ? -1 : 0;
+}
+
+/* moved_absolutely persists across the batch's inputs, as admission sees it. */
+static int send_mouse_input(
+    const ksi_mouseinput *input, bool *moved_absolutely,
+    const ksi_synth_owner *owner)
+{
     bool abs_move_active;
     bool rel_pending = false; /* relative-device events awaiting a SYN */
     bool abs_pending = false; /* absolute-device button events awaiting a SYN */
+
+    *moved_absolutely |= moves_absolutely(input);
 
     if ((input->flags & KSI_MOUSE_MOVE) != 0) {
         if ((input->flags & KSI_MOUSE_ABSOLUTE) != 0) {
@@ -1337,13 +1263,6 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
                        || emit_abs_event(ABS_Y, input->dy) != 0
                        || emit_abs_sync() != 0) {
                 return -1;
-            } else if (batch_used_abs_move != NULL) {
-                /* Remember, for this batch, that an absolute position was set:
-                 * buttons that follow (in this input or a later one) must be
-                 * emitted on the SAME (absolute) device so libinput cannot
-                 * process the click before the reposition and land it at the
-                 * old location. */
-                *batch_used_abs_move = true;
             }
         } else {
             if (input->dx != 0 && emit_event(EV_REL, REL_X, input->dx) != 0) {
@@ -1384,48 +1303,15 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
         rel_pending = true;
     }
 
-    /* Route each button transition to the correct device. A DOWN goes to this
-     * batch's device (the absolute device iff this batch established a position
-     * and that device exists); an UP is released on the device its DOWN went to
-     * — tracked across batches by route_mouse_button — so a `Click x,y Down`
-     * then a later move-less `Click Up` cannot strand a button held on the
-     * absolute device. Each call marks the device it actually used SYN-pending. */
-    abs_move_active = batch_used_abs_move != NULL && *batch_used_abs_move && uinput_abs_fd >= 0;
+    abs_move_active = *moved_absolutely && uinput_abs_fd >= 0;
 
-    if ((input->flags & KSI_MOUSE_LEFT_DOWN) != 0 && route_mouse_button(BTN_LEFT, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
-        return -1;
-    }
+    button_transition buttons[8];
+    size_t buttons_count = button_transitions(input, buttons);
 
-    if ((input->flags & KSI_MOUSE_LEFT_UP) != 0 && route_mouse_button(BTN_LEFT, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
-        return -1;
-    }
-
-    if ((input->flags & KSI_MOUSE_RIGHT_DOWN) != 0 && route_mouse_button(BTN_RIGHT, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
-        return -1;
-    }
-
-    if ((input->flags & KSI_MOUSE_RIGHT_UP) != 0 && route_mouse_button(BTN_RIGHT, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
-        return -1;
-    }
-
-    if ((input->flags & KSI_MOUSE_MIDDLE_DOWN) != 0 && route_mouse_button(BTN_MIDDLE, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
-        return -1;
-    }
-
-    if ((input->flags & KSI_MOUSE_MIDDLE_UP) != 0 && route_mouse_button(BTN_MIDDLE, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
-        return -1;
-    }
-
-    xbutton = mouse_data_to_xbutton(input->mouse_data);
-
-    if ((input->flags & KSI_MOUSE_X_DOWN) != 0) {
-        if (xbutton == 0 || route_mouse_button(xbutton, true, abs_move_active, &abs_pending, &rel_pending) != 0) {
-            return -1;
-        }
-    }
-
-    if ((input->flags & KSI_MOUSE_X_UP) != 0) {
-        if (xbutton == 0 || route_mouse_button(xbutton, false, abs_move_active, &abs_pending, &rel_pending) != 0) {
+    for (size_t i = 0u; i < buttons_count; i++) {
+        if (buttons[i].button == 0u
+            || route_mouse_button(buttons[i].button, buttons[i].down, *moved_absolutely,
+                abs_move_active, &abs_pending, &rel_pending, owner) != 0) {
             return -1;
         }
     }
@@ -1453,7 +1339,9 @@ static int send_mouse_input(const ksi_mouseinput *input, bool *batch_used_abs_mo
     return 0;
 }
 
-int ksi_linux_synth_send_input(const ksi_input *inputs, size_t count, uint32_t flags)
+int ksi_linux_synth_send_input(
+    const ksi_input *inputs, size_t count, uint32_t flags,
+    const ksi_synth_owner *owner)
 {
     int result = 0;
 
@@ -1462,164 +1350,40 @@ int ksi_linux_synth_send_input(const ksi_input *inputs, size_t count, uint32_t f
         return -1;
     }
 
-    /* A top-level client batch begins with clean surrogate state so an unpaired
-     * high surrogate cannot combine with an unrelated batch's leading low
-     * surrogate. A surrogate pair may span two fragment calls, so fragments
-     * retain the pending high-surrogate state. Physical replay carries no
-     * surrogate state and may occur between those fragments. */
-    if ((flags & KSI_INTERNAL_SYNTH_REPLAY) == 0u
-            && ((flags & KSI_INTERNAL_SYNTH_BATCH_FRAGMENT) == 0u
-                || (flags & KSI_INTERNAL_SYNTH_BATCH_START) != 0u)) {
+    /* A top-level batch starts with no pending high surrogate, so an unpaired one
+     * cannot join the next batch's low surrogate; a pair may span two fragments,
+     * which keep it. */
+    if ((flags & KSI_INTERNAL_SYNTH_BATCH_FRAGMENT) == 0u
+            || (flags & KSI_INTERNAL_SYNTH_BATCH_START) != 0u) {
         pending_high_surrogate = 0;
     }
 
-    /* Enable per-event pacing for this batch. The shared counter persists across
-     * calls so a burst of single-event passthrough replays is paced like one long
-     * synthesis batch. emit_event_to starts a fresh chunk after an idle gap,
-     * which keeps isolated Sends and keystrokes free. */
+    /* Share output pacing with physical forwarding on the sequencer. */
     synth_pacing_active = true;
 
-    /* Per-batch: once any input performs an absolute MouseMove, subsequent
-     * button presses in this same batch are emitted on the absolute device so
-     * position+click stay atomic on one device (see send_mouse_input). */
-    bool used_abs_move = false;
+    /* Buttons after an absolute move go with it; see route_mouse_button. */
+    bool moved_absolutely = false;
     int had_error = 0;
+    bool dead = owner_is_dead(owner, KSI_FORWARD_APPLIED);
 
     for (size_t i = 0; i < count; i++) {
-        if (inputs[i].type == KSI_INPUT_KEYBOARD) {
-            result = send_keyboard_input(&inputs[i].data.keyboard);
-        } else if (inputs[i].type == KSI_INPUT_MOUSE) {
-            result = send_mouse_input(&inputs[i].data.mouse, &used_abs_move);
+        ksi_input input = inputs[i];
+
+        if (dead && !keep_release(&input)) continue;
+        if (input.type == KSI_INPUT_KEYBOARD) {
+            result = send_keyboard_input(&input.data.keyboard, owner);
+        } else if (input.type == KSI_INPUT_MOUSE) {
+            result = send_mouse_input(&input.data.mouse, &moved_absolutely, owner);
         } else {
-            fprintf(stderr, "keysharp-input: unsupported input type %u\n", inputs[i].type);
+            fprintf(stderr, "keysharp-input: unsupported input type %u\n", input.type);
             result = -1;
         }
 
-        if (result != 0) {
-            had_error = 1;
-
-            /* A data-validation failure (unmappable codepoint/vk, lone surrogate)
-             * must NOT drop the rest of the batch — skip just this input and keep
-             * going, matching Windows SendInput (which never rejects individual
-             * KEYEVENTF_UNICODE events). Only a genuine device write failure
-             * (synth_write_failed, latched in emit_event_to) aborts, since
-             * continuing would only spew failed writes until the recovery poll
-             * rebuilds the device. */
-            if (synth_write_failed) {
-                break;
-            }
-        }
+        /* An invalid input (unmappable codepoint or vk, lone surrogate) skips
+         * only itself, as Win32 SendInput never rejects a single unicode event. */
+        had_error |= result != 0;
     }
 
     synth_pacing_active = false;
     return had_error ? -1 : 0;
-}
-
-static int replay_keyboard_hook_event(const ksi_keyboard_hook_event *event)
-{
-    ksi_input input;
-
-    memset(&input, 0, sizeof(input));
-    input.type = KSI_INPUT_KEYBOARD;
-    input.data.keyboard.vk = (uint16_t)event->vk_code;
-    input.data.keyboard.scan = (uint16_t)event->scan_code;
-    input.data.keyboard.flags = KSI_KEY_SCANCODE;
-
-    if ((event->flags & KSI_KEYBOARD_HOOK_UP) != 0) {
-        input.data.keyboard.flags |= KSI_KEY_UP;
-    }
-
-    return ksi_linux_synth_send_input(&input, 1,
-        KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_REPLAY);
-}
-
-static int replay_mouse_hook_event(const ksi_mouse_hook_event *event)
-{
-    ksi_input input;
-
-    memset(&input, 0, sizeof(input));
-    input.type = KSI_INPUT_MOUSE;
-
-    switch (event->message) {
-        case KSI_MESSAGE_MOUSE_MOVE:
-            input.data.mouse.flags = KSI_MOUSE_MOVE;
-            input.data.mouse.dx = event->x;
-            input.data.mouse.dy = event->y;
-
-            if ((event->mouse_data & KSI_MOUSE_ABSOLUTE) != 0) {
-                if (uinput_abs_fd >= 0) {
-                    input.data.mouse.flags |= KSI_MOUSE_ABSOLUTE;
-                } else {
-                    /* A grabbed absolute pointer (VM tablet, touchscreen) must
-                     * still reach the desktop when the absolute output device
-                     * failed to create; otherwise PASS silently swallows the
-                     * user's own pointer for as long as a mouse hook is
-                     * subscribed. The hook event carries the movement delta the
-                     * device reported, so re-emit it on the relative device. */
-                    input.data.mouse.dx = event->delta_x;
-                    input.data.mouse.dy = event->delta_y;
-                }
-            }
-
-            break;
-        case KSI_MESSAGE_LEFT_BUTTON_DOWN:
-            input.data.mouse.flags = KSI_MOUSE_LEFT_DOWN;
-            break;
-        case KSI_MESSAGE_LEFT_BUTTON_UP:
-            input.data.mouse.flags = KSI_MOUSE_LEFT_UP;
-            break;
-        case KSI_MESSAGE_RIGHT_BUTTON_DOWN:
-            input.data.mouse.flags = KSI_MOUSE_RIGHT_DOWN;
-            break;
-        case KSI_MESSAGE_RIGHT_BUTTON_UP:
-            input.data.mouse.flags = KSI_MOUSE_RIGHT_UP;
-            break;
-        case KSI_MESSAGE_MIDDLE_BUTTON_DOWN:
-            input.data.mouse.flags = KSI_MOUSE_MIDDLE_DOWN;
-            break;
-        case KSI_MESSAGE_MIDDLE_BUTTON_UP:
-            input.data.mouse.flags = KSI_MOUSE_MIDDLE_UP;
-            break;
-        case KSI_MESSAGE_MOUSE_WHEEL:
-            input.data.mouse.flags = KSI_MOUSE_WHEEL;
-            input.data.mouse.mouse_data = (uint32_t)((int32_t)event->mouse_data >> 16);
-            break;
-        case KSI_MESSAGE_MOUSE_HORIZONTAL_WHEEL:
-            input.data.mouse.flags = KSI_MOUSE_HORIZONTAL_WHEEL;
-            input.data.mouse.mouse_data = (uint32_t)((int32_t)event->mouse_data >> 16);
-            break;
-        case KSI_MESSAGE_X_BUTTON_DOWN:
-            input.data.mouse.flags = KSI_MOUSE_X_DOWN;
-            input.data.mouse.mouse_data = event->mouse_data;
-            break;
-        case KSI_MESSAGE_X_BUTTON_UP:
-            input.data.mouse.flags = KSI_MOUSE_X_UP;
-            input.data.mouse.mouse_data = event->mouse_data;
-            break;
-        default:
-            fprintf(stderr, "keysharp-input: unsupported mouse hook replay message=0x%x\n", event->message);
-            return -1;
-    }
-
-    return ksi_linux_synth_send_input(&input, 1,
-        KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_REPLAY);
-}
-
-int ksi_linux_synth_replay_hook_event(uint32_t hook_type, const ksi_hook_event_payload *event)
-{
-    int result;
-
-    if (event == NULL) {
-        return -1;
-    }
-
-    if (hook_type == KSI_HOOK_KEYBOARD) {
-        result = replay_keyboard_hook_event(&event->event.keyboard);
-    } else if (hook_type == KSI_HOOK_MOUSE) {
-        result = replay_mouse_hook_event(&event->event.mouse);
-    } else {
-        result = -1;
-    }
-
-    return result;
 }

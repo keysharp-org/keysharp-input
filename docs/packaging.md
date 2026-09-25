@@ -46,7 +46,7 @@ SHA256SUMS
 ```
 
 Archives contain the executable, SONAME library, public headers, pkg-config and
-CMake metadata, service files, policy, rule, installer, and standalone docs.
+CMake metadata, service files, policy, installer, and standalone docs.
 
 `install.sh --skip-if-compatible` leaves an installed package or portable copy
 untouched when its public client ABI and required runtime resources are

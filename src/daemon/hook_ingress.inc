@@ -37,11 +37,9 @@ static bool synth_batch_needs_hook_queue(
     return false;
 }
 
-static bool enqueue_synth_direct(
+static bool enqueue_synth_direct_complete(
     ksi_daemon_state *state,
-    const ksi_input *input,
-    bool batch_start,
-    uint64_t input_generation)
+    const ksi_synthetic_hook_item *item)
 {
     /* BATCH_FRAGMENT: this is one event of an already-received client batch (the
      * synthetic hook queue re-emits them individually), so per-batch synthesis
@@ -49,29 +47,15 @@ static bool enqueue_synth_direct(
      * fragment rather than being reset (see ksi_linux_synth_send_input).
      * BATCH_START on the first fragment re-arms that reset at the batch boundary. */
     uint32_t flags = KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_BATCH_FRAGMENT
-        | (batch_start ? KSI_INTERNAL_SYNTH_BATCH_START : 0u);
+        | (item->batch_start ? KSI_INTERNAL_SYNTH_BATCH_START : 0u);
+    bool ok = output_queue_push_synth(&state->output_queue, &item->input, 1u, flags,
+        item->input_generation, item->connection_id);
 
-    return output_queue_push_synth(
-        &state->output_queue, input, 1u, flags, input_generation);
-}
-
-static bool enqueue_synth_direct_complete(
-    ksi_daemon_state *state,
-    const ksi_input *input,
-    ksi_synth_completion *completion,
-    bool batch_start,
-    uint64_t input_generation)
-{
-    bool ok = enqueue_synth_direct(
-        state, input, batch_start, input_generation);
-
-    if (completion != NULL) {
-        if (ok) {
-            synth_completion_complete(completion);
-        } else {
-            synth_completion_fail(completion, KSI_STATUS_RESOURCE_EXHAUSTED,
-                KSI_DETAIL_NONE);
-        }
+    if (ok) {
+        synth_completion_complete(item->completion);
+    } else {
+        synth_completion_fail(item->completion, KSI_STATUS_RESOURCE_EXHAUSTED,
+            KSI_DETAIL_NONE);
     }
 
     return ok;
@@ -87,12 +71,14 @@ static bool create_synthetic_lane_event(
     uint32_t nesting_depth,
     ksi_synth_completion *completion,
     ksi_lane_event **event,
-    uint64_t input_generation)
+    uint64_t input_generation,
+    uint64_t connection_id)
 {
     uint32_t hook_type = hook_type_for_input(input);
     ksi_hook_event_payload payload;
     ksi_lane_egress egress = {
         .type = KSI_LANE_EGRESS_SYNTH,
+        .connection_id = connection_id,
         .synth_count = 1u,
         .synth_flags = KSI_SYNTH_BYPASS_HOOK | KSI_INTERNAL_SYNTH_BATCH_FRAGMENT
             | (batch_start ? KSI_INTERNAL_SYNTH_BATCH_START : 0u),
@@ -102,44 +88,31 @@ static bool create_synthetic_lane_event(
     *event = NULL;
 
     if (hook_type == 0u || !any_matching_hook_subscriptions(state, hook_type)
-        || state->backend == NULL || state->backend->input_to_hook_event == NULL
-        || !state->backend->input_to_hook_event(
-            input, &hook_type, &payload, &event_size)) {
+        || !ksi_linux_synth_input_to_hook_event(input, &hook_type, &payload, &event_size)) {
         return true;
     }
 
     egress.synth_inputs[0] = *input;
     *event = create_hook_lane_event(state, hook_type, &payload.event, event_size,
-        &egress, completion, nesting_depth,
-        input_generation);
+        &egress, completion, nesting_depth, input_generation);
     return *event != NULL;
 }
 
 static bool process_synthetic_hook_input(
     ksi_daemon_state *state,
-    const ksi_input *input,
-    ksi_synth_completion *completion,
-    bool batch_start,
-    uint64_t input_generation)
+    const ksi_synthetic_hook_item *item)
 {
     ksi_lane_event *event;
 
-    if (state == NULL || input == NULL) {
-        synth_completion_fail(completion, KSI_STATUS_INTERNAL,
-            KSI_DETAIL_NONE);
-        return false;
-    }
-
-    if (!create_synthetic_lane_event(state, input, batch_start, 0u,
-            completion, &event, input_generation)) {
-        synth_completion_fail(completion, KSI_STATUS_RESOURCE_EXHAUSTED,
+    if (!create_synthetic_lane_event(state, &item->input, item->batch_start, 0u,
+            item->completion, &event, item->input_generation, item->connection_id)) {
+        synth_completion_fail(item->completion, KSI_STATUS_RESOURCE_EXHAUSTED,
             KSI_DETAIL_NONE);
         return false;
     }
 
     if (event == NULL) {
-        return enqueue_synth_direct_complete(
-            state, input, completion, batch_start, input_generation);
+        return enqueue_synth_direct_complete(state, item);
     }
 
     atomic_store(&state->synthetic_hook_inflight, 1);
@@ -149,35 +122,33 @@ static bool process_synthetic_hook_input(
 
 static bool process_synthetic_hook_queue_one(ksi_daemon_state *state)
 {
-    ksi_input input;
-    uint64_t queued_at_ns;
-    ksi_synth_completion *completion = NULL;
-    bool batch_start = false;
-    uint64_t input_generation = 0u;
+    ksi_synthetic_hook_item item;
 
     if (state == NULL
         || atomic_load(&state->synthetic_hook_inflight) != 0
-        || !synthetic_hook_queue_pop(&state->synthetic_hook_queue,
-            &input, &queued_at_ns, &completion, &batch_start,
-            &input_generation)) {
+        || !synthetic_hook_queue_pop(&state->synthetic_hook_queue, &item)) {
         return false;
     }
 
-    (void)queued_at_ns;
+    if (item.release_owner) {
+        release_connection_output(state, item.connection_id, 0u);
+        /* Once no client remains, no synthetic key may stay held. */
+        if (state->client_count == 0u) (void)output_queue_push_release_generic(&state->output_queue);
+        return true;
+    }
 
-    if (input_generation != 0u
-        && input_generation != current_input_generation(state)) {
-        synth_completion_fail(completion, KSI_STATUS_CANCELLED,
+    if (item.input_generation != 0u
+        && item.input_generation != current_input_generation(state)) {
+        synth_completion_fail(item.completion, KSI_STATUS_CANCELLED,
             KSI_DETAIL_NONE);
         return true;
     }
 
-    if (batch_start) {
-        synth_completion_begin_atomic(completion);
+    if (item.batch_start) {
+        synth_completion_begin_atomic(item.completion);
     }
 
-    if (!process_synthetic_hook_input(
-            state, &input, completion, batch_start, input_generation)) {
+    if (!process_synthetic_hook_input(state, &item)) {
         fprintf(stderr, "keysharp-input: failed to route synthetic hook input\n");
     }
 
