@@ -63,13 +63,20 @@ it; package-manager dependency tracking decides when the broker is unused.
 
 ## NixOS
 
-The flake exports a package and `nixosModules.default`:
+Add the input to your host flake:
 
 ```nix
-{
-  services.keysharp-input.enable = true;
-}
+inputs.keysharp-input.url = "github:keysharp-org/keysharp-input";
+```
+
+Include `keysharp-input` in the `outputs` arguments and add these entries to your
+host's `nixosSystem.modules` list:
+
+```nix
+keysharp-input.nixosModules.default
+{ services.keysharp-input.enable = true; }
 ```
 
 The module loads uinput, enables polkit, installs the device rule, and starts
-`keysharp-input.service` with its socket.
+`keysharp-input.service` with its socket. It selects the flake's package for the host
+architecture; override `services.keysharp-input.package` to use a custom build.

@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, defaultPackage, ... }:
 
 let
   cfg = config.services.keysharp-input;
@@ -8,8 +8,8 @@ in {
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ./package.nix { };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
+      default = defaultPackage;
+      defaultText = lib.literalExpression "inputs.keysharp-input.packages.${pkgs.stdenv.hostPlatform.system}.default";
       description = "keysharp-input package to run.";
     };
   };

@@ -21,7 +21,11 @@
           keysharp-input = self.packages.${system}.default;
         });
 
-      nixosModules.default = import ./nix/module.nix;
+      nixosModules.default = { config, lib, pkgs, ... }:
+        import ./nix/module.nix {
+          inherit config lib pkgs;
+          defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
       nixosModules.keysharp-input = self.nixosModules.default;
 
       checks = forAllSystems (system: {
