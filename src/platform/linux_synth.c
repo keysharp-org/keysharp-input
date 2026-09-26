@@ -177,16 +177,17 @@ static void sweep_dead_targets(synth_holds *holds, uint8_t *released)
     drop_claims(holds, NULL, released);
 }
 
+static const ksi_synth_owner anonymous_owner;
+
 /* One key transition in queue order, for either view. A press restores a hold
  * synthesis displaced (if restore) or holds the key for its owner; a release ends
  * the owner's hold, or else, as a Win32 key-up does, the key everywhere. */
 static int apply_key(synth_holds *holds, uint16_t code, bool down, bool restore,
     const ksi_synth_owner *owner)
 {
-    static const ksi_synth_owner anonymous;
     synth_claim *claim;
 
-    if (owner == NULL) owner = &anonymous;
+    if (owner == NULL) owner = &anonymous_owner;
     if (down)
         return restore && ksi_linux_forward_restore_key(code, holds->view) ? 0 : hold_key(holds, owner, code);
 
@@ -309,8 +310,14 @@ static int tap_sink_key(uint16_t code)
 static int send_key_code(int key_code, int value, const ksi_synth_owner *owner)
 {
     uint16_t code = ksi_canonical_button((uint16_t)key_code);
+    const synth_claim *claim = find_claim(&applied, owner != NULL ? owner : &anonymous_owner);
+    /* An owner pressing a key it holds, as a script keeping a key down does,
+     * only keeps holding it. */
+    int repressed = value != 0 && (claim == NULL || !ksi_key_bit(claim->keys, code))
+        ? paced(ksi_linux_forward_sink_repress(code)) : 0;
 
-    return apply_key(&applied, code, value != 0, true, owner) == 0 && update_generic_key(code) >= 0 ? 0 : -1;
+    return apply_key(&applied, code, value != 0, true, owner) == 0 && update_generic_key(code) >= 0
+        && repressed >= 0 ? 0 : -1;
 }
 
 void ksi_linux_synth_add_logical_key_state(uint8_t *keys, size_t key_bytes)

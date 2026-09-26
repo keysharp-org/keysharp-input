@@ -68,8 +68,9 @@ in standalone modules.
   reorder it; it fails open instead. Client synthesis and Modify replacements
   use the generic devices, where every hold has an owner. A compositor reads
   each device's queue as a group, so keyboard state has one device: the sink
-  holds a key while synthesis or any source does and writes only the first
-  press and the last release. The output queue refuses Modify output from
+  holds a key while synthesis or any source does and writes its first press
+  and last release, plus a release and press when a new holder presses it,
+  except for modifier and lock keys. The output queue refuses Modify output from
   revoked hooks. A closed
   connection's accepted batches still play whole: a release marker queued
   behind them in the synthetic hook queue ends what they hold. Key state
@@ -87,9 +88,10 @@ in standalone modules.
   | RELEASE_GENERIC | all generic holds |
   | RELEASE_ALL, RECREATE_SYNTH | all generic holds; RELEASE_ALL also every source's holds |
 - A `ksi_synth_completion` counts every admitted fragment; exactly the transition
-  from one to zero releases the atomic-transaction count and destroys it. Recursive
-  completions also own the callback-stream reply reference; ordinary batches are detached
-  because their RPC already acknowledged admission.
+  from one to zero releases the atomic-transaction count and destroys it, replying
+  to the sender then: a batch hooks must see answers once they all have, as Win32
+  SendInput returns, with the status of its admission. Recursive completions own
+  the callback-stream reply reference and report failures.
 - `flush_generation` invalidates queued snapshots during fail-open or teardown;
   stale events may release resources but must not invoke callbacks or output
   synthetic replacements.

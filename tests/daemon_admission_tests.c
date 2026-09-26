@@ -1159,7 +1159,7 @@ static bool test_output_actions_reach_sink(void)
 
     CHECK(output_queue_push_synth(&state->output_queue, a_and_b, 2u, 0u, 1u, 7u));
     drain_output(state);
-    CHECK(sink_keys(1u, (const uint16_t[]){ KEY_B }, (const int32_t[]){ 1 }));
+    CHECK(sink_keys(3u, (const uint16_t[]){ KEY_B, KEY_A, KEY_A }, (const int32_t[]){ 1, 0, 1 }));
     CHECK(output_queue_push_release_generic(&state->output_queue));
     drain_output(state);
     CHECK(sink_keys(1u, (const uint16_t[]){ KEY_B }, (const int32_t[]){ 0 }));
@@ -1272,6 +1272,55 @@ static bool test_hook_routed_send_owners(void)
     return true;
 }
 
+/* As Win32 SendInput returns only after every low-level hook has seen the
+ * input, a Send hooks must see is answered once its batch completes, and
+ * reports its admission even when the batch is dropped afterwards. */
+static bool test_hook_routed_send_replies_after_hooks(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    ksi_client sender = { .fd = -1, .state = KSI_CLIENT_STATE_READY, .uid = getuid(),
+        .connection_id = 9u, .granted_scopes = KSI_SCOPE_INPUT_CONTROL,
+        .connection_role = KSI_ROLE_RPC, .hello_complete = true };
+    uint8_t *rx_buffer = calloc(1u, KSI_MAX_MESSAGE_SIZE);
+    uint8_t synthesize[KSI_SYNTHESIZE_PREFIX_SIZE + KSI_INPUT_WIRE_SIZE] = { 0 };
+    ksi_synthetic_hook_item item;
+    int sockets[2];
+
+    CHECK(state != NULL && rx_buffer != NULL);
+    CHECK(synthetic_hook_queue_init(&state->synthetic_hook_queue) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    state->ready_operations = KSI_OPERATION_SYNTHESIZE_KEYBOARD;
+    state->client_count = 2u;
+    sender.fd = sockets[0];
+    sender.rx_buffer = rx_buffer;
+    sender.hook_send_ref = hook_send_ref_create(sockets[0]);
+    state->clients[0] = sender;
+    state->clients[1] = (ksi_client){ .fd = -1, .uid = getuid(), .connection_id = 4u,
+        .connection_role = KSI_ROLE_CALLBACK_STREAM,
+        .hook_subscriptions = KSI_OPERATION_HOOK_KEYBOARD };
+    CHECK(sender.hook_send_ref != NULL);
+
+    ksi_wire_write_u32(synthesize, 1u);
+    ksi_wire_write_u32(synthesize + KSI_SYNTHESIZE_PREFIX_SIZE, (uint32_t)KSI_INPUT_KEYBOARD);
+    ksi_wire_write_u16(synthesize + KSI_SYNTHESIZE_PREFIX_SIZE + 10u, KEY_A);
+    ksi_wire_write_u32(synthesize + KSI_SYNTHESIZE_PREFIX_SIZE + 12u, (uint32_t)KSI_KEY_SCANCODE);
+    CHECK(dispatch_request(state, &sender, KSI_OPCODE_SYNTHESIZE_INPUT, 1u,
+        synthesize, sizeof(synthesize)));
+    CHECK(poll(&(struct pollfd){ .fd = sockets[1], .events = POLLIN }, 1u, 0) == 0);
+    CHECK(synthetic_hook_queue_pop(&state->synthetic_hook_queue, &item));
+    synth_completion_fail(item.completion, KSI_STATUS_CANCELLED, KSI_DETAIL_NONE);
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_SYNTHESIZE_INPUT, 1u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+
+    synthetic_hook_queue_close(&state->synthetic_hook_queue);
+    hook_send_ref_invalidate(sender.hook_send_ref);
+    hook_send_ref_release(sender.hook_send_ref);
+    close(sockets[1]);
+    free(rx_buffer);
+    free(state);
+    return true;
+}
+
 int main(void)
 {
     if (!test_daemon_admission_and_operation_gates()
@@ -1291,7 +1340,8 @@ int main(void)
         || !test_panic_fails_open()
         || !test_hook_class_end_releases_holds()
         || !test_closed_connection_release_order()
-        || !test_hook_routed_send_owners()) {
+        || !test_hook_routed_send_owners()
+        || !test_hook_routed_send_replies_after_hooks()) {
         return 1;
     }
     /* A broken sink is a pipe without a reader, as the daemon ignores. */

@@ -158,6 +158,46 @@ static int write_sink_locked(const struct input_event *events, size_t count)
     return result;
 }
 
+/* A key the sink holds writes no further press, yet a new holder's press must
+ * still type, as a repeated Win32 key-down does, so it is written as a release
+ * and a press. Modifier and lock keys stay down: releasing one would read as a
+ * lone tap, or toggle the lock. */
+static bool needs_repress_locked(uint16_t code)
+{
+    switch (code) {
+    case KEY_LEFTCTRL: case KEY_RIGHTCTRL: case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
+    case KEY_LEFTALT: case KEY_RIGHTALT: case KEY_LEFTMETA: case KEY_RIGHTMETA:
+    case KEY_CAPSLOCK: case KEY_NUMLOCK: case KEY_SCROLLLOCK:
+        return false;
+    default:
+        return ksi_linux_key_code_is_keyboard(code) && ksi_key_bit(sink.down, code);
+    }
+}
+
+static int write_sink_key_locked(uint16_t code, int32_t value)
+{
+    const struct input_event events[] = {
+        { .type = EV_KEY, .code = code, .value = value },
+        { .type = EV_SYN, .code = SYN_REPORT },
+    };
+
+    return write_sink_locked(events, 2u);
+}
+
+/* Returns the number of events written, or -1. */
+static int tap_locked(uint16_t code)
+{
+    bool down = ksi_key_bit(sink.down, code);
+    const struct input_event events[] = {
+        { .type = EV_KEY, .code = code, .value = !down },
+        { .type = EV_SYN, .code = SYN_REPORT },
+        { .type = EV_KEY, .code = code, .value = down },
+        { .type = EV_SYN, .code = SYN_REPORT },
+    };
+
+    return write_sink_locked(events, 4u) == 0 ? 4 : -1;
+}
+
 static bool sink_wants_locked(uint16_t code)
 {
     if (ksi_key_bit(sink.synth, code)) return true;
@@ -171,13 +211,9 @@ static bool sink_wants_locked(uint16_t code)
 static int reconcile_locked(uint16_t code)
 {
     bool want = sink_wants_locked(code);
-    const struct input_event events[] = {
-        { .type = EV_KEY, .code = code, .value = want },
-        { .type = EV_SYN, .code = SYN_REPORT },
-    };
 
     if (want == ksi_key_bit(sink.down, code)) return 0;
-    return write_sink_locked(events, 2u) == 0 ? 2 : -1;
+    return write_sink_key_locked(code, want) == 0 ? 2 : -1;
 }
 
 /* Sets whether the source holds code downstream; APPLIED writes the change. */
@@ -484,16 +520,20 @@ int ksi_linux_forward_write(const ksi_forward_packet *packet)
         device->clone_report_open = !ends_report;
         note_written_keys(device->views[KSI_FORWARD_APPLIED].output, events, count, result);
     } else {
-        /* The sink changes only when its first holder presses or its last
-         * releases, and repeats only a key it holds. */
+        /* The sink changes when its first holder presses or its last releases,
+         * repeats only a key it holds, and retypes a key another holder has. */
+        bool repress = key != NULL && key->value == 1 && !ksi_key_bit(output, key->code)
+            && needs_repress_locked(key->code);
         if (key != NULL && key->value != 2)
             ksi_set_key_bit(device->views[KSI_FORWARD_APPLIED].output, key->code, key->value != 0);
-        if (key != NULL && (key->value == 2 ? !ksi_key_bit(sink.down, key->code)
+        if (!repress && key != NULL && (key->value == 2 ? !ksi_key_bit(sink.down, key->code)
                 : sink_wants_locked(key->code) == ksi_key_bit(sink.down, key->code))) {
             pthread_mutex_unlock(&devices_mutex);
             return 0;
         }
-        result = write_sink_locked(events, count);
+        result = repress ? write_sink_key_locked(key->code, 0) : 0;
+        if (result == 0) result = write_sink_locked(events, count);
+        count += repress ? 2u : 0u;
         device->sink_report_open = !ends_report;
     }
     pthread_mutex_unlock(&devices_mutex);
@@ -626,20 +666,24 @@ int ksi_linux_forward_sink_key(uint16_t code, bool held)
 
 int ksi_linux_forward_sink_tap(uint16_t code)
 {
-    int result;
+    int written;
 
     if (code > KEY_MAX) return -1;
     pthread_mutex_lock(&devices_mutex);
-    bool down = ksi_key_bit(sink.down, code);
-    const struct input_event events[] = {
-        { .type = EV_KEY, .code = code, .value = !down },
-        { .type = EV_SYN, .code = SYN_REPORT },
-        { .type = EV_KEY, .code = code, .value = down },
-        { .type = EV_SYN, .code = SYN_REPORT },
-    };
-    result = write_sink_locked(events, 4u);
+    written = tap_locked(code);
     pthread_mutex_unlock(&devices_mutex);
-    return result == 0 ? 4 : -1;
+    return written;
+}
+
+int ksi_linux_forward_sink_repress(uint16_t code)
+{
+    int written = 0;
+
+    if (code > KEY_MAX) return 0;
+    pthread_mutex_lock(&devices_mutex);
+    if (needs_repress_locked(code)) written = tap_locked(code);
+    pthread_mutex_unlock(&devices_mutex);
+    return written;
 }
 
 void ksi_linux_forward_sink_clear_synth(void)

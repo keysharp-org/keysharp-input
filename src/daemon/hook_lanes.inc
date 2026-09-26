@@ -603,10 +603,15 @@ static void synth_completion_send_result(
 {
     uint8_t payload[KSI_STATUS_PAYLOAD_SIZE];
 
-    /* Ordinary SendInput reports queue admission immediately. Its detached
-     * completion exists only to keep the accepted batch atomic while hooks run. */
+    /* A completion without a sender only keeps its batch atomic while hooks run. */
     if (completion == NULL || completion->send_ref == NULL) {
         return;
+    }
+    /* As Win32 SendInput reports only whether input entered the queue, input
+     * dropped after admission, as a seat change drops it, still answers OK. */
+    if (completion->admitted) {
+        status = KSI_STATUS_OK;
+        detail = KSI_DETAIL_NONE;
     }
 
     bool can_reply = !completion->is_recursive_synthesis

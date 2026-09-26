@@ -337,6 +337,8 @@ typedef struct ksi_synth_completion {
     _Atomic uint64_t terminal_result;
     bool owns_atomic_transaction;
     bool is_recursive_synthesis;
+    /* An ordinary Send admitted to the queue, whose reply reports that. */
+    bool admitted;
     uint64_t parent_hook_event_id;
 } ksi_synth_completion;
 

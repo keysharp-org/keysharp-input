@@ -160,7 +160,10 @@ Each input record is 40 bytes. It starts `{u32 type,u32 reserved=0}`. Keyboard
 type 1 stores `{u16 vk,u16 scan,u32 flags,u32 time,u32 reserved,u64 extra_info,u64 reserved}`
 at offset 8. Mouse type 0 stores
 `{i32 dx,i32 dy,u32 mouse_data,u32 flags,u32 time,u32 reserved,u64 extra_info}`
-at offset 8. The only public synthesis flag is BYPASS_HOOK=`0x01`.
+at offset 8. The only public synthesis flag is BYPASS_HOOK=`0x01`. Without it,
+a SYNTHESIZE_INPUT that any hook must see is answered once every hook has seen
+it. As with Win32 SendInput, the status reports admission, so input dropped
+afterwards, as a seat change drops it, still answers OK.
 
 ## Ordering and safety
 

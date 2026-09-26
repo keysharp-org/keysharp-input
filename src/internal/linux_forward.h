@@ -102,13 +102,16 @@ uint32_t ksi_linux_forward_epoch(void);
 
 /* The sink is synthesis's keyboard device (a negative fd detaches it). A key is
  * down while synthesis or any source holds it, so only the first press and last
- * release are written. Sequencer; sink_key and sink_tap return events written or -1. */
+ * release are written, except that a later holder's press is written as a
+ * release and a press (sink_repress, called before that holder's hold).
+ * Sequencer; sink_key, sink_tap and sink_repress return events written or -1. */
 void ksi_linux_forward_attach_sink(int fd);
 /* Advances whenever the sink is detached. */
 uint32_t ksi_linux_forward_sink_generation(void);
 bool ksi_linux_forward_sink_ready(void);
 int ksi_linux_forward_sink_key(uint16_t code, bool held);
 int ksi_linux_forward_sink_tap(uint16_t code);
+int ksi_linux_forward_sink_repress(uint16_t code);
 void ksi_linux_forward_sink_clear_synth(void);
 
 #endif

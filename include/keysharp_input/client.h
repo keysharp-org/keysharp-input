@@ -278,6 +278,10 @@ KSI_API ksi_status ksi_hook_reply_event(
     const ksi_hook_event *event,
     const ksi_hook_reply *reply,
     ksi_error *error);
+/* Returns once every hook, the caller's own included, has seen the input, as
+ * Win32 SendInput does, or once it is queued when KSI_SYNTH_BYPASS_HOOK is set
+ * or no hook is subscribed. The status reports whether the input was admitted,
+ * not whether it was delivered. */
 KSI_API ksi_status ksi_synthesize(
     ksi_connection *connection,
     const ksi_input *inputs,

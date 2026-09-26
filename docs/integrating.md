@@ -36,6 +36,10 @@ used by one thread at a time. The callback API is deliberately reentrant:
 a registered nested-hook handler may call `ksi_synthesize` on the same callback
 connection. The library pumps child hook requests until the nested call
 completes, then sends the child's decision and resumes the parent request.
+Outside a callback, `ksi_synthesize` returns only once every hook, the caller's
+own included, has seen the input, as Win32 SendInput does. Call it on another
+connection, from a thread other than the one reading your hook stream, which
+must keep reading while the call waits.
 Do not disconnect or free the callback context inside a nested callback. Defer
 destruction until the outer client API call returns, and keep replacement input
 arrays alive until that return.
@@ -187,9 +191,9 @@ owns contributes physical state only, but the broker learns of that owner only
 by trying to grab the source, so this holds while a hook or BlockInput wants
 the source. A device query's bitmaps describe that source alone, without
 synthesis, while its modifier mask and lock bytes describe the seat, which is
-what hooks use to name keypad keys. Logical state follows admitted output, so a
-query after a Send returns sees its result before paced output drains. A batch
-that goes through another client's hooks is admitted only once they pass it.
+what hooks use to name keypad keys. Logical state follows admitted output, and a
+Send returns only once its input has passed every hook and been admitted, so a
+query after it returns sees its result before paced output drains.
 
 See [the complete device-state example](../examples/read-key-state.c).
 
@@ -205,7 +209,10 @@ they were written in: sharing the keyboard device keeps a remap such as `+c::d`,
 which sends Shift up, `d` and Shift down around a Shift the user holds, in
 order, and a modifier held on one keyboard applies to keys from another. The
 device holds a key while synthesis or any keyboard holds it, so the desktop sees
-one press when the first holder presses and one release when the last lets go.
+one release when the last holder lets go. A press still types while another
+holder keeps the key down, as a repeated Win32 key-down does, so the desktop
+sees it as a release and a press; a client pressing a key it already holds, or
+any press of a modifier or lock key, changes nothing there.
 While a keyboard is intercepted, the desktop sees its keys as coming from that
 device, so settings matched to one keyboard, such as a per-device layout, do not
 apply to them.

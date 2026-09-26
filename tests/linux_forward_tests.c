@@ -354,14 +354,15 @@ static bool test_forwarding_and_synthesis(void)
     CHECK(read_events(generic[0]) == 3u && events[0].value == 1 && events[1].value == 2);
     CHECK(read_events(outputs[1].fds[0]) == 0u);
 
-    /* Synthesis shares the sink; a key a source already holds adds nothing. */
+    /* Synthesis shares the sink; a key a source already holds is pressed again. */
     const ksi_input generated[] = {
         { .type = KSI_INPUT_MOUSE, .data.mouse = { .dx = 20, .flags = KSI_MOUSE_MOVE } },
         key_input(KEY_A, true), key_input(KEY_B, true),
     };
     CHECK(send(generated, 3u, NULL) == 0);
-    CHECK(read_events(generic[0]) == 4u && events[0].type == EV_REL && events[0].value == 20
-        && events[2].code == KEY_B);
+    CHECK(read_events(generic[0]) == 8u && events[0].type == EV_REL && events[0].value == 20
+        && events[2].code == KEY_A && events[2].value == 0 && events[4].code == KEY_A
+        && events[4].value == 1 && events[6].code == KEY_B);
 
     /* A lane goes only to an output its source has. */
     motion.target = keyboard;
@@ -752,13 +753,15 @@ static bool test_sink_keeps_order(void)
     CHECK(forward_key(second, KEY_LEFTSHIFT, 0) == 0);
     CHECK(sink_keys(1u, (const uint16_t[]){ KEY_LEFTSHIFT }, (const int32_t[]){ 0 }));
 
-    /* A script's release of its own press leaves the user's hold down, and the
-     * user's release ends the script's hold, as a Win32 key-up does. */
+    /* A script's press of a key the user holds types it again, its release
+     * leaves the user's hold down, and the user's release ends the script's
+     * hold, as a Win32 key-up does. */
     CHECK(forward_key(first, KEY_A, 1) == 0 && read_events(generic[0]) == 2u);
     const ksi_input a_down = key_input(KEY_A, true), a_up = key_input(KEY_A, false);
     CHECK(send(&a_down, 1u, &script) == 0 && send(&a_up, 1u, &script) == 0);
-    CHECK(read_events(generic[0]) == 0u && sink_down(KEY_A));
-    CHECK(send(&a_down, 1u, &script) == 0 && read_events(generic[0]) == 0u);
+    CHECK(sink_keys(2u, (const uint16_t[]){ KEY_A, KEY_A }, (const int32_t[]){ 0, 1 }) && sink_down(KEY_A));
+    CHECK(send(&a_down, 1u, &script) == 0
+        && sink_keys(2u, (const uint16_t[]){ KEY_A, KEY_A }, (const int32_t[]){ 0, 1 }));
     const ksi_forward_packet user_up = key_packet(first, KEY_A, 0);
     CHECK(forward(&user_up) == 0 && sink_keys(1u, (const uint16_t[]){ KEY_A }, (const int32_t[]){ 0 }));
 
@@ -796,7 +799,8 @@ static bool test_mixed_batch_and_unplug(void)
     CHECK(send(&drop, 1u, &script) == 0 && read_events(generic[0]) == 2u);
 
     CHECK(send(&w_down, 1u, &script) == 0 && read_events(generic[0]) == 2u);
-    CHECK(forward_key(keyboard, KEY_W, 1) == 0 && read_events(generic[0]) == 0u);
+    CHECK(forward_key(keyboard, KEY_W, 1) == 0
+        && sink_keys(2u, (const uint16_t[]){ KEY_W, KEY_W }, (const int32_t[]){ 0, 1 }));
     close_source(keyboard);
     ksi_linux_synth_maintain_output();
     CHECK(read_events(generic[0]) == 0u && sink_down(KEY_W) && logical(KEY_W));
@@ -817,8 +821,9 @@ static bool test_owner_lifetimes(void)
         .hook_type = KSI_HOOK_MOUSE, .source_type = EV_KEY, .source_code = BTN_LEFT };
     const ksi_synth_owner script = { .connection_id = 33u };
 
+    /* The second owner's press types again. */
     CHECK(send(&down, 1u, &first_owner) == 0 && send(&down, 1u, &second_owner) == 0);
-    CHECK(read_events(generic[0]) == 2u && applied.holders[KEY_B] == 2u);
+    CHECK(read_events(generic[0]) == 6u && applied.holders[KEY_B] == 2u);
 
     /* Zero filter fields are wildcards. */
     release(&(ksi_synth_owner){ .connection_id = 11u, .hook_type = KSI_HOOK_MOUSE });
@@ -828,7 +833,7 @@ static bool test_owner_lifetimes(void)
 
     /* An owner's own release ends only its hold. */
     CHECK(send(&down, 1u, &script) == 0 && send(&up, 1u, &first_owner) == 0);
-    CHECK(read_events(generic[0]) == 0u && applied.holders[KEY_B] == 1u);
+    CHECK(read_events(generic[0]) == 4u && applied.holders[KEY_B] == 1u);
 
     /* A disconnect ends the client's own holds. */
     release(&(ksi_synth_owner){ .connection_id = 33u });
@@ -837,7 +842,7 @@ static bool test_owner_lifetimes(void)
     /* A release its sender never pressed is explicit and ends every hold. */
     CHECK(send(&down, 1u, &first_owner) == 0 && send(&down, 1u, &script) == 0);
     CHECK(send(&up, 1u, &(ksi_synth_owner){ .connection_id = 44u }) == 0);
-    CHECK(read_events(generic[0]) == 4u && applied.holders[KEY_B] == 0u
+    CHECK(read_events(generic[0]) == 8u && applied.holders[KEY_B] == 0u
         && enqueued.holders[KEY_B] == 0u);
 
     /* A remap's [Shift up, a] releases a forwarded Shift it never pressed. */
@@ -1141,6 +1146,44 @@ static bool test_tap_of_held_key(void)
     return true;
 }
 
+/* A press still types while another holder keeps the key down, as a repeated
+ * Win32 key-down does, such as a hotstring typing a key the user has not let go
+ * of yet. An owner pressing a key it holds only keeps holding it, and modifier
+ * and lock keys stay down. */
+static bool test_new_holder_presses_again(void)
+{
+    uint64_t keyboard = ksi_linux_forward_open(PLAIN, true);
+    const ksi_synth_owner script = { .connection_id = 19u };
+    const ksi_synth_owner other = { .connection_id = 20u };
+    const ksi_input n = key_input(KEY_N, true);
+    const ksi_input n_up = key_input(KEY_N, false);
+    const ksi_input shift = key_input(KEY_LEFTSHIFT, true);
+    const ksi_input caps = key_input(KEY_CAPSLOCK, true);
+    const uint16_t repress[] = { KEY_N, KEY_N };
+    const int32_t up_down[] = { 0, 1 };
+
+    CHECK(forward_key(keyboard, KEY_N, 1) == 0 && read_events(generic[0]) == 2u);
+    CHECK(send(&n, 1u, &script) == 0 && sink_keys(2u, repress, up_down));
+    CHECK(send(&n, 1u, &script) == 0 && read_events(generic[0]) == 0u);
+    CHECK(send(&n_up, 1u, &script) == 0 && read_events(generic[0]) == 0u && sink_down(KEY_N));
+    CHECK(forward_key(keyboard, KEY_N, 0) == 0 && sink_keys(1u, (const uint16_t[]){ KEY_N }, (const int32_t[]){ 0 }));
+
+    CHECK(send(&n, 1u, &script) == 0 && sink_keys(1u, (const uint16_t[]){ KEY_N }, (const int32_t[]){ 1 }));
+    CHECK(forward_key(keyboard, KEY_N, 1) == 0 && sink_keys(2u, repress, up_down));
+    CHECK(send(&n, 1u, &other) == 0 && sink_keys(2u, repress, up_down));
+    CHECK(forward_key(keyboard, KEY_N, 0) == 0 && sink_keys(1u, (const uint16_t[]){ KEY_N }, (const int32_t[]){ 0 }));
+    CHECK(!logical(KEY_N));
+
+    CHECK(forward_key(keyboard, KEY_LEFTSHIFT, 1) == 0 && read_events(generic[0]) == 2u);
+    CHECK(send(&shift, 1u, &script) == 0 && read_events(generic[0]) == 0u);
+    CHECK(forward_key(keyboard, KEY_CAPSLOCK, 1) == 0 && read_events(generic[0]) == 2u);
+    CHECK(send(&caps, 1u, &script) == 0 && read_events(generic[0]) == 0u);
+
+    close_source(keyboard);
+    release_everything();
+    return true;
+}
+
 int main(void)
 {
     /* A broken sink is a pipe without a reader, as the daemon ignores. */
@@ -1170,6 +1213,7 @@ int main(void)
         || !test_buttons_across_devices()
         || !test_dead_owner_mouse()
         || !test_tap_of_held_key()
+        || !test_new_holder_presses_again()
         || !test_sink_failure()) return 1;
     /* keyd skips devices with its vendor identifier, so a clone of its
      * output must keep it; fake_create checks the vendor. */

@@ -940,11 +940,11 @@ static void handle_synthesize_input(
             return;
         }
 
-        /* Like Win32 SendInput, an ordinary sender waits only for admission to
-         * the input queue. The detached completion keeps the accepted batch
-         * atomic, but never holds this RPC open while hook callbacks run. */
+        /* As Win32 SendInput returns only after every low-level hook has seen
+         * the input, the completion replies once the whole batch has passed the
+         * hooks, so the sender's own hook state is current when it resumes. */
         ksi_synth_completion *completion = synth_completion_create(
-            state, NULL, NULL);
+            state, client->hook_send_ref, message->header);
 
         if (completion == NULL) {
             send_status(client->fd, message->header,
@@ -962,13 +962,10 @@ static void handle_synthesize_input(
                 client->connection_id)) {
             synth_completion_fail(completion,
                 KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
-            send_status(client->fd, message->header,
-                KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
             return;
         }
-
-        send_status(client->fd, message->header, KSI_STATUS_OK,
-            KSI_DETAIL_NONE);
+        /* Set before this thread can dequeue the batch. */
+        completion->admitted = true;
         return;
     } else {
         if (!output_queue_push_synth(&state->output_queue,
