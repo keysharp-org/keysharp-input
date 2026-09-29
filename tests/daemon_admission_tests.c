@@ -724,6 +724,44 @@ static bool test_quarantine_revokes_hook_output(void)
     return true;
 }
 
+static bool test_expired_hook_reply(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    ksi_client client = { .connection_role = KSI_ROLE_CALLBACK_STREAM,
+        .hook_send_ref = hook_send_ref_create(-1) };
+    ksi_client other = { .connection_role = KSI_ROLE_CALLBACK_STREAM,
+        .hook_send_ref = hook_send_ref_create(-1) };
+    uint8_t payload[KSI_HOOK_DECISION_PREFIX_SIZE + KSI_INPUT_WIRE_SIZE] = { 0 };
+    ksi_message_header header = { .request_id = 42u };
+    ksi_binary_message_view message = { .header = &header,
+        .payload = payload, .payload_size = sizeof(payload) };
+
+    CHECK(state != NULL && client.hook_send_ref != NULL && other.hook_send_ref != NULL);
+    ksi_wire_write_u32(payload + KSI_STATUS_PAYLOAD_SIZE, KSI_HOOK_MODIFY);
+    ksi_wire_write_u32(payload + KSI_STATUS_PAYLOAD_SIZE + 4u, 1u);
+    ksi_wire_write_u32(payload + KSI_HOOK_DECISION_PREFIX_SIZE, KSI_INPUT_KEYBOARD);
+    ksi_wire_write_u16(payload + KSI_HOOK_DECISION_PREFIX_SIZE + 10u, KEY_A);
+    ksi_wire_write_u32(payload + KSI_HOOK_DECISION_PREFIX_SIZE + 12u, KSI_KEY_SCANCODE);
+
+    hook_send_ref_expire_event(client.hook_send_ref, 0u, 42u);
+    CHECK(!handle_hook_decision(state, &other, &message));
+    header.request_id = 43u;
+    CHECK(!handle_hook_decision(state, &client, &message));
+    header.request_id = 42u;
+    /* No lane or output queue exists: the expired Modify must be discarded. */
+    CHECK(handle_hook_decision(state, &client, &message));
+    CHECK(!handle_hook_decision(state, &client, &message));
+
+    hook_send_ref_expire_event(client.hook_send_ref, 1u, 44u);
+    header.request_id = 44u;
+    message.payload_size--;
+    CHECK(!handle_hook_decision(state, &client, &message));
+    hook_send_ref_release(client.hook_send_ref);
+    hook_send_ref_release(other.hook_send_ref);
+    free(state);
+    return true;
+}
+
 /* A disconnect ends exactly the client's own holds, and output the client had
  * sent still plays but holds nothing; the last disconnect ends every
  * synthetic hold. */
@@ -1336,6 +1374,7 @@ int main(void)
         || !test_output_admission_rules()
         || !test_lane_order_reserve()
         || !test_quarantine_revokes_hook_output()
+        || !test_expired_hook_reply()
         || !test_raw_fragments_and_seat_gate()
         || !test_panic_fails_open()
         || !test_hook_class_end_releases_holds()

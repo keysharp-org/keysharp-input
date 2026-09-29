@@ -16,6 +16,8 @@ void hook_send_ref_invalidate(ksi_hook_send_ref *ref);
 bool hook_send_ref_is_stalled(const ksi_hook_send_ref *ref, size_t lane_index);
 void hook_send_ref_mark_stalled(ksi_hook_send_ref *ref, size_t lane_index);
 void hook_send_ref_clear_stalled(ksi_hook_send_ref *ref, size_t lane_index);
+void hook_send_ref_expire_event(ksi_hook_send_ref *ref, size_t lane_index, uint64_t event_id);
+bool hook_send_ref_consume_expired_event(ksi_hook_send_ref *ref, uint64_t event_id);
 int hook_send_ref_send(
     ksi_hook_send_ref *ref,
     uint16_t opcode,

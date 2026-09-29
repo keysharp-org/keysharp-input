@@ -32,6 +32,7 @@ struct ksi_hook_send_ref {
     atomic_uint ref_count;
     atomic_bool valid;
     atomic_uint stalled_lanes;
+    atomic_uint_least64_t expired_events[2];
     pthread_mutex_t send_mutex;
     pthread_mutex_t turn_mutex;
     pthread_cond_t turn_condition;
@@ -43,6 +44,26 @@ struct ksi_hook_send_ref {
 
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static ksi_hook_send_ref *registry;
+
+void hook_send_ref_expire_event(ksi_hook_send_ref *ref, size_t lane_index, uint64_t event_id)
+{
+    if (ref != NULL && lane_index < 2u) {
+        atomic_store(&ref->expired_events[lane_index], event_id);
+    }
+}
+
+bool hook_send_ref_consume_expired_event(ksi_hook_send_ref *ref, uint64_t event_id)
+{
+    if (ref == NULL || event_id == 0u) return false;
+
+    for (size_t i = 0u; i < 2u; i++) {
+        uint64_t expected = event_id;
+        if (atomic_compare_exchange_strong(&ref->expired_events[i], &expected, 0u)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool monotonic_deadline_after_ms(struct timespec *deadline, int timeout_ms)
 {

@@ -656,6 +656,7 @@ static bool handle_hook_decision(
     ksi_hook_lane *lane;
     ksi_lane_decision decision;
     uint64_t required_operations = 0u;
+    bool expired = false;
 
     if (client->connection_role != KSI_ROLE_CALLBACK_STREAM
         || message->payload_size < KSI_STATUS_PAYLOAD_SIZE) {
@@ -666,7 +667,9 @@ static bool handle_hook_decision(
     if (lane == NULL
         || atomic_load(&lane->current_responder_connection_id)
             != client->connection_id) {
-        return false;
+        expired = hook_send_ref_consume_expired_event(client->hook_send_ref,
+            message->header->request_id);
+        if (!expired) return false;
     }
     memset(&decision, 0, offsetof(ksi_lane_decision, inputs));
     decision.event_id = message->header->request_id;
@@ -687,7 +690,7 @@ static bool handle_hook_decision(
             }
         }
         decision.decision = KSI_HOOK_PASS;
-        return lane_decision_queue_push(&lane->decision_queue, &decision);
+        return expired || lane_decision_queue_push(&lane->decision_queue, &decision);
     }
     if (!ksi_protocol_decode_hook_decision_prefix(message->payload,
             message->payload_size, &decision_value, &input_count)
@@ -703,9 +706,9 @@ static bool handle_hook_decision(
         || (decision_value == KSI_HOOK_MODIFY && input_count == 0u)) {
         goto invalid_decision;
     }
-    if (!input_owner_matches_uid(state, client->uid)
+    if (!expired && (!input_owner_matches_uid(state, client->uid)
         || (decision_value != KSI_HOOK_PASS
-            && !client_has_scope(client, KSP_SCOPE_INPUT_CONTROL))) {
+            && !client_has_scope(client, KSP_SCOPE_INPUT_CONTROL)))) {
         decision.decision = KSI_HOOK_PASS;
         (void)lane_decision_queue_push(&lane->decision_queue, &decision);
         return false;
@@ -724,6 +727,8 @@ static bool handle_hook_decision(
             : KSI_OPERATION_SYNTHESIZE_MOUSE;
         required_operations |= input_needs_absolute_pointer(&decision.inputs[i]);
     }
+    if (expired) return true;
+
     if ((required_operations & state->ready_operations) != required_operations
         || !lane_decision_queue_push(&lane->decision_queue, &decision)) {
         decision.decision = KSI_HOOK_PASS;
@@ -743,7 +748,7 @@ static bool handle_hook_decision(
 invalid_decision:
     decision.decision = KSI_HOOK_PASS;
     decision.input_count = 0u;
-    (void)lane_decision_queue_push(&lane->decision_queue, &decision);
+    if (!expired) (void)lane_decision_queue_push(&lane->decision_queue, &decision);
     return false;
 }
 

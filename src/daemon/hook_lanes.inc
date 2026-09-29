@@ -1717,6 +1717,10 @@ static ksi_subscriber_result lane_call_subscriber(
         return KSI_SUBSCRIBER_DECIDED;
     }
 
+    /* A client must finish its outstanding reply before reading quarantine.
+     * Retire that reply before clearing the responder, so it can be discarded. */
+    hook_send_ref_expire_event(send_ref,
+        hook_type_to_lane_index(event->hook_type), event->event_id);
     lane_clear_responder(lane);
 
     if (lane_event_cancelled(lane, event)) {

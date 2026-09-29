@@ -259,6 +259,10 @@ connection sent before it closed still play whole, and what they hold is
 released after them. When the last client disconnects, every generic hold ends,
 while keys still physically held stay down until they are released.
 
+Finish each callback with `ksi_hook_reply_event`, even if it exceeded its deadline.
+The service discards the late decision, and the client can then read the quarantine
+notification and rearm the affected hook after its retry interval.
+
 A sender's release of a key it holds ends only its own hold. A release from a
 sender that does not hold the key ends every generic hold of it and releases it
 for the sources still holding it, as a Win32 key-up does; a later synthetic

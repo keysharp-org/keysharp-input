@@ -85,6 +85,8 @@ unauthorized, stale, and timed-out decisions become Pass. Repeated timeouts
 quarantine only the affected hook type and emit a typed notification. The fifth
 consecutive timeout disconnects that callback stream. Replacement and
 synthesis batches are bounded and admitted atomically.
+A well-formed late reply to a client's expired callback is discarded without
+disconnecting it or lifting its quarantine; it cannot produce replacement input.
 
 Passive observer streams require Input Monitoring but acquire no grabs and accept
 no hook decisions. Each stream has a fixed queue; event delivery never waits for
