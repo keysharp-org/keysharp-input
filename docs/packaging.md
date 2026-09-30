@@ -63,12 +63,12 @@ it; package-manager dependency tracking decides when the broker is unused.
 
 ## Launchpad PPA
 
-Each release is also uploaded to `ppa:descolada/keysharp-input` for the Ubuntu
-series listed in `PPA_SERIES` in the release workflow. `packaging/debian/` is the
-single package definition: CPack takes its maintainer scripts, and Launchpad builds
-the same package from a source upload that `packaging/ppa/build-source.sh` makes of
-the tagged tree and its submodule. Both builds read the client ABI capability from
-the public header.
+Each release is also uploaded to `ppa:descolada/keysharp`, which carries Keysharp
+and keysharp-desktop as well, for the Ubuntu series listed in `PPA_SERIES` in the
+release workflow. `packaging/debian/` is the single package definition: CPack takes
+its maintainer scripts, and Launchpad builds the same package from a source upload
+that `packaging/ppa/build-source.sh` makes of the tagged tree and its submodule.
+Both builds read the client ABI capability from the public header.
 
 Launchpad accepts each version once, so the workflow first builds every series and
 architecture from that upload with `packaging/ppa/rehearse.sh`: in a clean container

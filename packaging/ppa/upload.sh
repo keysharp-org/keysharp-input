@@ -18,6 +18,8 @@ trap 'gpgconf --kill all >/dev/null 2>&1 || true; rm -rf -- "${GNUPGHOME}"' EXIT
 printf '%s\n' "${PPA_GPG_PRIVATE_KEY}" | gpg --batch --quiet --import
 fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
 [[ -n "${fingerprint}" ]] || { echo "PPA_GPG_PRIVATE_KEY holds no secret key." >&2; exit 1; }
+# dput checks the signatures it uploads, and reports an unknown-trust key as an error.
+printf '%s:6:\n' "${fingerprint}" | gpg --batch --quiet --import-ownertrust
 printf '%s' "${PPA_GPG_PASSPHRASE:-}" > "${GNUPGHOME}/passphrase"
 cat > "${GNUPGHOME}/sign" <<EOF
 #!/bin/sh

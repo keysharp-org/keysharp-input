@@ -19,8 +19,9 @@ permissions:
   contents: read
 
 env:
+  # One PPA carries this package, Keysharp and the other component, so a single repository installs them.
   # Launchpad builds each series from its own source upload. Adding one here adds its build and rehearsal.
-  PPA: descolada/keysharp-input
+  PPA: descolada/keysharp
   PPA_SERIES: noble resolute
 
 concurrency:

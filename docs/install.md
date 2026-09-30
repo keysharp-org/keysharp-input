@@ -11,11 +11,11 @@ On Debian or Ubuntu:
 sudo apt install ./keysharp-input_<version>_<arch>.deb
 ```
 
-On Ubuntu 24.04 or 26.04, the Launchpad PPA supplies the same package and keeps it
-updated:
+On Ubuntu 24.04 or 26.04, Keysharp's Launchpad PPA supplies the same package and
+keeps it updated:
 
 ```sh
-sudo add-apt-repository ppa:descolada/keysharp-input
+sudo add-apt-repository ppa:descolada/keysharp
 sudo apt install keysharp-input
 ```
 
