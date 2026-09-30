@@ -2,7 +2,7 @@
 .gitattributes text eol=lf
 
 *.sh text eol=lf
-packaging/debian/* text eol=lf
+packaging/debian/** text eol=lf
 *.service text eol=lf
 *.service.in text eol=lf
 *.socket text eol=lf

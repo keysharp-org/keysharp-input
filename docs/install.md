@@ -11,6 +11,14 @@ On Debian or Ubuntu:
 sudo apt install ./keysharp-input_<version>_<arch>.deb
 ```
 
+On Ubuntu 24.04 or 26.04, the Launchpad PPA supplies the same package and keeps it
+updated:
+
+```sh
+sudo add-apt-repository ppa:descolada/keysharp-input
+sudo apt install keysharp-input
+```
+
 On another systemd distribution:
 
 ```sh
@@ -58,7 +66,7 @@ failures. Holding **Backspace+Escape+Enter** releases grabs, hooks and input blo
 ## Upgrade and remove
 
 Install a newer release using the same command and channel. Downloaded `.deb` files
-do not configure an update repository. Check releases for updates, including
+do not configure an update repository; the PPA does. Check releases for updates, including
 security fixes; ABI compatibility alone does not mean a release is current.
 
 Remove a package through its package manager. Remove the default source/archive

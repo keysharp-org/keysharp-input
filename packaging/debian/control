@@ -1,0 +1,27 @@
+Source: keysharp-input
+Section: utils
+Priority: optional
+Maintainer: Descolada <16986957+Descolada@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               pkgconf | pkg-config,
+               libudev-dev,
+               libevdev-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/keysharp-org/keysharp-input
+Rules-Requires-Root: no
+
+Package: keysharp-input
+Architecture: amd64 arm64
+Depends: ${misc:Depends},
+         ${shlibs:Depends},
+         polkitd,
+         udev,
+         kmod,
+         systemd
+Provides: ${client-abi:Provides}
+Description: Privileged Linux input broker
+ A Linux service and C library for global keyboard and mouse hooks, input
+ synthesis, blocking and physical input-state queries. The same API works
+ on X11 and Wayland. Applications use libkeysharp-input.so.0; the root
+ service owns evdev and uinput access.

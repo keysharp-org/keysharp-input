@@ -111,8 +111,8 @@ client that stops answering cannot lock the user out. Keep that path working.
 - The hook read/reply path uses fixed buffers and allocates nothing per event.
 - Comments explain why, in one to three lines. Do not restate the code, describe what it
   replaced, or capitalise words for emphasis.
-- Shell lifecycle scripts are POSIX `sh`, and CI shellchecks
-  `install.sh uninstall.sh packaging/install-release.sh packaging/debian/*`.
+- Shell lifecycle scripts are POSIX `sh`, and CI shellchecks them together with the Debian
+  maintainer scripts in `packaging/debian/` and the Launchpad tooling in `packaging/ppa/`.
 - Public API changes need `include/keysharp_input/client.h`, `docs/integrating.md`, and
   the complete C programs in `examples/` updated together.
 

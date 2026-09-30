@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+# The client ABI, not the product version, is the package's contract, and the public header states it.
+ABI_MINOR := $(shell sed -n 's/^\#define KSI_CLIENT_ABI_MINOR \([0-9]*\)u*$$/\1/p' include/keysharp_input/client.h)
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
+
+# The maintainer scripts set up the units and the permission store, exactly as in the CPack package.
+override_dh_installsystemd override_dh_installtmpfiles:
+
+override_dh_gencontrol:
+	dh_gencontrol -- -Vclient-abi:Provides="keysharp-input-client-abi-0 (= 0.$(ABI_MINOR))"

@@ -9,9 +9,19 @@ on:
         description: Existing v-prefixed release tag
         required: true
         type: string
+      ppa_revision:
+        description: PPA upload revision; raise it to upload a version Launchpad already has again
+        required: false
+        type: string
+        default: "1"
 
 permissions:
   contents: read
+
+env:
+  # Launchpad builds each series from its own source upload. Adding one here adds its build and rehearsal.
+  PPA: descolada/keysharp-input
+  PPA_SERIES: noble resolute
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
@@ -24,6 +34,7 @@ jobs:
       source_sha: ${{ steps.release.outputs.source_sha }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
+      ppa_series: ${{ steps.release.outputs.ppa_series }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -66,6 +77,7 @@ jobs:
           echo "source_sha=$tag_sha" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ppa_series=$(jq -cn --arg series "$PPA_SERIES" '$series | split(" ")')" >> "$GITHUB_OUTPUT"
 
   nix:
     needs: prepare
@@ -255,3 +267,89 @@ jobs:
           else
             gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
           fi
+
+  ppa-source:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Debian source tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends debhelper
+
+      - name: Build source uploads
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SERIES: ${{ env.PPA_SERIES }}
+          PPA_REVISION: ${{ inputs.ppa_revision || '1' }}
+        run: bash packaging/ppa/build-source.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ppa-source
+          path: dist/ppa/*
+          if-no-files-found: error
+
+  # Launchpad accepts a version once, so every series and architecture is built here first, offline
+  # and unprivileged, the way its builders do.
+  ppa-rehearse:
+    needs:
+      - prepare
+      - ppa-source
+    name: Rehearse PPA build (${{ matrix.series }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        series: ${{ fromJSON(needs.prepare.outputs.ppa_series) }}
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ppa-source
+          path: dist/ppa
+
+      - name: Build as Launchpad would
+        env:
+          SERIES: ${{ matrix.series }}
+        run: bash packaging/ppa/rehearse.sh dist/ppa/keysharp-input_*~"$SERIES"*.dsc "$SERIES" dist/rehearsal
+
+  # Independent of the GitHub publish job, which refuses a rerun once the release exists, so a rerun
+  # still uploads just the series Launchpad does not have.
+  publish-ppa:
+    needs:
+      - prepare
+      - ppa-rehearse
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ppa-source
+          path: dist/ppa
+
+      - name: Install upload tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends devscripts dput
+
+      - name: Sign and upload
+        env:
+          PPA_GPG_PRIVATE_KEY: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
+          PPA_GPG_PASSPHRASE: ${{ secrets.PPA_GPG_PASSPHRASE }}
+        run: bash packaging/ppa/upload.sh "$PPA" dist/ppa/*_source.changes
