@@ -7,6 +7,7 @@ int main(void)
     ksi_service_info info;
     ksi_error error;
     ksi_connection *connection = NULL;
+    ksi_connection *lease = NULL;
     ksi_permission_scopes granted = 0u;
     ksi_operations active = 0u;
     const ksi_permission_scopes wanted =
@@ -15,19 +16,27 @@ int main(void)
     ksi_connect_options_init(&options);
     ksi_service_info_init(&info);
     ksi_error_init(&error);
-    options.role = KSI_ROLE_CALLBACK_STREAM;
-    options.requested_scopes = wanted;
+    options.role = KSI_ROLE_AUTHORIZATION_LEASE;
+    options.requested_scopes = 0u;
 
-    if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK) {
+    if (ksi_connect(&options, &lease, &info, &error) != KSI_STATUS_OK) {
         fprintf(stderr, "connect: %s\n", error.message);
         return 1;
     }
-    if (ksi_authorize(connection, KSI_AUTH_REQUEST, wanted, &granted, &error)
-            != KSI_STATUS_OK
+    if (ksi_authorize(lease, KSI_AUTH_REQUEST, wanted, &granted, &error)
+            != KSI_STATUS_OK) {
+        fprintf(stderr, "authorize: %s\n", error.message);
+        ksi_disconnect(lease);
+        return 1;
+    }
+    options.role = KSI_ROLE_CALLBACK_STREAM;
+    options.lease_id = info.lease_id;
+    if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
         || ksi_hook_subscribe(connection, KSI_HOOK_KEYBOARD, &active, &error)
             != KSI_STATUS_OK) {
         fprintf(stderr, "subscribe: %s\n", error.message);
         ksi_disconnect(connection);
+        ksi_disconnect(lease);
         return 1;
     }
 
@@ -55,5 +64,6 @@ int main(void)
             break;
     }
     ksi_disconnect(connection);
+    ksi_disconnect(lease);
     return 0;
 }

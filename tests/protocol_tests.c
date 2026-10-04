@@ -37,7 +37,7 @@ int main(void)
 
     ksi_frame_header_encode(raw, &header);
     CHECK(memcmp(raw, "KSIP", 4u) == 0);
-    CHECK(raw[4] == 2u && raw[5] == 0u && raw[6] == 0u && raw[7] == 0u);
+    CHECK(raw[4] == KSI_PROTOCOL_MAJOR && raw[5] == 0u && raw[6] == 0u && raw[7] == 0u);
     CHECK(raw[16] == 0x08u && raw[23] == 0x01u);
     CHECK(ksi_frame_header_decode(raw, &decoded));
     CHECK(decoded.major == header.major);

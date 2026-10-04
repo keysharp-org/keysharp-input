@@ -18,8 +18,8 @@ static void process_permission_done(ksi_daemon_state *state, ksi_permission_task
             for (nfds_t j = 0u; j < state->client_count; j++) {
                 ksi_client *client = &state->clients[j];
                 if (!client->has_identity || client->uid != snapshot->uid
-                    || strcmp(client->exe_hash, snapshot->hash) != 0) continue;
-                revoked |= client->granted_scopes & ~snapshot->allowed;
+                    || strcmp(client->identity.hash, snapshot->hash) != 0) continue;
+                revoked |= client->authorization_lease->granted_scopes & ~snapshot->allowed;
                 client->permission_store_generation = snapshot->generation;
                 client->permission_store_generation_valid = true;
             }
@@ -63,7 +63,7 @@ static void process_permission_done(ksi_daemon_state *state, ksi_permission_task
     if (missing != 0u && client->pending_authorization_mode == KSI_AUTH_REQUEST) {
         if (start_prompt_task(state, client->hook_send_ref, state->commands, state->permissions,
                 client->fd, client->connection_id, task->requested, missing,
-                client->exe_path, client->exe_hash, client->pid, client->uid, client->start_time)) {
+                &client->identity)) {
             client->state = KSI_CLIENT_STATE_AWAITING_PROMPT;
             return;
         }
@@ -74,6 +74,6 @@ static void process_permission_done(ksi_daemon_state *state, ksi_permission_task
     if (granted != 0u && (client->connection_role != KSI_ROLE_OBSERVER_STREAM
             || (granted & KSP_SCOPE_INPUT_CONTROL) != 0u)) prepare_requested_scopes(state, granted);
     client->pending_authorization = false;
-    finish_client_authorization(client, client->pending_authorization_opcode,
+    finish_client_authorization(state, client, client->pending_authorization_opcode,
         client->pending_request_id, task->requested, granted);
 }

@@ -32,6 +32,10 @@ static void send_hello_status(
         detail,
         granted_scopes,
         client->advertised_operations);
+    if (status == KSI_STATUS_OK) {
+        ksi_wire_write_u64(payload + 24u, client->authorization_lease == NULL ? 0u : client->authorization_lease->id);
+        payload_size = KSI_HELLO_RESULT_PAYLOAD_SIZE;
+    }
     (void)ipc_send_locked(
         client->fd,
         KSI_OPCODE_HELLO,
@@ -87,6 +91,7 @@ static void send_pending_authorization_status(
 }
 
 static void finish_client_authorization(
+    ksi_daemon_state *state,
     ksi_client *client,
     uint16_t opcode,
     uint64_t request_id,
@@ -95,16 +100,32 @@ static void finish_client_authorization(
 {
     bool complete = requested == 0u || (granted & requested) == requested;
 
-    client->granted_scopes |= granted;
-
-    if (complete) {
-        send_authorization_status(client, opcode, request_id, KSI_STATUS_OK,
-            KSI_DETAIL_NONE, client->granted_scopes);
-        return;
+    if (client->authorization_lease != NULL) {
+        client->authorization_lease->granted_scopes |= granted;
+        (void)snprintf(client->authorization_lease->hash, sizeof(client->authorization_lease->hash), "%s", client->identity.hash);
     }
 
-    send_authorization_status(client, opcode, request_id, KSI_STATUS_DENIED,
-        KSI_DETAIL_NONE, 0u);
+    if (opcode != KSI_OPCODE_AUTHORIZE)
+        send_authorization_status(client, opcode, request_id,
+            complete ? KSI_STATUS_OK : KSI_STATUS_DENIED, KSI_DETAIL_NONE,
+            complete ? client_grants(client) : 0u);
+    if (client->connection_role == KSI_ROLE_AUTHORIZATION_LEASE) {
+        uint8_t notification[KSI_SESSION_REVOKED_PAYLOAD_SIZE] = { 0 };
+        ksi_wire_write_u32(notification, client_grants(client));
+        if (hook_send_ref_try_send(client->hook_send_ref, KSI_OPCODE_SESSION_GRANTED, KSI_FRAME_FLAG_EVENT,
+                0u, notification, sizeof(notification)) != 1)
+            hook_send_ref_invalidate(client->hook_send_ref);
+    }
+    if (opcode == KSI_OPCODE_AUTHORIZE) {
+        if (client->keyboard_state_subscribed) {
+            publish_keyboard_states(state);
+            send_keyboard_state(client, &state->keyboard_snapshot, true, state->keyboard_sequence);
+        }
+        /* The reply is a barrier for the grant and keyboard visibility snapshot. */
+        send_authorization_status(client, opcode, request_id,
+            complete ? KSI_STATUS_OK : KSI_STATUS_DENIED, KSI_DETAIL_NONE,
+            complete ? client_grants(client) : 0u);
+    }
 }
 
 /* A revoke is rare control-plane work. Clear cached privileges and active grab
@@ -134,23 +155,24 @@ static void invalidate_connected_permissions(
         ksi_client *client = &state->clients[i];
         uint32_t old_grants;
 
-        if (!client->has_identity || client->uid != uid
+        if (client->authorization_lease == NULL || client->uid != uid
             || (!all_executables
-                && strcmp(client->exe_hash, exe_hash) != 0)) {
+                && strcmp(client->authorization_lease->hash, exe_hash) != 0)) {
             continue;
         }
 
         uint8_t notification[KSI_SESSION_REVOKED_PAYLOAD_SIZE];
 
-        old_grants = client->granted_scopes;
+        old_grants = client_grants(client);
         ksi_wire_write_u32(notification, scopes & old_grants);
         ksi_wire_write_u32(notification + 4u, 0u);
-        if ((scopes & old_grants) != 0u) {
-            (void)ipc_send_locked(client->fd, KSI_OPCODE_SESSION_REVOKED,
-                KSI_FRAME_FLAG_EVENT, 0u, notification,
-                sizeof(notification));
+        if ((scopes & old_grants) != 0u && client->connection_role == KSI_ROLE_AUTHORIZATION_LEASE) {
+            if (hook_send_ref_try_send(client->hook_send_ref, KSI_OPCODE_SESSION_REVOKED,
+                    KSI_FRAME_FLAG_EVENT, 0u, notification, sizeof(notification)) != 1)
+                hook_send_ref_invalidate(client->hook_send_ref);
         }
-        client->granted_scopes &= ~scopes;
+        if (client->connection_role == KSI_ROLE_AUTHORIZATION_LEASE)
+            client->authorization_lease->granted_scopes &= ~scopes;
 
         if ((scopes & KSP_SCOPE_INPUT_MONITORING) != 0u) {
             client->observer_subscriptions = 0u;
@@ -201,9 +223,6 @@ static void invalidate_connected_permissions(
             grabs_changed = true;
         }
 
-        if (client->hook_subscriptions == 0u && client->block_input_mask == 0u) {
-            client->lease_expires_ms = 0u;
-        }
 
         /* A hook reader otherwise has no deterministic way to distinguish a
          * live but unsubscribed stream from a revoked one. Invalidating its
@@ -254,17 +273,17 @@ static bool refresh_external_permissions(ksi_daemon_state *state)
     if (task == NULL) return false;
     for (nfds_t i = 0u; i < state->client_count; i++) {
         ksi_client *client = &state->clients[i];
+        client->permission_refresh_pending = client->authorization_lease != NULL;
         if (!client->has_identity) continue;
         bool duplicate = false;
         for (size_t prior = 0u; prior < task->snapshot_count; prior++)
             duplicate |= task->snapshots[prior].uid == client->uid
-                && strcmp(task->snapshots[prior].hash, client->exe_hash) == 0;
+                && strcmp(task->snapshots[prior].hash, client->identity.hash) == 0;
         if (!duplicate) {
             ksi_permission_snapshot *snapshot = &task->snapshots[task->snapshot_count++];
             snapshot->uid = client->uid;
-            (void)snprintf(snapshot->hash, sizeof(snapshot->hash), "%s", client->exe_hash);
+            (void)snprintf(snapshot->hash, sizeof(snapshot->hash), "%s", client->identity.hash);
         }
-        client->permission_refresh_pending = true;
     }
     if (!submit_permission_task(task, NULL)) return false;
     state->permission_refresh_inflight = true;
@@ -317,20 +336,20 @@ static void permission_monitor_fail_open(ksi_daemon_state *state)
         client->permission_store_generation_valid = false;
 
         if (!client->has_identity) {
-            client->granted_scopes &= ~KSI_INPUT_PERMISSION_SCOPES;
+            if (client->authorization_lease != NULL) client->authorization_lease->granted_scopes &= ~KSI_INPUT_PERMISSION_SCOPES;
             continue;
         }
         for (nfds_t prior = 0u; prior < index; prior++) {
             ksi_client *other = &state->clients[prior];
             if (other->has_identity && other->uid == client->uid
-                && strcmp(other->exe_hash, client->exe_hash) == 0) {
+                && strcmp(other->identity.hash, client->identity.hash) == 0) {
                 already_invalidated = true;
                 break;
             }
         }
         if (!already_invalidated) {
             invalidate_connected_permissions(
-                state, client->uid, client->exe_hash, false,
+                state, client->uid, client->identity.hash, false,
                 KSI_INPUT_PERMISSION_SCOPES);
         }
     }
@@ -477,7 +496,7 @@ static void process_client_prompt_done(ksi_daemon_state *state, ksi_daemon_comma
         prepare_requested_scopes(state, client->pending_requested_scopes);
     client->permission_store_generation = command->data.prompt_done.store_generation;
     client->permission_store_generation_valid = true;
-    finish_client_authorization(client, client->pending_authorization_opcode,
+    finish_client_authorization(state, client, client->pending_authorization_opcode,
         client->pending_request_id, client->pending_requested_scopes,
         command->data.prompt_done.allowed_scopes & client->pending_requested_scopes);
 }
@@ -518,8 +537,8 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
 
     /* A changed start time means the pid was recycled while identity was read. */
     if (result != NULL && result->has_identity
-        && (result->start_time == 0u || client->start_time == 0u
-            || result->start_time != client->start_time)) {
+        && (result->identity.start_time == 0u || client->start_time == 0u
+            || result->identity.start_time != client->start_time)) {
         fprintf(stderr,
             "keysharp-input: rejecting identity for client pid=%ld: process start time changed "
             "between accept and identify (pid recycled)\n", (long)client->pid);
@@ -529,14 +548,10 @@ static void process_client_identified(ksi_daemon_state *state, ksi_daemon_comman
     if (result != NULL && result->has_identity) {
         client->has_identity = true;
         client->identity = result->identity;
-        client->identity_checked_ms = monotonic_ms();
-        client->start_time = result->start_time;
-        (void)snprintf(client->exe_path, sizeof(client->exe_path), "%s", result->exe_path);
-        (void)snprintf(client->exe_hash, sizeof(client->exe_hash), "%s", result->exe_hash);
 
         if (g_verbose) {
             printf("identified client fd=%d hash=%s path=%s\n",
-                client->fd, client->exe_hash, client->exe_path);
+                client->fd, client->identity.hash, client->identity.executable);
         }
     } else {
         client->has_identity = false;
@@ -586,7 +601,7 @@ static bool client_has_scope(const ksi_client *client, uint32_t scope)
 {
     if (!client->hello_complete || client->permission_refresh_pending)
         return false;
-    return (client->granted_scopes & scope) == scope;
+    return (client_grants(client) & scope) == scope;
 }
 
 static uint32_t hook_type_to_operation(uint32_t hook_type)
@@ -798,60 +813,11 @@ static void clear_hook_state(ksi_daemon_state *state)
         state->clients[i].block_input_mask = 0;
         state->clients[i].consecutive_hook_failures[0] = 0;
         state->clients[i].consecutive_hook_failures[1] = 0;
-        state->clients[i].lease_expires_ms = 0u;
-    }
-}
-
-static void renew_client_lease(ksi_client *client)
-{
-    if (client == NULL) {
-        return;
-    }
-
-    if (client->hook_subscriptions != 0u || client->block_input_mask != 0u) {
-        client->lease_expires_ms = monotonic_ms() + KSI_GRAB_LEASE_TIMEOUT_MS;
-    } else {
-        client->lease_expires_ms = 0u;
-    }
-}
-
-static void expire_client_leases(ksi_daemon_state *state)
-{
-    uint64_t now;
-
-    if (state == NULL) {
-        return;
-    }
-
-    now = monotonic_ms();
-
-    for (nfds_t i = state->client_count; i > 0; i--) {
-        nfds_t index = i - 1u;
-        ksi_client *client = &state->clients[index];
-        if (client->lease_expires_ms == 0u || now < client->lease_expires_ms) {
-            continue;
-        }
-
-        /* A switched-away user's stored hook state is deliberately dormant,
-         * not abandoned. Pause its lease while logind says another uid owns
-         * seat0; refresh it when that uid becomes active again. */
-        if (!input_owner_matches_uid(state, client->uid)) {
-            continue;
-        }
-
-        fprintf(stderr,
-            "keysharp-input: client fd=%d grab lease expired; failing open and disconnecting\n",
-            client->fd);
-
-        remove_client(state, index);
     }
 }
 
 /* Drops connections that never completed HELLO within the handshake
- * window. A peer that connects and sends nothing otherwise keeps its slot forever
- * (leases arm only for hook/block clients), so N such peers could exhaust the
- * client table and deny the broker to everyone. Authenticated idle clients (e.g. a
- * query connection that sent a zero-scope hello) completed HELLO and are kept. */
+ * window. Silent peers must not exhaust the client table. */
 static void expire_unauthenticated_clients(ksi_daemon_state *state)
 {
     uint64_t now;
@@ -878,19 +844,6 @@ static void expire_unauthenticated_clients(ksi_daemon_state *state)
             remove_client(state, index);
             continue;
         }
-        if (client->revalidation_pending && now - client->identity_checked_ms >= 1000u) {
-            remove_client(state, index);
-            continue;
-        }
-        if (client->has_identity && !client->revalidation_pending
-            && (client->granted_scopes != 0u || client->pending_authorization)
-            && now - client->identity_checked_ms >= KSI_DAEMON_MAINTENANCE_MS) {
-            if (!start_revalidation_task(state, client)) {
-                remove_client(state, index);
-                continue;
-            }
-        }
-
         /* Capless-idle reaper: an authenticated connection holding no grants and
          * no hook/block subscriptions, idle past the timeout, is dropped so it
          * cannot pin a per-uid slot forever. Guarded on idle ready state so
@@ -899,9 +852,11 @@ static void expire_unauthenticated_clients(ksi_daemon_state *state)
         if (client->hello_complete
             && client->state == KSI_CLIENT_STATE_READY
             && !client->pending_authorization
-            && client->granted_scopes == 0u
+            && client_grants(client) == 0u
             && client->hook_subscriptions == 0u
             && client->block_input_mask == 0u
+            && !client->keyboard_state_subscribed
+            && client->connection_role != KSI_ROLE_AUTHORIZATION_LEASE
             && client->last_activity_ms != 0u
             && now >= client->last_activity_ms + KSI_CAPLESS_IDLE_TIMEOUT_MS) {
             fprintf(stderr,

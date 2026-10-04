@@ -83,6 +83,14 @@ static int delayed_permission_check(const ksp_store *store, uid_t uid,
     } \
 } while (0)
 
+static ksi_authorization_lease *test_lease(uint32_t scopes)
+{
+    ksi_authorization_lease *lease = calloc(1u, sizeof(*lease));
+    if (lease == NULL) abort();
+    *lease = (ksi_authorization_lease){ .active = true, .references = 1u, .granted_scopes = scopes };
+    return lease;
+}
+
 static bool dispatch_request(
     ksi_daemon_state *state,
     ksi_client *client,
@@ -196,7 +204,7 @@ static bool test_daemon_admission_and_operation_gates(void)
     CHECK(dispatch_request(&state, &client, KSI_OPCODE_AUTHORIZE, 2u,
         authorize, sizeof(authorize)));
     CHECK(read_status_response(sockets[1], KSI_OPCODE_AUTHORIZE, 2u,
-        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_WRONG_ROLE, NULL));
     CHECK(!client.pending_authorization);
     CHECK(client.state == KSI_CLIENT_STATE_READY);
 
@@ -213,7 +221,7 @@ static bool test_daemon_admission_and_operation_gates(void)
     CHECK(read_status_response(sockets[1], KSI_OPCODE_SET_BLOCK_INPUT, 4u,
         KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
 
-    client.granted_scopes = KSI_SCOPE_INPUT_CONTROL;
+    client.authorization_lease = test_lease(KSI_SCOPE_INPUT_CONTROL);
     CHECK(dispatch_request(&state, &client, KSI_OPCODE_SET_BLOCK_INPUT, 5u,
         block, sizeof(block)));
     CHECK(read_status_response(sockets[1], KSI_OPCODE_SET_BLOCK_INPUT, 5u,
@@ -278,7 +286,7 @@ static bool test_daemon_admission_and_operation_gates(void)
 
     /* A key-state request selects a device only with a whole device id. */
     uint8_t device_key_state[KSI_KEY_STATE_REQUEST_SIZE + 1u] = { 0 };
-    client.granted_scopes |= KSI_SCOPE_INPUT_MONITORING;
+    client.authorization_lease->granted_scopes |= KSI_SCOPE_INPUT_MONITORING;
     CHECK(dispatch_request(&state, &client, KSI_OPCODE_GET_KEY_STATE, 12u,
         device_key_state, KSI_KEY_STATE_REQUEST_SIZE - 1u));
     CHECK(read_status_response(sockets[1], KSI_OPCODE_GET_KEY_STATE, 12u,
@@ -323,7 +331,7 @@ static bool test_observer_admission_and_backpressure(void)
     client->hello_complete = true;
     client->connection_role = KSI_ROLE_OBSERVER_STREAM;
     client->connection_id = 1u;
-    client->granted_scopes = KSI_SCOPE_INPUT_MONITORING;
+    client->authorization_lease = test_lease(KSI_SCOPE_INPUT_MONITORING);
     CHECK(client->hook_send_ref != NULL && client->rx_buffer != NULL);
     ksi_wire_write_u32(subscription, KSI_HOOK_KEYBOARD);
     CHECK(dispatch_request(state, client, KSI_OPCODE_SUBSCRIBE_HOOK, 1u,
@@ -363,7 +371,7 @@ static bool test_observer_admission_and_backpressure(void)
     process_client_prompt_done(state, &completed_prompt);
     CHECK(read_status_response(sockets[1], KSI_OPCODE_AUTHORIZE, 19u,
         KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
-    CHECK(client->granted_scopes == KSI_SCOPE_INPUT_MONITORING && !client->pending_authorization);
+    CHECK(client_grants(client) == KSI_SCOPE_INPUT_MONITORING && !client->pending_authorization);
     task.input_generation = 2u;
     hook_send_ref_invalidate(client->hook_send_ref);
     CHECK(prompt_cancelled(&task));
@@ -416,6 +424,8 @@ static bool test_permission_fence_preserves_key_release(void)
     return true;
 }
 
+static bool read_service_event(int fd, uint16_t opcode, uint8_t *payload, size_t size);
+
 static bool test_permission_io_does_not_block_input_admission(void)
 {
     ksi_daemon_state *state = calloc(1u, sizeof(*state));
@@ -441,16 +451,15 @@ static bool test_permission_io_does_not_block_input_admission(void)
         CHECK(client->hook_send_ref != NULL && client->rx_buffer != NULL);
     }
     ksi_client *requester = &state->clients[0];
-    requester->connection_role = KSI_ROLE_RPC;
+    requester->connection_role = KSI_ROLE_AUTHORIZATION_LEASE;
     requester->identity_attempted = requester->has_identity = true;
     CHECK(ksp_identity_capture(getpid(), getuid(), &requester->identity) == 0);
     requester->pid = requester->identity.pid;
     requester->start_time = requester->identity.start_time;
-    requester->identity_checked_ms = monotonic_ms();
-    (void)snprintf(requester->exe_hash, sizeof(requester->exe_hash), "%s", requester->identity.hash);
+    requester->authorization_lease = test_lease(0u);
     ksi_client *reader = &state->clients[1];
     reader->connection_role = KSI_ROLE_OBSERVER_STREAM;
-    reader->granted_scopes = KSI_SCOPE_INPUT_MONITORING;
+    reader->authorization_lease = test_lease(KSI_SCOPE_INPUT_MONITORING);
     reader->observer_subscriptions = KSI_OPERATION_HOOK_KEYBOARD;
     reader->observer_queue = calloc(KSI_OBSERVER_QUEUE_CAPACITY, sizeof(ksi_observer_frame));
     CHECK(reader->observer_queue != NULL);
@@ -480,7 +489,7 @@ static bool test_permission_io_does_not_block_input_admission(void)
     CHECK(dispatch_request(state, reader, KSI_OPCODE_PING, 9u, NULL, 0u));
     CHECK(read_status_response(observer[1], KSI_OPCODE_PING, 9u,
         KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
-    CHECK(requester->pending_authorization && requester->granted_scopes == 0u);
+    CHECK(requester->pending_authorization && client_grants(requester) == 0u);
 
     pthread_mutex_lock(&permission_barrier);
     release_permission_worker = true;
@@ -489,10 +498,26 @@ static bool test_permission_io_does_not_block_input_admission(void)
     struct pollfd completed = { .fd = ksi_pipe_ring_wake_fd(&commands.ring), .events = POLLIN };
     CHECK(poll(&completed, 1u, 1000) == 1);
     process_daemon_commands(state);
+    uint8_t grant[KSI_SESSION_REVOKED_PAYLOAD_SIZE];
+    CHECK(read_service_event(rpc[1], KSI_OPCODE_SESSION_GRANTED, grant, sizeof(grant)));
+    CHECK(ksi_wire_read_u32(grant) == KSI_SCOPE_INPUT_MONITORING);
     CHECK(read_status_response(rpc[1], KSI_OPCODE_AUTHORIZE, 8u,
         KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
     CHECK(!requester->pending_authorization && requester->permission_task == NULL);
-    CHECK(requester->granted_scopes == KSI_SCOPE_INPUT_MONITORING);
+    CHECK(client_grants(requester) == KSI_SCOPE_INPUT_MONITORING);
+    free(reader->authorization_lease);
+    reader->authorization_lease = requester->authorization_lease;
+    reader->authorization_lease->references++;
+    CHECK(refresh_external_permissions(state));
+    CHECK(requester->permission_refresh_pending && reader->permission_refresh_pending);
+    CHECK(!client_has_scope(reader, KSI_SCOPE_INPUT_MONITORING));
+    uint64_t refresh_deadline = monotonic_ms() + 1000u;
+    while (state->permission_refresh_inflight && monotonic_ms() < refresh_deadline) {
+        CHECK(poll(&completed, 1u, 1000) == 1);
+        process_daemon_commands(state);
+    }
+    CHECK(!requester->permission_refresh_pending && !reader->permission_refresh_pending);
+    CHECK(client_has_scope(reader, KSI_SCOPE_INPUT_MONITORING));
     ksi_worker_pool_request_stop(&g_permission_worker_pool);
     CHECK(ksi_worker_pool_join_before(&g_permission_worker_pool, monotonic_ms() + 1000u));
     ksi_worker_pool_destroy(&g_permission_worker_pool);
@@ -822,7 +847,7 @@ static bool test_unsubscribe_revokes_hook_output(void)
     ksi_client *client = &state->clients[0];
     *client = (ksi_client){ .fd = sockets[0], .connection_id = 6u, .uid = getuid(),
         .state = KSI_CLIENT_STATE_READY, .hello_complete = true,
-        .connection_role = KSI_ROLE_CALLBACK_STREAM, .granted_scopes = KSI_SCOPE_INPUT_MONITORING,
+        .connection_role = KSI_ROLE_CALLBACK_STREAM, .authorization_lease = test_lease(KSI_SCOPE_INPUT_MONITORING),
         .rx_buffer = calloc(1u, KSI_MAX_MESSAGE_SIZE), .hook_send_ref = hook_send_ref_create(sockets[0]) };
     CHECK(client->rx_buffer != NULL && client->hook_send_ref != NULL);
 
@@ -1317,7 +1342,7 @@ static bool test_hook_routed_send_replies_after_hooks(void)
 {
     ksi_daemon_state *state = calloc(1u, sizeof(*state));
     ksi_client sender = { .fd = -1, .state = KSI_CLIENT_STATE_READY, .uid = getuid(),
-        .connection_id = 9u, .granted_scopes = KSI_SCOPE_INPUT_CONTROL,
+        .connection_id = 9u, .authorization_lease = test_lease(KSI_SCOPE_INPUT_CONTROL),
         .connection_role = KSI_ROLE_RPC, .hello_complete = true };
     uint8_t *rx_buffer = calloc(1u, KSI_MAX_MESSAGE_SIZE);
     uint8_t synthesize[KSI_SYNTHESIZE_PREFIX_SIZE + KSI_INPUT_WIRE_SIZE] = { 0 };
@@ -1348,7 +1373,7 @@ static bool test_hook_routed_send_replies_after_hooks(void)
     CHECK(synthetic_hook_queue_pop(&state->synthetic_hook_queue, &item));
     synth_completion_fail(item.completion, KSI_STATUS_CANCELLED, KSI_DETAIL_NONE);
     CHECK(read_status_response(sockets[1], KSI_OPCODE_SYNTHESIZE_INPUT, 1u,
-        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+        KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
 
     synthetic_hook_queue_close(&state->synthetic_hook_queue);
     hook_send_ref_invalidate(sender.hook_send_ref);
@@ -1359,9 +1384,161 @@ static bool test_hook_routed_send_replies_after_hooks(void)
     return true;
 }
 
+static bool read_service_event(int fd, uint16_t opcode, uint8_t *payload, size_t size)
+{
+    uint8_t frame[KSI_FRAME_HEADER_SIZE + KSI_KEY_STATE_EVENT_PAYLOAD_SIZE];
+    size_t received;
+    struct pollfd wait = { .fd = fd, .events = POLLIN };
+    CHECK(poll(&wait, 1u, 1000) == 1);
+    CHECK(ksi_ipc_read_framed_message(fd, frame, sizeof(frame), &received) == 1);
+    ksi_message_header header;
+    CHECK(ksi_frame_header_decode(frame, &header));
+    CHECK(header.flags == KSI_FRAME_FLAG_EVENT && header.opcode == opcode && header.request_id == 0u);
+    CHECK(received == KSI_FRAME_HEADER_SIZE + size);
+    memcpy(payload, frame + KSI_FRAME_HEADER_SIZE, size);
+    return true;
+}
+
+static bool test_lease_state_and_synthesis_order(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    int sockets[4][2];
+    CHECK(state != NULL && output_queue_init(&state->output_queue, state) == 0);
+    CHECK(synthetic_hook_queue_init(&state->synthetic_hook_queue) == 0);
+    state->ready_operations = state->available_operations = KSI_OPERATION_SYNTHESIZE_KEYBOARD;
+    state->client_count = 4u;
+    for (unsigned int i = 0u; i < 4u; i++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets[i]) == 0);
+        state->clients[i] = (ksi_client){ .fd = sockets[i][0], .pid = getpid(), .uid = getuid(),
+            .start_time = 1u, .connection_id = 101u + i, .state = KSI_CLIENT_STATE_READY };
+        state->clients[i].rx_buffer = calloc(1u, KSI_MAX_MESSAGE_SIZE);
+        state->clients[i].hook_send_ref = hook_send_ref_create(sockets[i][0]);
+        CHECK(state->clients[i].rx_buffer != NULL && state->clients[i].hook_send_ref != NULL);
+    }
+    uint8_t hello[KSI_HELLO_PAYLOAD_SIZE] = { 0 }, result[KSI_HELLO_RESULT_PAYLOAD_SIZE];
+    uint8_t event[KSI_KEY_STATE_EVENT_PAYLOAD_SIZE];
+    ksi_client *owner = &state->clients[0], *observer = &state->clients[1], *rpc = &state->clients[2];
+    ksi_wire_write_u16(hello, KSI_ROLE_AUTHORIZATION_LEASE);
+    CHECK(dispatch_request(state, owner, KSI_OPCODE_HELLO, 1u, hello, sizeof(hello)));
+    CHECK(read_status_response(sockets[0][1], KSI_OPCODE_HELLO, 1u, sizeof(result), KSI_STATUS_OK, 0u, result));
+    CHECK(ksi_wire_read_u64(result + 24u) == owner->connection_id);
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_SESSION_GRANTED, event, 8u));
+    owner->authorization_lease->granted_scopes = KSI_SCOPE_INPUT_MONITORING | KSI_SCOPE_INPUT_CONTROL;
+    (void)snprintf(owner->authorization_lease->hash, sizeof(owner->authorization_lease->hash), "fixture");
+    ksi_wire_write_u16(hello, KSI_ROLE_OBSERVER_STREAM);
+    ksi_wire_write_u64(hello + 8u, owner->connection_id);
+    CHECK(dispatch_request(state, observer, KSI_OPCODE_HELLO, 2u, hello, sizeof(hello)));
+    CHECK(read_status_response(sockets[1][1], KSI_OPCODE_HELLO, 2u, sizeof(result), KSI_STATUS_OK, 0u, result));
+    CHECK(observer->authorization_lease == owner->authorization_lease);
+    ksi_wire_write_u16(hello, KSI_ROLE_RPC);
+    CHECK(dispatch_request(state, rpc, KSI_OPCODE_HELLO, 3u, hello, sizeof(hello)));
+    CHECK(read_status_response(sockets[2][1], KSI_OPCODE_HELLO, 3u, sizeof(result), KSI_STATUS_OK, 0u, result));
+    state->clients[3].pid++;
+    CHECK(dispatch_request(state, &state->clients[3], KSI_OPCODE_HELLO, 4u, hello, sizeof(hello)));
+    CHECK(read_status_response(sockets[3][1], KSI_OPCODE_HELLO, 4u, KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, 0u, NULL));
+    uint8_t subscription[KSI_HOOK_SUBSCRIPTION_PAYLOAD_SIZE] = { 0 };
+    ksi_wire_write_u32(subscription, KSI_HOOK_KEYBOARD);
+    CHECK(dispatch_request(state, observer, KSI_OPCODE_SUBSCRIBE_HOOK, 5u, subscription, sizeof(subscription)));
+    CHECK(read_status_response(sockets[1][1], KSI_OPCODE_SUBSCRIBE_HOOK, 5u, KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE, KSI_STATUS_OK, 0u, NULL));
+    CHECK(dispatch_request(state, observer, KSI_OPCODE_UNSUBSCRIBE_HOOK, 6u, subscription, sizeof(subscription)));
+    CHECK(read_status_response(sockets[1][1], KSI_OPCODE_UNSUBSCRIBE_HOOK, 6u, KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE, KSI_STATUS_OK, 0u, NULL));
+    CHECK(observer->connection_id == 102u && observer->observer_subscriptions == 0u);
+    ksi_linux_synth_reset_enqueued_synth();
+    publish_subscribed_keyboard_states(state);
+    CHECK(!state->keyboard_snapshot_valid && state->keyboard_sequence == 0u);
+    CHECK(dispatch_request(state, owner, KSI_OPCODE_KEY_STATE_SUBSCRIBE, 7u, NULL, 0u));
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_KEY_STATE_EVENT, event, sizeof(event)));
+    CHECK(ksi_wire_read_u32(event) == 3u && ksi_wire_read_u64(event + 8u) == 1u);
+    CHECK(read_status_response(sockets[0][1], KSI_OPCODE_KEY_STATE_SUBSCRIBE, 7u, KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, 0u, NULL));
+    output_queue_sync_owners(state);
+    uint8_t synth[KSI_SYNTHESIZE_PREFIX_SIZE + KSI_INPUT_WIRE_SIZE] = { 0 };
+    ksi_wire_write_u32(synth, 1u); ksi_wire_write_u32(synth + 4u, KSI_SYNTH_BYPASS_HOOK);
+    ksi_wire_write_u32(synth + 8u, KSI_INPUT_KEYBOARD);
+    ksi_wire_write_u16(synth + 18u, KEY_LEFTSHIFT);
+    ksi_wire_write_u32(synth + 20u, KSI_KEY_SCANCODE);
+    CHECK(dispatch_request(state, rpc, KSI_OPCODE_SYNTHESIZE_INPUT, 8u, synth, sizeof(synth)));
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_KEY_STATE_EVENT, event, sizeof(event)));
+    CHECK(ksi_wire_read_u32(event) == 4u && ksi_wire_read_u64(event + 8u) == 2u);
+    CHECK(ksi_wire_read_u32(event + 16u) == 0x10u);
+    uint8_t ack[KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE];
+    CHECK(read_status_response(sockets[2][1], KSI_OPCODE_SYNTHESIZE_INPUT, 8u, sizeof(ack), KSI_STATUS_OK, 0u, ack));
+    CHECK(ksi_wire_read_u32(ack + 8u) == 0x10u && ksi_wire_read_u64(ack + 16u) == 2u);
+    CHECK(dispatch_request(state, owner, KSI_OPCODE_KEY_STATE_SUBSCRIBE, 9u, NULL, 0u));
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_KEY_STATE_EVENT, event, sizeof(event)));
+    CHECK(ksi_wire_read_u32(event) == 3u && ksi_wire_read_u64(event + 8u) == 2u);
+    CHECK(read_status_response(sockets[0][1], KSI_OPCODE_KEY_STATE_SUBSCRIBE, 9u, KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, 0u, NULL));
+    /* Client compaction can place a bound RPC before its lease owner. */
+    ksi_client reordered = state->clients[0];
+    state->clients[0] = state->clients[2];
+    state->clients[2] = reordered;
+    owner = &state->clients[2]; rpc = &state->clients[0];
+    invalidate_connected_permissions(state, getuid(), "fixture", false, KSI_SCOPE_INPUT_CONTROL);
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_SESSION_REVOKED, event, 8u));
+    CHECK(!client_has_scope(rpc, KSI_SCOPE_INPUT_CONTROL));
+    CHECK(dispatch_request(state, rpc, KSI_OPCODE_SYNTHESIZE_INPUT, 10u, synth, sizeof(synth)));
+    CHECK(read_status_response(sockets[2][1], KSI_OPCODE_SYNTHESIZE_INPUT, 10u, KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, 0u, NULL));
+    finish_client_authorization(state, owner, KSI_OPCODE_AUTHORIZE, 11u,
+        KSI_SCOPE_INPUT_MONITORING | KSI_SCOPE_INPUT_CONTROL, KSI_SCOPE_INPUT_MONITORING);
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_SESSION_GRANTED, event, 8u));
+    CHECK(ksi_wire_read_u32(event) == KSI_SCOPE_INPUT_MONITORING);
+    CHECK(read_service_event(sockets[0][1], KSI_OPCODE_KEY_STATE_EVENT, event, sizeof(event)));
+    CHECK(ksi_wire_read_u32(event) == 3u && ksi_wire_read_u64(event + 8u) == 2u);
+    CHECK(read_status_response(sockets[0][1], KSI_OPCODE_AUTHORIZE, 11u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, 0u, NULL));
+    uint8_t backlog[4096u] = { 0 };
+    ssize_t written;
+    do { written = send(owner->fd, backlog, sizeof(backlog), MSG_DONTWAIT | MSG_NOSIGNAL); }
+    while (written > 0);
+    CHECK(written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    send_keyboard_state(owner, &state->keyboard_snapshot, false, state->keyboard_sequence);
+    CHECK(!hook_send_ref_is_valid(owner->hook_send_ref));
+    ksi_authorization_lease *shared = rpc->authorization_lease;
+    remove_client(state, 2u);
+    CHECK(!shared->active && shared->granted_scopes == 0u);
+    CHECK(!hook_send_ref_is_valid(state->clients[0].hook_send_ref));
+    while (state->client_count != 0u) remove_client(state, state->client_count - 1u);
+    for (unsigned int i = 0u; i < 4u; i++) close(sockets[i][1]);
+    synthetic_hook_queue_close(&state->synthetic_hook_queue);
+    output_queue_close(&state->output_queue);
+    ksi_linux_devices_set_observer_callback(NULL, NULL, NULL);
+    ksi_linux_devices_set_raw_observer_callback(NULL, NULL);
+    ksi_linux_synth_reset_enqueued_synth();
+    free(state);
+    return true;
+}
+
+static bool test_identity_accept_guard(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    CHECK(state != NULL);
+    state->client_count = 1u;
+    ksi_client *client = &state->clients[0];
+    *client = (ksi_client){ .fd = 17, .connection_id = 101u, .pid = getpid(),
+        .uid = getuid(), .start_time = 1u, .identity_attempted = true };
+    ksi_client_identified_result result = { .has_identity = true,
+        .identity = { .pid = getpid(), .uid = getuid(), .start_time = 1u } };
+    strcpy(result.identity.hash, "captured");
+    ksi_daemon_command command = { .client_fd = 17, .connection_id = 100u };
+    command.data.identified.result = &result;
+    process_client_identified(state, &command);
+    CHECK(!client->has_identity);
+    command.connection_id = 101u;
+    process_client_identified(state, &command);
+    CHECK(client->has_identity && client->start_time == 1u
+        && strcmp(client->identity.hash, "captured") == 0);
+    client->has_identity = false;
+    result.identity.start_time = 2u;
+    process_client_identified(state, &command);
+    CHECK(!client->has_identity && client->start_time == 1u && client->identity_attempted);
+    free(state);
+    return true;
+}
+
 int main(void)
 {
-    if (!test_daemon_admission_and_operation_gates()
+    if (!test_identity_accept_guard()
+        || !test_lease_state_and_synthesis_order()
+        || !test_daemon_admission_and_operation_gates()
         || !test_observer_admission_and_backpressure()
         || !test_nonblocking_observer_transport()
         || !test_permission_fence_preserves_key_release()

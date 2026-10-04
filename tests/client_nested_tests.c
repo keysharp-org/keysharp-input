@@ -27,7 +27,7 @@
 #define FUTURE_HOOK_TYPE 15u
 #define FUTURE_OPERATION UINT64_C(0x0000000000001000)
 
-_Static_assert(sizeof(ksi_service_info) == 56u,
+_Static_assert(sizeof(ksi_service_info) == 64u,
     "service-info ABI size changed");
 _Static_assert(offsetof(ksi_service_info, granted_scopes) == 12u,
     "service-info scope offset changed");
@@ -103,7 +103,7 @@ static bool send_frame(
     const uint8_t *payload, size_t payload_size)
 {
     uint8_t header[HEADER_SIZE] = { 'K', 'S', 'I', 'P' };
-    write_u16(header + 4u, 2u); write_u16(header + 6u, 0u);
+    write_u16(header + 4u, KSI_PROTOCOL_MAJOR); write_u16(header + 6u, 0u);
     write_u16(header + 8u, opcode); write_u16(header + 10u, flags);
     write_u32(header + 12u, (uint32_t)payload_size); write_u64(header + 16u, id);
     return transfer(fd, header, sizeof(header), true)
@@ -123,12 +123,12 @@ static void *server_main(void *argument)
     if (!receive_frame(fd, &opcode, &flags, &outer_id, payload, sizeof(payload), &size)
         || opcode != HELLO || flags != 0u || size != 16u
         || read_u16(payload) != KSI_ROLE_CALLBACK_STREAM) goto fail;
-    memset(payload, 0, 24u); write_u32(payload, KSI_STATUS_OK);
+    memset(payload, 0, 32u); write_u32(payload, KSI_STATUS_OK);
     write_u32(payload + 8u, KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED
         | FUTURE_SCOPE_KEPT);
     write_u64(payload + 16u, KSI_OPERATION_HOOK_KEYBOARD
         | KSI_OPERATION_SYNTHESIZE_KEYBOARD | FUTURE_OPERATION);
-    if (!send_frame(fd, HELLO, RESPONSE, outer_id, payload, 24u)) goto fail;
+    if (!send_frame(fd, HELLO, RESPONSE, outer_id, payload, 32u)) goto fail;
 
     if (!receive_frame(fd, &opcode, &flags, &outer_id, payload, sizeof(payload), &size)
         || opcode != SYNTHESIZE || flags != 0u) goto fail;
@@ -139,8 +139,8 @@ static void *server_main(void *argument)
 
     if (!receive_frame(fd, &opcode, &flags, &nested_id, payload, sizeof(payload), &size)
         || opcode != SYNTHESIZE || flags != 0u || nested_id == outer_id) goto fail;
-    memset(payload, 0, 8u);
-    if (!send_frame(fd, SYNTHESIZE, RESPONSE, nested_id, payload, 8u)) goto fail;
+    memset(payload, 0, 24u); write_u64(payload + 16u, 1u);
+    if (!send_frame(fd, SYNTHESIZE, RESPONSE, nested_id, payload, 24u)) goto fail;
 
     if (!receive_frame(fd, &opcode, &flags, &nested_id, payload, sizeof(payload), &size)
         || opcode != HOOK_EVENT || flags != RESPONSE || nested_id != event_id
@@ -154,13 +154,15 @@ static void *server_main(void *argument)
     memset(payload, 0, 8u);
     write_u32(payload, KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED);
     if (!send_frame(fd, SESSION_REVOKED, EVENT, 0u, payload, 8u)) goto fail;
-    memset(payload, 0, 8u);
-    if (!send_frame(fd, SYNTHESIZE, RESPONSE, outer_id, payload, 8u)
+    memset(payload, 0, 24u); write_u64(payload + 16u, 2u);
+    if (!send_frame(fd, SYNTHESIZE, RESPONSE, outer_id, payload, 24u)
         || !receive_frame(fd, &opcode, &flags, &nested_id,
             payload, sizeof(payload), &size)
-        || opcode != PING || flags != 0u || nested_id != 0u || size != 0u)
+        || opcode != PING || flags != 0u || nested_id == 0u || size != 0u)
         goto fail;
 
+    memset(payload, 0, 8u);
+    if (!send_frame(fd, PING, RESPONSE, nested_id, payload, 8u)) goto fail;
     close(fd); return NULL;
 fail:
     state->failed = 1; close(fd); return NULL;
@@ -174,7 +176,7 @@ static ksi_status nested_handler(
     (*calls)++;
     if (event->hook_type != KSI_HOOK_KEYBOARD) return KSI_STATUS_INTERNAL;
     ksi_hook_reply_init(reply);
-    return ksi_synthesize(connection, NULL, 0u, KSI_SYNTH_BYPASS_HOOK, error);
+    return ksi_synthesize(connection, NULL, 0u, KSI_SYNTH_BYPASS_HOOK, NULL, error);
 }
 
 static void *observer_server(void *argument)
@@ -188,10 +190,10 @@ static void *observer_server(void *argument)
     if (fd < 0) { state->failed = 1; return NULL; }
     if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
         || opcode != HELLO || read_u16(payload) != KSI_ROLE_OBSERVER_STREAM) goto fail;
-    memset(payload, 0, 24u);
+    memset(payload, 0, 32u);
     write_u32(payload + 8u, KSI_SCOPE_INPUT_MONITORING);
     write_u64(payload + 16u, KSI_OPERATION_OBSERVE_KEYBOARD | KSI_OPERATION_QUERY_DEVICES);
-    if (!send_frame(fd, HELLO, RESPONSE, id, payload, 24u)) goto fail;
+    if (!send_frame(fd, HELLO, RESPONSE, id, payload, 32u)) goto fail;
     if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
         || opcode != KSI_OPCODE_SUBSCRIBE_HOOK || read_u32(payload) != KSI_HOOK_KEYBOARD) goto fail;
     memset(payload, 0, 72u);
@@ -339,7 +341,7 @@ static int run_client_test(bool observer)
             || observation.kind != KSI_OBSERVER_OVERFLOW || observation.dropped_events != 9u
             || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
             || observation.kind != KSI_OBSERVER_SESSION_REVOKED
-            || ksi_connection_granted_scopes(connection) != 0u) goto joined;
+            || observation.data.revoked_scopes != KSI_SCOPE_INPUT_MONITORING) goto joined;
         result = 0;
         goto joined;
     }
@@ -347,12 +349,12 @@ static int run_client_test(bool observer)
         || ksi_set_nested_hook_handler(connection, nested_handler,
             &callback_calls, &error) != KSI_STATUS_OK
         || ksi_synthesize(connection, NULL, 0u,
-            KSI_SYNTH_BYPASS_HOOK, &error) != KSI_STATUS_OK
+            KSI_SYNTH_BYPASS_HOOK, NULL, &error) != KSI_STATUS_OK
+        || ksi_connection_sequence(connection) != 2u
         || callback_calls != 1u
         || ksi_connection_available_operations(connection)
             != (KSI_OPERATION_HOOK_KEYBOARD | KSI_OPERATION_SYNTHESIZE_KEYBOARD
-                | FUTURE_OPERATION)
-        || ksi_connection_granted_scopes(connection) != 0u) goto joined;
+                | FUTURE_OPERATION)) goto joined;
     ksi_hook_message_init(&message);
     if (ksi_hook_next(connection, 0u, &message, &error) != KSI_STATUS_OK
         || message.kind != KSI_HOOK_MESSAGE_QUARANTINED
@@ -366,6 +368,7 @@ static int run_client_test(bool observer)
     ksi_hook_message_init(&message);
     if (ksi_hook_next(connection, 1u, &message, &error) != KSI_STATUS_TIMEOUT)
         goto joined;
+    if (ksi_ping(connection, &error) != KSI_STATUS_OK) goto joined;
     result = 0;
 joined:
     ksi_disconnect(connection); pthread_join(thread, NULL);

@@ -23,5 +23,5 @@ Provides: ${client-abi:Provides}
 Description: Privileged Linux input broker
  A Linux service and C library for global keyboard and mouse hooks, input
  synthesis, blocking and physical input-state queries. The same API works
- on X11 and Wayland. Applications use libkeysharp-input.so.0; the root
+ on X11 and Wayland. Applications use libkeysharp-input.so.1; the root
  service owns evdev and uinput access.

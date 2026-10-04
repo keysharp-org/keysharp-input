@@ -222,6 +222,7 @@ size_t ksi_protocol_encode_hello_result(
     ksi_wire_write_u32(destination + 8u, granted_scopes);
     ksi_wire_write_u32(destination + 12u, 0u);
     ksi_wire_write_u64(destination + 16u, available_operations);
+    ksi_wire_write_u64(destination + 24u, 0u);
     return KSI_HELLO_RESULT_PAYLOAD_SIZE;
 }
 

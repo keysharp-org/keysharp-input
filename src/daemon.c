@@ -71,7 +71,6 @@
 #define KSI_MAX_SYNTH_HOOK_STEPS_PER_PASS 256u
 #define KSI_MAX_RECURSION_DEPTH 32u
 #define KSI_SHUTDOWN_TIMEOUT_MS 5000u
-#define KSI_GRAB_LEASE_TIMEOUT_MS 15000u
 /* Handshake deadline; peers that send nothing cannot pin slots. */
 #define KSI_HANDSHAKE_TIMEOUT_MS 10000u
 /* Idle deadline for authenticated scope-less connections (no grants, no
@@ -128,6 +127,14 @@ typedef enum ksi_client_state {
     KSI_CLIENT_STATE_AWAITING_PROMPT, /* permission prompt running on worker thread */
 } ksi_client_state;
 
+typedef struct ksi_authorization_lease {
+    uint32_t granted_scopes;
+    uint32_t references;
+    bool active;
+    uint64_t id;
+    char hash[KSP_HASH_HEX_LENGTH + 1u];
+} ksi_authorization_lease;
+
 /* Main-thread-only: holds application state for one authenticated client. */
 typedef struct ksi_client {
     int fd;
@@ -146,12 +153,12 @@ typedef struct ksi_client {
     bool identity_attempted;
     bool has_identity;
     ksp_identity identity;
-    bool revalidation_pending;
-    uint64_t identity_checked_ms;
     bool hello_complete;
     uint32_t connection_role;
     uint64_t connected_at_ms;
-    uint32_t granted_scopes;
+    ksi_authorization_lease *authorization_lease;
+    bool keyboard_state_subscribed;
+    ksi_key_state_payload keyboard_snapshot;
     uint64_t advertised_operations;
     uint32_t hook_subscriptions;
     uint32_t observer_subscriptions;
@@ -169,12 +176,9 @@ typedef struct ksi_client {
     uint32_t quarantined_hooks;
     uint64_t quarantine_rearm_after_ms[2];
     uint64_t last_hook_quarantine_ms[2];
-    uint64_t lease_expires_ms;
     /* Last time any message was received; drives the capless-idle reaper so an
      * authenticated scope-less connection cannot pin a slot forever. */
     uint64_t last_activity_ms;
-    char exe_path[KSP_PATH_CAPACITY];
-    char exe_hash[KSP_HASH_HEX_LENGTH + 1u];
     /* Authorization request waiting for identification or a prompt. */
     bool pending_authorization;
     uint16_t pending_authorization_opcode;
@@ -190,18 +194,21 @@ typedef struct ksi_client {
     bool permission_store_generation_valid;
 } ksi_client;
 
+static uint32_t client_grants(const ksi_client *client)
+{
+    return client->authorization_lease != NULL && client->authorization_lease->active
+        ? client->authorization_lease->granted_scopes : 0u;
+}
+
 /* Heap-allocated payload for KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED. */
 typedef struct ksi_client_identified_result {
     bool has_identity;
     ksp_identity identity;
-    char exe_path[KSP_PATH_CAPACITY];
-    char exe_hash[KSP_HASH_HEX_LENGTH + 1u];
-    uint64_t start_time;
 } ksi_client_identified_result;
 
 typedef enum ksi_daemon_command_type {
     KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED, /* worker -> main: identity resolution complete */
-    KSI_DAEMON_COMMAND_CLIENT_REVALIDATED,
+    KSI_DAEMON_COMMAND_SYNTH_ACK,
     KSI_DAEMON_COMMAND_PERMISSION_DONE,
     KSI_DAEMON_COMMAND_CLIENT_PROMPT_DONE, /* worker → main: user permission prompt complete */
     KSI_DAEMON_COMMAND_LANE_HOOK_FAILURE, /* lane → main: send/timeout failure for a client */
@@ -213,6 +220,7 @@ typedef struct ksi_daemon_command {
     uint64_t connection_id;
     union {
         ksi_permission_task *permission;
+        struct ksi_synth_completion *synth_ack;
         struct {
             ksi_client_identified_result *result; /* heap-allocated; freed by consumer */
         } identified;
@@ -485,6 +493,9 @@ typedef struct ksi_hook_lane {
 } ksi_hook_lane;
 
 typedef struct ksi_daemon_state {
+    uint64_t keyboard_sequence;
+    ksi_key_state_payload keyboard_snapshot;
+    bool keyboard_snapshot_valid;
     const ksi_platform_backend *backend;
     ksi_client clients[KSI_MAX_CLIENTS];
     nfds_t client_count;
@@ -574,6 +585,10 @@ static void send_status(
     uint32_t status,
     uint32_t detail);
 static void remove_client(ksi_daemon_state *state, nfds_t index);
+static void publish_keyboard_states(ksi_daemon_state *state);
+static void send_keyboard_state(ksi_client *client, const ksi_key_state_payload *state, bool snapshot, uint64_t sequence);
+static bool fence_permission_output(ksi_daemon_state *state);
+static void synth_completion_destroy(struct ksi_synth_completion *completion);
 static void send_indicator_state_result(int client_fd, const ksi_message_header *request);
 static void send_pointer_position_result(int client_fd, const ksi_message_header *request);
 static void send_pointer_buttons_result(int client_fd, const ksi_message_header *request);
@@ -644,8 +659,10 @@ static void free_daemon_command(ksi_daemon_command *command)
     if (command->type == KSI_DAEMON_COMMAND_PERMISSION_DONE) {
         free_permission_task(command->data.permission);
         command->data.permission = NULL;
-    } else if (command->type == KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED
-        || command->type == KSI_DAEMON_COMMAND_CLIENT_REVALIDATED) {
+    } else if (command->type == KSI_DAEMON_COMMAND_SYNTH_ACK) {
+        synth_completion_destroy(command->data.synth_ack);
+        command->data.synth_ack = NULL;
+    } else if (command->type == KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED) {
         free(command->data.identified.result);
         command->data.identified.result = NULL;
     } else if (command->type == KSI_DAEMON_COMMAND_CLIENT_PROMPT_DONE
@@ -777,14 +794,6 @@ static void set_active_input_owner(
         &state->active_input_uid, (unsigned int)uid, memory_order_relaxed);
     atomic_store_explicit(
         &state->active_input_uid_valid, true, memory_order_release);
-
-    /* Resume stored subscriptions for this uid and give their leases a fresh
-     * active interval; switched-away users' lease clocks remain paused. */
-    for (nfds_t i = 0u; i < state->client_count; i++) {
-        if (state->clients[i].uid == uid) {
-            renew_client_lease(&state->clients[i]);
-        }
-    }
 
     if (update_grab_state(state) != 0) {
         fprintf(stderr,
@@ -947,6 +956,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
         ? backend->get_ready_operations()
         : available_operations;
     daemon_state->next_connection_id = 1;
+    daemon_state->keyboard_sequence = 1u;
     daemon_state->next_event_id = 1;
     daemon_state->input_owner_enforced = options->system_service;
     daemon_state->permission_notify_fd = -1;
@@ -1162,9 +1172,10 @@ int ksi_daemon_run(const ksi_daemon_options *options)
             (void)process_hook_ingress(daemon_state);
             apply_fail_open_if_requested(daemon_state);
             process_daemon_commands(daemon_state);
-            expire_client_leases(daemon_state);
             expire_unauthenticated_clients(daemon_state);
             run_backend_maintenance(daemon_state);
+            /* EVIOCGKEY reconciles state hidden by another evdev grab, only while subscribed. */
+            publish_subscribed_keyboard_states(daemon_state);
 
             continue;
         }
@@ -1213,9 +1224,9 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 
         apply_fail_open_if_requested(daemon_state);
         process_daemon_commands(daemon_state);
-        expire_client_leases(daemon_state);
         expire_unauthenticated_clients(daemon_state);
         flush_observers(daemon_state);
+        publish_subscribed_keyboard_states(daemon_state);
 
     }
 

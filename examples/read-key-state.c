@@ -23,7 +23,8 @@ int main(void)
     ksi_connect_options_init(&options);
     ksi_service_info_init(&info);
     ksi_error_init(&error);
-    options.requested_scopes = KSI_SCOPE_INPUT_MONITORING;
+    options.role = KSI_ROLE_AUTHORIZATION_LEASE;
+    options.requested_scopes = 0u;
     if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
         || ksi_authorize(connection, KSI_AUTH_REQUEST, KSI_SCOPE_INPUT_MONITORING,
             &granted, &error) != KSI_STATUS_OK) {

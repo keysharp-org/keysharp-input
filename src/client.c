@@ -13,13 +13,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #define KSI_CLIENT_MAX_RECURSION 32u
 #define KSI_CLIENT_NOTIFICATION_CAPACITY 16u
-#define KSI_CLIENT_HOOK_HEARTBEAT_MS 5000u
 
 _Static_assert((uint32_t)KSI_SCOPE_INPUT_MONITORING
         == (uint32_t)KSP_SCOPE_INPUT_MONITORING,
@@ -37,12 +38,21 @@ typedef struct ksi_wire_header {
 
 struct ksi_connection {
     int fd;
+    int poll_fd;
+    int ready_fd;
     uint32_t role;
     uint32_t default_timeout_ms;
     uint32_t granted_scopes;
     uint32_t pending_revoked_scopes;
     uint64_t available_operations;
     uint64_t next_request_id;
+    uint64_t sequence;
+    uint8_t rx_header[KSI_FRAME_HEADER_SIZE];
+    size_t rx_header_used;
+    size_t rx_payload_used;
+    ksi_lease_message lease_notifications[KSI_CLIENT_NOTIFICATION_CAPACITY];
+    uint32_t lease_head;
+    uint32_t lease_count;
     uint64_t outstanding_hook_request;
     uint32_t recursion_depth;
     ksi_nested_hook_handler nested_handler;
@@ -58,6 +68,29 @@ struct ksi_connection {
     uint8_t tx[KSI_MAX_PAYLOAD_SIZE];
 };
 
+static bool initialize_poll_descriptor(ksi_connection *connection)
+{
+    connection->poll_fd = epoll_create1(EPOLL_CLOEXEC);
+    connection->ready_fd = eventfd(0u, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (connection->poll_fd < 0 || connection->ready_fd < 0) return false;
+    struct epoll_event socket_event = { .events = EPOLLIN | EPOLLERR | EPOLLHUP };
+    struct epoll_event ready_event = { .events = EPOLLIN };
+    return epoll_ctl(connection->poll_fd, EPOLL_CTL_ADD, connection->fd, &socket_event) == 0
+        && epoll_ctl(connection->poll_fd, EPOLL_CTL_ADD, connection->ready_fd, &ready_event) == 0;
+}
+
+static void update_buffered_readiness(ksi_connection *connection)
+{
+    uint64_t value;
+    while (read(connection->ready_fd, &value, sizeof(value)) > 0) {}
+    if (connection->notification_count != 0u || connection->observer_count != 0u
+        || connection->observer_dropped != 0u || connection->lease_count != 0u
+        || (connection->role == KSI_ROLE_OBSERVER_STREAM && connection->pending_revoked_scopes != 0u)) {
+        value = 1u;
+        (void)write(connection->ready_fd, &value, sizeof(value));
+    }
+}
+
 #ifdef KSI_CLIENT_TESTING
 ksi_connection *ksi_client_test_adopt_descriptor(int descriptor)
 {
@@ -67,11 +100,24 @@ ksi_connection *ksi_client_test_adopt_descriptor(int descriptor)
     ksi_connection *connection = calloc(1u, sizeof(*connection));
     if (connection != NULL) {
         connection->fd = descriptor;
+        connection->poll_fd = connection->ready_fd = -1;
+        (void)fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK);
+        if (!initialize_poll_descriptor(connection)) { ksi_disconnect(connection); return NULL; }
         connection->role = KSI_ROLE_RPC;
         connection->default_timeout_ms = KSI_DEFAULT_REQUEST_TIMEOUT_MS;
         connection->next_request_id = 1u;
     }
     return connection;
+}
+
+void ksi_client_test_set_role(ksi_connection *connection, uint32_t role)
+{
+    connection->role = role;
+}
+
+void ksi_client_test_set_timeout(ksi_connection *connection, uint32_t timeout_ms)
+{
+    connection->default_timeout_ms = timeout_ms;
 }
 
 void ksi_client_test_set_outstanding_hook_request(
@@ -204,10 +250,16 @@ static ksi_status invalid_output(ksi_error *error, const char *name)
     return KSI_STATUS_INVALID_REQUEST;
 }
 
-static ksi_status invalid_result(ksi_error *error, const char *name)
+static ksi_status terminal_failure(ksi_connection *connection, ksi_status status)
+{
+    (void)shutdown(connection->fd, SHUT_RDWR);
+    return status;
+}
+
+static ksi_status invalid_result(ksi_connection *connection, ksi_error *error, const char *name)
 {
     set_error(error, 0u, 0, "service returned invalid %s data", name);
-    return KSI_STATUS_INTERNAL;
+    return terminal_failure(connection, KSI_STATUS_INTERNAL);
 }
 
 static void init_sized(void *value, size_t size)
@@ -292,7 +344,7 @@ static ksi_status write_all(
     size_t offset = 0u;
 
     while (offset < size) {
-        ssize_t written = write(connection->fd, bytes + offset, size - offset);
+        ssize_t written = send(connection->fd, bytes + offset, size - offset, MSG_NOSIGNAL);
 
         if (written > 0) {
             offset += (size_t)written;
@@ -318,21 +370,20 @@ static ksi_status write_all(
     return KSI_STATUS_OK;
 }
 
-static ksi_status read_all(
+static ksi_status read_incremental(
     ksi_connection *connection,
     uint8_t *bytes,
     size_t size,
+    size_t *offset,
     uint64_t deadline,
     uint32_t timeout_ms,
     ksi_error *error)
 {
-    size_t offset = 0u;
-
-    while (offset < size) {
-        ssize_t received = read(connection->fd, bytes + offset, size - offset);
+    while (*offset < size) {
+        ssize_t received = read(connection->fd, bytes + *offset, size - *offset);
 
         if (received > 0) {
-            offset += (size_t)received;
+            *offset += (size_t)received;
             continue;
         }
         if (received < 0 && errno == EINTR) {
@@ -423,11 +474,11 @@ static ksi_status receive_frame(
     uint32_t timeout_ms,
     ksi_error *error)
 {
-    uint8_t raw[KSI_FRAME_HEADER_SIZE];
+    uint8_t *raw = connection->rx_header;
     uint64_t deadline = timeout_ms == UINT32_MAX
         ? 0u : monotonic_ms() + timeout_ms;
-    ksi_status status = read_all(connection, raw, sizeof(raw),
-        deadline, timeout_ms, error);
+    ksi_status status = read_incremental(connection, raw, KSI_FRAME_HEADER_SIZE,
+        &connection->rx_header_used, deadline, timeout_ms, error);
 
     if (status != KSI_STATUS_OK) {
         return status;
@@ -435,8 +486,9 @@ static ksi_status receive_frame(
     if (memcmp(raw, "KSIP", 4u) != 0
         || read_u16(raw + 4u) != KSI_PROTOCOL_MAJOR
         || read_u16(raw + 6u) != KSI_PROTOCOL_MINOR) {
-        set_error(error, 0u, 0, "invalid service protocol header");
-        return KSI_STATUS_UNSUPPORTED;
+        set_error(error, 0u, 0, "keysharp-input requires protocol %u.%u (client ABI %u.%u)",
+            KSI_PROTOCOL_MAJOR, KSI_PROTOCOL_MINOR, KSI_CLIENT_ABI_MAJOR, KSI_CLIENT_ABI_MINOR);
+        return terminal_failure(connection, KSI_STATUS_UNSUPPORTED);
     }
     header->opcode = read_u16(raw + 8u);
     header->flags = read_u16(raw + 10u);
@@ -445,16 +497,18 @@ static ksi_status receive_frame(
     if (header->payload_size > KSI_MAX_PAYLOAD_SIZE
         || !wire_header_is_valid(header)) {
         set_error(error, 0u, 0, "invalid service frame");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     if (header->payload_size != 0u) {
-        status = read_all(connection, connection->rx, header->payload_size,
-            deadline, timeout_ms, error);
+        status = read_incremental(connection, connection->rx, header->payload_size,
+            &connection->rx_payload_used, deadline, timeout_ms, error);
     }
+    if (status == KSI_STATUS_OK) connection->rx_header_used = connection->rx_payload_used = 0u;
     return status;
 }
 
 static ksi_status decode_status(
+    ksi_connection *connection,
     const uint8_t *payload,
     size_t payload_size,
     size_t success_size,
@@ -465,14 +519,14 @@ static ksi_status decode_status(
 
     if (payload_size < KSI_STATUS_PAYLOAD_SIZE) {
         set_error(error, 0u, 0, "service returned a truncated status");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     status = read_u32(payload);
     detail = read_u32(payload + 4u);
     if (status == KSI_STATUS_OK) {
         if (payload_size != success_size) {
             set_error(error, detail, 0, "service returned an invalid result size");
-            return KSI_STATUS_INTERNAL;
+            return terminal_failure(connection, KSI_STATUS_INTERNAL);
         }
         clear_error(error);
         return KSI_STATUS_OK;
@@ -483,16 +537,16 @@ static ksi_status decode_status(
         uint32_t length = read_u32(payload + KSI_STATUS_PAYLOAD_SIZE);
         if ((size_t)length != payload_size - KSI_STATUS_PAYLOAD_SIZE - 4u) {
             set_error(error, detail, 0, "service returned an invalid diagnostic");
-            return KSI_STATUS_INTERNAL;
+            return terminal_failure(connection, KSI_STATUS_INTERNAL);
         }
         set_error(error, detail, 0, "%.*s", (int)(length > 255u ? 255u : length),
             (const char *)(payload + KSI_STATUS_PAYLOAD_SIZE + 4u));
     } else {
         set_error(error, detail, 0, "service returned an invalid diagnostic");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     return status <= KSI_STATUS_REVOKED || status == KSI_STATUS_INTERNAL
-        ? status : KSI_STATUS_INTERNAL;
+        ? status : terminal_failure(connection, KSI_STATUS_INTERNAL);
 }
 
 static uint64_t next_request_id(ksi_connection *connection)
@@ -686,6 +740,7 @@ static bool queue_notification(
         % KSI_CLIENT_NOTIFICATION_CAPACITY;
     connection->notifications[index] = *message;
     connection->notification_count++;
+    update_buffered_readiness(connection);
     return true;
 }
 
@@ -700,6 +755,9 @@ static bool pop_notification(
     connection->notification_head = (connection->notification_head + 1u)
         % KSI_CLIENT_NOTIFICATION_CAPACITY;
     connection->notification_count--;
+    if (message->kind == KSI_HOOK_MESSAGE_SESSION_REVOKED)
+        connection->pending_revoked_scopes &= ~message->data.revoked_scopes;
+    update_buffered_readiness(connection);
     return true;
 }
 
@@ -732,12 +790,60 @@ static bool decode_observer(const ksi_wire_header *header, const uint8_t *payloa
     return message->kind == KSI_OBSERVER_OVERFLOW && size == 0u && message->dropped_events != 0u;
 }
 
+static bool queue_lease_event(ksi_connection *connection, const ksi_wire_header *header)
+{
+    ksi_lease_message message;
+    ksi_lease_message_init(&message);
+    if (header->opcode == KSI_OPCODE_KEY_STATE_EVENT) {
+        if (header->payload_size != KSI_KEY_STATE_EVENT_PAYLOAD_SIZE) return false;
+        message.kind = read_u32(connection->rx);
+        message.physical_modifiers_lr = read_u32(connection->rx + 4u);
+        message.sequence = read_u64(connection->rx + 8u);
+        if ((message.kind != KSI_LEASE_KEYBOARD_SNAPSHOT && message.kind != KSI_LEASE_KEYBOARD_DELTA)
+            || message.sequence == 0u) return false;
+        const uint8_t *body = connection->rx + 16u;
+        ksi_key_state_init(&message.state);
+        message.state.modifiers_lr = read_u32(body);
+        message.state.caps_lock = body[4u]; message.state.num_lock = body[5u]; message.state.scroll_lock = body[6u];
+        if (body[7u] != 0u || body[4u] > 1u || body[5u] > 1u || body[6u] > 1u) return false;
+        memcpy(message.state.logical_keys, body + 8u, KSI_KEY_STATE_BITMAP_BYTES);
+        memcpy(message.state.physical_keys, body + 8u + KSI_KEY_STATE_BITMAP_BYTES, KSI_KEY_STATE_BITMAP_BYTES);
+    } else if (header->opcode == KSI_OPCODE_SESSION_GRANTED) {
+        if (header->payload_size != KSI_SESSION_REVOKED_PAYLOAD_SIZE || read_u32(connection->rx + 4u) != 0u) return false;
+        message.kind = KSI_LEASE_GRANTED;
+        connection->granted_scopes = read_u32(connection->rx);
+    } else if (header->opcode == KSI_OPCODE_SESSION_REVOKED) {
+        message.revoked_scopes = apply_revocation(connection, connection->rx, header->payload_size);
+        if (message.revoked_scopes == 0u) return false;
+        connection->pending_revoked_scopes = 0u; message.kind = KSI_LEASE_REVOKED;
+    } else return false;
+    message.granted_scopes = connection->granted_scopes;
+    if (header->opcode == KSI_OPCODE_KEY_STATE_EVENT && connection->lease_count != 0u) {
+        uint32_t last = (connection->lease_head + connection->lease_count - 1u) % KSI_CLIENT_NOTIFICATION_CAPACITY;
+        ksi_lease_message *previous = &connection->lease_notifications[last];
+        if (previous->kind == KSI_LEASE_KEYBOARD_SNAPSHOT || previous->kind == KSI_LEASE_KEYBOARD_DELTA) {
+            /* Full state records can replace a burst while an RPC awaits its reply. */
+            message.kind = KSI_LEASE_KEYBOARD_SNAPSHOT;
+            *previous = message;
+            update_buffered_readiness(connection);
+            return true;
+        }
+    }
+    if (connection->lease_count == KSI_CLIENT_NOTIFICATION_CAPACITY) return false;
+    uint32_t index = (connection->lease_head + connection->lease_count) % KSI_CLIENT_NOTIFICATION_CAPACITY;
+    connection->lease_notifications[index] = message; connection->lease_count++;
+    update_buffered_readiness(connection);
+    return true;
+}
+
 static bool queue_service_event(
     ksi_connection *connection,
     const ksi_wire_header *header)
 {
     ksi_hook_message message;
 
+    if (connection->role == KSI_ROLE_AUTHORIZATION_LEASE || connection->role == KSI_ROLE_RPC)
+        return queue_lease_event(connection, header);
     ksi_hook_message_init(&message);
     if (header->opcode == KSI_OPCODE_OBSERVER_EVENT && connection->role == KSI_ROLE_OBSERVER_STREAM) {
         ksi_observer_message observation;
@@ -749,6 +855,7 @@ static bool queue_service_event(
                 % KSI_CLIENT_NOTIFICATION_CAPACITY;
             connection->observer_notifications[index] = observation;
             connection->observer_count++;
+            update_buffered_readiness(connection);
         }
         return true;
     }
@@ -793,7 +900,7 @@ static ksi_status handle_nested_hook(
     if (!decode_hook_event(connection->rx, header->payload_size,
             header->request_id, &event)) {
         set_error(error, 0u, 0, "service returned an invalid hook event");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     memset(&reply, 0, sizeof(reply));
     reply.struct_size = sizeof(reply);
@@ -822,16 +929,22 @@ static ksi_status wait_response(
     uint16_t opcode,
     uint64_t request_id,
     uint32_t timeout_ms,
+    uint64_t deadline,
     ksi_wire_header *response,
     ksi_error *error)
 {
     for (;;) {
+        if (timeout_ms != UINT32_MAX && monotonic_ms() >= deadline) {
+            set_error(error, 0u, ETIMEDOUT, "service response timed out");
+            return terminal_failure(connection, KSI_STATUS_TIMEOUT);
+        }
         ksi_wire_header header;
-        ksi_status status = receive_frame(connection, &header,
-            timeout_ms, error);
+        uint32_t remaining = timeout_ms == UINT32_MAX ? UINT32_MAX
+            : (uint32_t)remaining_timeout(deadline, timeout_ms);
+        ksi_status status = receive_frame(connection, &header, remaining, error);
 
         if (status != KSI_STATUS_OK) {
-            return status;
+            return status == KSI_STATUS_TIMEOUT ? terminal_failure(connection, status) : status;
         }
         if (header.flags == KSI_FRAME_FLAG_EVENT
             && queue_service_event(connection, &header)) {
@@ -847,7 +960,7 @@ static ksi_status wait_response(
         if ((header.flags & KSI_FRAME_FLAG_RESPONSE) == 0u
             || header.opcode != opcode || header.request_id != request_id) {
             set_error(error, 0u, 0, "service returned an unexpected frame");
-            return KSI_STATUS_INTERNAL;
+            return terminal_failure(connection, KSI_STATUS_INTERNAL);
         }
         *response = header;
         return KSI_STATUS_OK;
@@ -870,14 +983,15 @@ static ksi_status request(
         set_error(error, 0u, EINVAL, "invalid connection");
         return KSI_STATUS_INVALID_REQUEST;
     }
+    uint64_t deadline = timeout_ms == UINT32_MAX ? 0u : monotonic_ms() + timeout_ms;
     request_id = next_request_id(connection);
     status = send_frame(connection, opcode, 0u, request_id,
         payload, payload_size, timeout_ms, error);
     if (status != KSI_STATUS_OK) {
-        return status;
+        return status == KSI_STATUS_TIMEOUT ? terminal_failure(connection, status) : status;
     }
     return wait_response(connection, opcode, request_id,
-        timeout_ms, response, error);
+        timeout_ms, deadline, response, error);
 }
 
 static ksi_status simple_request(
@@ -899,9 +1013,9 @@ static ksi_status simple_request(
     }
     if (response->flags != KSI_FRAME_FLAG_RESPONSE) {
         set_error(error, 0u, 0, "service returned an invalid response flag");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
-    return decode_status(connection->rx, response->payload_size,
+    return decode_status(connection, connection->rx, response->payload_size,
         success_size, error);
 }
 
@@ -1128,16 +1242,19 @@ ksi_status ksi_connect(
         return KSI_STATUS_RESOURCE_EXHAUSTED;
     }
     created->fd = fd;
+    created->poll_fd = created->ready_fd = -1;
+    if (!initialize_poll_descriptor(created)) { ksi_disconnect(created); return KSI_STATUS_UNAVAILABLE; }
     created->role = options->role;
     created->default_timeout_ms = timeout_ms;
     created->next_request_id = 1u;
     write_u16(hello, (uint16_t)options->role);
     write_u16(hello + 2u, (uint16_t)options->authorization_mode);
     write_u32(hello + 4u, options->requested_scopes);
+    write_u64(hello + 8u, options->lease_id);
     status = request(created, KSI_OPCODE_HELLO, hello, sizeof(hello),
         timeout_ms, &response, error);
     if (status == KSI_STATUS_OK) {
-        status = decode_status(created->rx, response.payload_size,
+        status = decode_status(created, created->rx, response.payload_size,
             KSI_HELLO_RESULT_PAYLOAD_SIZE, error);
     }
     if (status == KSI_STATUS_OK && response.flags != KSI_FRAME_FLAG_RESPONSE) {
@@ -1173,6 +1290,7 @@ ksi_status ksi_connect(
         service_info->abi_minor = KSI_CLIENT_ABI_MINOR;
         service_info->granted_scopes = created->granted_scopes;
         service_info->available_operations = created->available_operations;
+        service_info->lease_id = read_u64(created->rx + 24u);
     }
     *connection = created;
     return KSI_STATUS_OK;
@@ -1187,8 +1305,20 @@ void ksi_disconnect(ksi_connection *connection)
         (void)close(connection->fd);
         connection->fd = -1;
     }
+    if (connection->poll_fd >= 0) (void)close(connection->poll_fd);
+    if (connection->ready_fd >= 0) (void)close(connection->ready_fd);
     memset(connection, 0, sizeof(*connection));
     free(connection);
+}
+
+int ksi_connection_fd(const ksi_connection *connection)
+{
+    return connection == NULL ? -1 : connection->poll_fd;
+}
+
+uint64_t ksi_connection_sequence(const ksi_connection *connection)
+{
+    return connection == NULL ? 0u : connection->sequence;
 }
 
 ksi_status ksi_authorize(
@@ -1218,7 +1348,7 @@ ksi_status ksi_authorize(
     }
     if (read_u32(connection->rx + 12u) != 0u) {
         set_error(error, 0u, 0, "service returned invalid authorization data");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     connection->granted_scopes |= read_u32(connection->rx + 8u)
         & (uint32_t)KSI_SCOPE_ALL;
@@ -1233,12 +1363,6 @@ ksi_status ksi_ping(ksi_connection *connection, ksi_error *error)
     ksi_wire_header response;
     return simple_request(connection, KSI_OPCODE_PING, NULL, 0u,
         KSI_STATUS_PAYLOAD_SIZE, &response, error);
-}
-
-ksi_permission_scopes ksi_connection_granted_scopes(
-    const ksi_connection *connection)
-{
-    return connection == NULL ? 0u : connection->granted_scopes;
 }
 
 ksi_operations ksi_connection_available_operations(
@@ -1263,20 +1387,22 @@ ksi_status ksi_permissions_list(
         set_error(error, 0u, EINVAL, "invalid permissions-list request");
         return KSI_STATUS_INVALID_REQUEST;
     }
+    uint64_t deadline = connection->default_timeout_ms == UINT32_MAX ? 0u
+        : monotonic_ms() + connection->default_timeout_ms;
     request_id = next_request_id(connection);
     status = send_frame(connection, KSI_OPCODE_PERMISSIONS_LIST, 0u,
         request_id, NULL, 0u, connection->default_timeout_ms, error);
     if (status != KSI_STATUS_OK) {
-        return status;
+        return status == KSI_STATUS_TIMEOUT ? terminal_failure(connection, status) : status;
     }
     for (;;) {
         status = wait_response(connection, KSI_OPCODE_PERMISSIONS_LIST,
-            request_id, connection->default_timeout_ms, &response, error);
+            request_id, connection->default_timeout_ms, deadline, &response, error);
         if (status != KSI_STATUS_OK) {
             return status;
         }
         if (response.flags == KSI_FRAME_FLAG_RESPONSE) {
-            status = decode_status(connection->rx, response.payload_size,
+            status = decode_status(connection, connection->rx, response.payload_size,
                 KSI_STATUS_PAYLOAD_SIZE, error);
             return status == KSI_STATUS_OK && cancelled
                 ? KSI_STATUS_CANCELLED : status;
@@ -1284,9 +1410,9 @@ ksi_status ksi_permissions_list(
         if (response.flags != (KSI_FRAME_FLAG_RESPONSE | KSI_FRAME_FLAG_MORE)
             || response.payload_size < KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE) {
             set_error(error, 0u, 0, "service returned an invalid permission entry");
-            return KSI_STATUS_INTERNAL;
+            return terminal_failure(connection, KSI_STATUS_INTERNAL);
         }
-        status = decode_status(connection->rx, response.payload_size,
+        status = decode_status(connection, connection->rx, response.payload_size,
             response.payload_size, error);
         if (status != KSI_STATUS_OK) {
             return status;
@@ -1300,7 +1426,7 @@ ksi_status ksi_permissions_list(
                     != response.payload_size - KSI_PERMISSIONS_LIST_ENTRY_FIXED_SIZE
                 || path_length >= KSI_EXECUTABLE_PATH_SIZE) {
                 set_error(error, 0u, 0, "service returned an invalid permission entry");
-                return KSI_STATUS_INTERNAL;
+                return terminal_failure(connection, KSI_STATUS_INTERNAL);
             }
             if (!cancelled) {
                 ksi_permission_entry_init(&entry);
@@ -1384,50 +1510,41 @@ ksi_status ksi_permissions_revoke(
         payload, sizeof(payload), KSI_STATUS_PAYLOAD_SIZE, &response, error);
 }
 
-ksi_permission_scopes ksi_lease_granted_scopes(
-    const ksi_connection *connection)
+void ksi_lease_message_init(ksi_lease_message *message)
 {
-    return connection != NULL
-            && connection->role == KSI_ROLE_AUTHORIZATION_LEASE
-        ? connection->granted_scopes : 0u;
+    init_sized(message, sizeof(*message));
 }
 
-ksi_status ksi_lease_next(
-    ksi_connection *connection,
-    uint32_t timeout_ms,
-    ksi_permission_scopes *revoked_scopes,
-    ksi_error *error)
+ksi_status ksi_key_state_subscribe(ksi_connection *connection, ksi_error *error)
 {
-    if (connection == NULL || revoked_scopes == NULL
-        || connection->role != KSI_ROLE_AUTHORIZATION_LEASE) {
-        set_error(error, 0u, EINVAL, "connection is not an authorization lease");
-        return KSI_STATUS_INVALID_REQUEST;
-    }
-    for (;;) {
-        ksi_wire_header header;
-        ksi_status status;
+    ksi_wire_header response;
+    if (connection == NULL || connection->role != KSI_ROLE_AUTHORIZATION_LEASE)
+        return invalid_output(error, "authorization lease");
+    return simple_request(connection, KSI_OPCODE_KEY_STATE_SUBSCRIBE, NULL, 0u,
+        KSI_STATUS_PAYLOAD_SIZE, &response, error);
+}
 
-        if (connection->pending_revoked_scopes != 0u) {
-            *revoked_scopes = connection->pending_revoked_scopes;
-            connection->pending_revoked_scopes = 0u;
-            clear_error(error);
+ksi_status ksi_lease_next(ksi_connection *connection, uint32_t timeout_ms,
+    ksi_lease_message *message, ksi_error *error)
+{
+    if (connection == NULL || !sized_output_is_valid(message, sizeof(*message))
+        || (connection->role != KSI_ROLE_AUTHORIZATION_LEASE && connection->role != KSI_ROLE_RPC))
+        return invalid_output(error, "lease message");
+    uint64_t deadline = timeout_ms == UINT32_MAX ? 0u : monotonic_ms() + timeout_ms;
+    for (;;) {
+        if (connection->lease_count != 0u) {
+            *message = connection->lease_notifications[connection->lease_head];
+            connection->lease_head = (connection->lease_head + 1u) % KSI_CLIENT_NOTIFICATION_CAPACITY;
+            connection->lease_count--; update_buffered_readiness(connection); clear_error(error);
             return KSI_STATUS_OK;
         }
-        status = receive_frame(connection, &header, timeout_ms, error);
-        if (status != KSI_STATUS_OK) {
-            return status;
-        }
-        if (header.flags == KSI_FRAME_FLAG_EVENT
-            && header.opcode == KSI_OPCODE_SESSION_REVOKED) {
-            apply_revocation(connection, connection->rx, header.payload_size);
-            if (connection->pending_revoked_scopes == 0u) {
-                set_error(error, 0u, 0, "service returned an invalid revocation");
-                return KSI_STATUS_INTERNAL;
-            }
-            continue;
-        }
-        set_error(error, 0u, 0, "service returned an unexpected lease frame");
-        return KSI_STATUS_INTERNAL;
+        ksi_wire_header header;
+        uint32_t wait = timeout_ms == UINT32_MAX ? UINT32_MAX
+            : (uint32_t)remaining_timeout(deadline, timeout_ms);
+        ksi_status status = receive_frame(connection, &header, wait, error);
+        if (status != KSI_STATUS_OK) return status;
+        if (header.flags == KSI_FRAME_FLAG_EVENT && queue_lease_event(connection, &header)) continue;
+        return invalid_result(connection, error, "lease frame");
     }
 }
 
@@ -1495,10 +1612,10 @@ static ksi_status devices_list_paged(ksi_connection *connection, uint16_t opcode
         ksi_status status = request(connection, opcode,
             payload, sizeof(payload), connection->default_timeout_ms, &response, error);
         if (status != KSI_STATUS_OK) return status;
-        status = decode_status(connection->rx, response.payload_size, response.payload_size, error);
+        status = decode_status(connection, connection->rx, response.payload_size, response.payload_size, error);
         if (status != KSI_STATUS_OK) return status;
         if (response.flags != KSI_FRAME_FLAG_RESPONSE || response.payload_size < KSI_DEVICE_LIST_PREFIX_SIZE)
-            return invalid_result(error, "device list");
+            return invalid_result(connection, error, "device list");
         uint32_t count = read_u32(connection->rx + 20u);
         uint32_t next = read_u32(connection->rx + 16u);
         uint64_t returned_generation = read_u64(connection->rx + 8u);
@@ -1506,13 +1623,13 @@ static ksi_status devices_list_paged(ksi_connection *connection, uint16_t opcode
             || response.payload_size != KSI_DEVICE_LIST_PREFIX_SIZE + count * KSI_DEVICE_INFO_WIRE_SIZE
             || (next != 0u && next <= offset)
             || (generation != 0u && returned_generation != generation))
-            return invalid_result(error, "device list");
+            return invalid_result(connection, error, "device list");
         generation = returned_generation;
         for (uint32_t i = 0u; i < count; i++) {
             ksi_device_info device;
             if (!ksi_device_decode(connection->rx + KSI_DEVICE_LIST_PREFIX_SIZE
                     + (size_t)i * KSI_DEVICE_INFO_WIRE_SIZE, KSI_DEVICE_INFO_WIRE_SIZE, &device))
-                return invalid_result(error, "device");
+                return invalid_result(connection, error, "device");
             if (!visitor(&device, context)) return KSI_STATUS_CANCELLED;
         }
         offset = next;
@@ -1548,7 +1665,7 @@ ksi_status ksi_get_gamepad_state(ksi_connection *connection, uint32_t device_id,
     ksi_status status = request(connection, KSI_OPCODE_GET_GAMEPAD_STATE,
         payload, sizeof(payload), connection->default_timeout_ms, &response, error);
     if (status != KSI_STATUS_OK) return status;
-    status = decode_status(connection->rx, response.payload_size, response.payload_size, error);
+    status = decode_status(connection, connection->rx, response.payload_size, response.payload_size, error);
     if (status != KSI_STATUS_OK) return status;
     if (response.flags != KSI_FRAME_FLAG_RESPONSE
         || response.payload_size < KSI_GAMEPAD_STATE_PREFIX_SIZE
@@ -1556,7 +1673,7 @@ ksi_status ksi_get_gamepad_state(ksi_connection *connection, uint32_t device_id,
             response.payload_size - KSI_STATUS_PAYLOAD_SIZE, state)
         || state->device_id != device_id
         || (generation != 0u && state->device_generation != generation))
-        return invalid_result(error, "gamepad state");
+        return invalid_result(connection, error, "gamepad state");
     clear_error(error);
     return KSI_STATUS_OK;
 }
@@ -1574,6 +1691,7 @@ ksi_status ksi_observer_next(ksi_connection *connection,
             message->kind = KSI_OBSERVER_SESSION_REVOKED;
             message->data.revoked_scopes = connection->pending_revoked_scopes;
             connection->pending_revoked_scopes = 0u;
+            update_buffered_readiness(connection);
             clear_error(error);
             return KSI_STATUS_OK;
         }
@@ -1581,6 +1699,7 @@ ksi_status ksi_observer_next(ksi_connection *connection,
             *message = connection->observer_notifications[connection->observer_head];
             connection->observer_head = (connection->observer_head + 1u) % KSI_CLIENT_NOTIFICATION_CAPACITY;
             connection->observer_count--;
+            update_buffered_readiness(connection);
             clear_error(error);
             return KSI_STATUS_OK;
         }
@@ -1589,6 +1708,7 @@ ksi_status ksi_observer_next(ksi_connection *connection,
             message->kind = KSI_OBSERVER_OVERFLOW;
             message->dropped_events = connection->observer_dropped;
             connection->observer_dropped = 0u;
+            update_buffered_readiness(connection);
             clear_error(error);
             return KSI_STATUS_OK;
         }
@@ -1598,7 +1718,7 @@ ksi_status ksi_observer_next(ksi_connection *connection,
         ksi_status status = receive_frame(connection, &header, wait, error);
         if (status != KSI_STATUS_OK) return status;
         if (header.flags == KSI_FRAME_FLAG_EVENT && queue_service_event(connection, &header)) continue;
-        return invalid_result(error, "observer frame");
+        return invalid_result(connection, error, "observer frame");
     }
 }
 
@@ -1624,7 +1744,7 @@ static ksi_status hook_subscription(
         KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE, &response, error);
     if (status == KSI_STATUS_OK && read_u32(connection->rx + 12u) != 0u) {
         set_error(error, 0u, 0, "service returned invalid hook state");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     if (status == KSI_STATUS_OK && active_operations != NULL) {
         *active_operations = (ksi_operations)read_u32(connection->rx + 8u);
@@ -1678,33 +1798,10 @@ ksi_status ksi_hook_next(
         ? 0u : monotonic_ms() + timeout_ms;
     for (;;) {
         ksi_wire_header header;
-        uint32_t wait_ms = KSI_CLIENT_HOOK_HEARTBEAT_MS;
-        ksi_status status;
-
-        if (timeout_ms != UINT32_MAX) {
-            int remaining = remaining_timeout(deadline, timeout_ms);
-            wait_ms = remaining < (int)KSI_CLIENT_HOOK_HEARTBEAT_MS
-                ? (uint32_t)remaining : KSI_CLIENT_HOOK_HEARTBEAT_MS;
-        }
-        status = receive_frame(connection, &header, wait_ms, error);
-
-        if (status == KSI_STATUS_TIMEOUT) {
-            status = send_frame(connection, KSI_OPCODE_PING, 0u, 0u,
-                NULL, 0u, 0u, error);
-            if (status != KSI_STATUS_OK) {
-                return status;
-            }
-            if (timeout_ms != UINT32_MAX
-                && remaining_timeout(deadline, timeout_ms) == 0) {
-                set_error(error, 0u, 0, "operation timed out");
-                return KSI_STATUS_TIMEOUT;
-            }
-            clear_error(error);
-            continue;
-        }
-        if (status != KSI_STATUS_OK) {
-            return status;
-        }
+        uint32_t wait_ms = timeout_ms == UINT32_MAX ? UINT32_MAX
+            : (uint32_t)remaining_timeout(deadline, timeout_ms);
+        ksi_status status = receive_frame(connection, &header, wait_ms, error);
+        if (status != KSI_STATUS_OK) return status;
         if (header.flags == KSI_FRAME_FLAG_EVENT
             && queue_service_event(connection, &header)) {
             if (pop_notification(connection, message)) {
@@ -1717,7 +1814,7 @@ ksi_status ksi_hook_next(
             || !decode_hook_event(connection->rx, header.payload_size,
                 header.request_id, &message->data.event)) {
             set_error(error, 0u, 0, "service returned an invalid hook frame");
-            return KSI_STATUS_INTERNAL;
+            return terminal_failure(connection, KSI_STATUS_INTERNAL);
         }
         message->struct_size = sizeof(*message);
         message->kind = KSI_HOOK_MESSAGE_EVENT;
@@ -1754,6 +1851,7 @@ ksi_status ksi_synthesize(
     const ksi_input *inputs,
     uint32_t input_count,
     uint32_t flags,
+    uint32_t *logical_modifiers_lr,
     ksi_error *error)
 {
     ksi_wire_header response;
@@ -1776,8 +1874,15 @@ ksi_status ksi_synthesize(
             return KSI_STATUS_INVALID_REQUEST;
         }
     }
-    return simple_request(connection, KSI_OPCODE_SYNTHESIZE_INPUT,
-        connection->tx, size, KSI_STATUS_PAYLOAD_SIZE, &response, error);
+    ksi_status status = simple_request(connection, KSI_OPCODE_SYNTHESIZE_INPUT,
+        connection->tx, size, KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE, &response, error);
+    if (status == KSI_STATUS_OK) {
+        if (read_u32(connection->rx + 12u) != 0u) return invalid_result(connection, error, "synthesis acknowledgement");
+        connection->sequence = read_u64(connection->rx + 16u);
+        if (connection->sequence == 0u) return invalid_result(connection, error, "synthesis sequence");
+        if (logical_modifiers_lr != NULL) *logical_modifiers_lr = read_u32(connection->rx + 8u);
+    }
+    return status;
 }
 
 ksi_status ksi_set_block_input(
@@ -1800,7 +1905,7 @@ ksi_status ksi_set_block_input(
         &response, error);
     if (status == KSI_STATUS_OK && read_u32(connection->rx + 12u) != 0u) {
         set_error(error, 0u, 0, "service returned invalid block-input state");
-        return KSI_STATUS_INTERNAL;
+        return terminal_failure(connection, KSI_STATUS_INTERNAL);
     }
     if (status == KSI_STATUS_OK && effective_mask != NULL) {
         *effective_mask = read_u32(connection->rx + 8u);
@@ -1836,7 +1941,7 @@ ksi_status ksi_get_indicator_state(
     }
     if (connection->rx[8u] > 1u || connection->rx[9u] > 1u
         || connection->rx[10u] > 1u || connection->rx[11u] != 0u) {
-        return invalid_result(error, "indicator-state");
+        return invalid_result(connection, error, "indicator-state");
     }
     memset(state, 0, sizeof(*state));
     state->struct_size = sizeof(*state);
@@ -1864,7 +1969,7 @@ ksi_status ksi_get_pointer_position(
     }
     if (connection->rx[8u] > 1u
         || !bytes_are_zero(connection->rx + 9u, 3u)) {
-        return invalid_result(error, "pointer-position");
+        return invalid_result(connection, error, "pointer-position");
     }
     memset(position, 0, sizeof(*position));
     position->struct_size = sizeof(*position);
@@ -1909,7 +2014,7 @@ ksi_status ksi_get_device_key_state(
     }
     if (connection->rx[12u] > 1u || connection->rx[13u] > 1u
         || connection->rx[14u] > 1u || connection->rx[15u] != 0u) {
-        return invalid_result(error, "key-state");
+        return invalid_result(connection, error, "key-state");
     }
     memset(state, 0, sizeof(*state));
     state->struct_size = sizeof(*state);
@@ -1941,7 +2046,7 @@ ksi_status ksi_get_pointer_buttons(
     }
     if (connection->rx[8u] > 1u
         || !bytes_are_zero(connection->rx + 9u, 3u)) {
-        return invalid_result(error, "pointer-buttons");
+        return invalid_result(connection, error, "pointer-buttons");
     }
     memset(buttons, 0, sizeof(*buttons));
     buttons->struct_size = sizeof(*buttons);
@@ -1969,7 +2074,7 @@ ksi_status ksi_get_idle_time(
     }
     if (connection->rx[8u] > 1u
         || !bytes_are_zero(connection->rx + 9u, 7u)) {
-        return invalid_result(error, "idle-time");
+        return invalid_result(connection, error, "idle-time");
     }
     memset(idle_time, 0, sizeof(*idle_time));
     idle_time->struct_size = sizeof(*idle_time);
@@ -1996,7 +2101,7 @@ ksi_status ksi_get_modifier_state(
     }
     if (connection->rx[16u] > 1u || connection->rx[17u] > 1u
         || connection->rx[18u] > 1u || connection->rx[19u] != 0u) {
-        return invalid_result(error, "modifier-state");
+        return invalid_result(connection, error, "modifier-state");
     }
     memset(state, 0, sizeof(*state));
     state->struct_size = sizeof(*state);

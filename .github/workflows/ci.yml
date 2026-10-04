@@ -60,7 +60,7 @@ jobs:
           ./build/keysharp-input info
           DESTDIR="$RUNNER_TEMP/install-root" cmake --install build
           test -x "$RUNNER_TEMP/install-root/usr/local/bin/keysharp-input"
-          test -f "$RUNNER_TEMP/install-root/usr/local/lib/libkeysharp-input.so.0"
+          test -f "$RUNNER_TEMP/install-root/usr/local/lib/libkeysharp-input.so.1"
           test -f "$RUNNER_TEMP/install-root/usr/local/include/keysharp_input/client.h"
           test -f "$RUNNER_TEMP/install-root/usr/local/include/keysharp_input/constants.h"
           test -f "$RUNNER_TEMP/install-root/etc/systemd/system/keysharp-input.service"

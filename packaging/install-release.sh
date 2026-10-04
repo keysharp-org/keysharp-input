@@ -5,9 +5,9 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=0.4.0
-expected_client_abi_major=0
-expected_client_abi_minor=4
+expected_version=1.0.0
+expected_client_abi_major=1
+expected_client_abi_minor=0
 
 usage() {
     echo "Usage: sudo ./install.sh [--skip-if-compatible]"
@@ -53,11 +53,11 @@ is_root_protected_executable() {
 }
 
 portable_library_payload() {
-    link=/usr/local/lib/libkeysharp-input.so.0
+    link=/usr/local/lib/libkeysharp-input.so.1
     [ -L "$link" ] || return 1
     resolved=$(readlink -f -- "$link" 2>/dev/null) || return 1
     case "$resolved" in
-        /usr/local/lib/libkeysharp-input.so.0.*) ;;
+        /usr/local/lib/libkeysharp-input.so.1.*) ;;
         *) return 1 ;;
     esac
     is_root_protected_file "$resolved" || return 1
@@ -336,10 +336,10 @@ installation_complete_for_channel() {
         package)
             binary=/usr/bin/keysharp-input
             library=$(first_existing_path \
-                /usr/lib/libkeysharp-input.so.0 \
-                /usr/lib64/libkeysharp-input.so.0 \
-                /usr/lib/x86_64-linux-gnu/libkeysharp-input.so.0 \
-                /usr/lib/aarch64-linux-gnu/libkeysharp-input.so.0) || return 1
+                /usr/lib/libkeysharp-input.so.1 \
+                /usr/lib64/libkeysharp-input.so.1 \
+                /usr/lib/x86_64-linux-gnu/libkeysharp-input.so.1 \
+                /usr/lib/aarch64-linux-gnu/libkeysharp-input.so.1) || return 1
             service=$(first_existing_path \
                 /usr/lib/systemd/system/keysharp-input.service \
                 /lib/systemd/system/keysharp-input.service) || return 1
@@ -355,10 +355,10 @@ installation_complete_for_channel() {
         portable)
             binary=/usr/local/bin/keysharp-input
             library=$(first_existing_path \
-                /usr/local/lib/libkeysharp-input.so.0 \
-                /usr/local/lib64/libkeysharp-input.so.0 \
-                /usr/local/lib/x86_64-linux-gnu/libkeysharp-input.so.0 \
-                /usr/local/lib/aarch64-linux-gnu/libkeysharp-input.so.0) \
+                /usr/local/lib/libkeysharp-input.so.1 \
+                /usr/local/lib64/libkeysharp-input.so.1 \
+                /usr/local/lib/x86_64-linux-gnu/libkeysharp-input.so.1 \
+                /usr/local/lib/aarch64-linux-gnu/libkeysharp-input.so.1) \
                 || return 1
             service=/etc/systemd/system/keysharp-input.service
             socket=/etc/systemd/system/keysharp-input.socket
@@ -387,7 +387,7 @@ installation_complete_for_channel() {
 archive_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 for required in \
     bin/keysharp-input \
-    lib/libkeysharp-input.so.0.4.0 \
+    lib/libkeysharp-input.so.1.0.0 \
     include/keysharp_input/client.h \
     include/keysharp_input/constants.h \
     include/keysharp_input/devices.h \
@@ -407,7 +407,7 @@ for required in \
     fi
 done
 
-if installed_debian_provider_satisfies keysharp-input-client-abi-0; then
+if installed_debian_provider_satisfies keysharp-input-client-abi-1; then
     if $skip_if_compatible && installation_complete_for_channel package; then
         echo "Compatible package-managed keysharp-input provider is already installed."
         exit 0
@@ -438,11 +438,11 @@ cleanup_install_temporary() {
     [ -z "$atomic_temporary" ] || rm -f -- "$atomic_temporary"
 }
 trap cleanup_install_temporary EXIT HUP INT TERM
-atomic_install_file "$archive_dir/lib/libkeysharp-input.so.0.4.0" \
-    /usr/local/lib/libkeysharp-input.so.0.4.0 0755
-atomic_install_symlink libkeysharp-input.so.0.4.0 \
-    /usr/local/lib/libkeysharp-input.so.0
-atomic_install_symlink libkeysharp-input.so.0 \
+atomic_install_file "$archive_dir/lib/libkeysharp-input.so.1.0.0" \
+    /usr/local/lib/libkeysharp-input.so.1.0.0 0755
+atomic_install_symlink libkeysharp-input.so.1.0.0 \
+    /usr/local/lib/libkeysharp-input.so.1
+atomic_install_symlink libkeysharp-input.so.1 \
     /usr/local/lib/libkeysharp-input.so
 atomic_install_file "$archive_dir/bin/keysharp-input" \
     /usr/local/bin/keysharp-input 0755

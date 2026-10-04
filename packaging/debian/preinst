@@ -80,15 +80,15 @@ if portable_socket_conflicts; then
     conflicts="${conflicts} ${portable_socket}"
 fi
 for portable_library in \
-    /usr/local/lib/libkeysharp-input.so.0 \
-    /usr/local/lib64/libkeysharp-input.so.0 \
-    /usr/local/lib/x86_64-linux-gnu/libkeysharp-input.so.0 \
-    /usr/local/lib/aarch64-linux-gnu/libkeysharp-input.so.0; do
+    /usr/local/lib/libkeysharp-input.so.1 \
+    /usr/local/lib64/libkeysharp-input.so.1 \
+    /usr/local/lib/x86_64-linux-gnu/libkeysharp-input.so.1 \
+    /usr/local/lib/aarch64-linux-gnu/libkeysharp-input.so.1; do
     if portable_library_conflicts "$portable_library" \
-        /usr/lib/libkeysharp-input.so.0 \
-        /usr/lib64/libkeysharp-input.so.0 \
-        /usr/lib/x86_64-linux-gnu/libkeysharp-input.so.0 \
-        /usr/lib/aarch64-linux-gnu/libkeysharp-input.so.0; then
+        /usr/lib/libkeysharp-input.so.1 \
+        /usr/lib64/libkeysharp-input.so.1 \
+        /usr/lib/x86_64-linux-gnu/libkeysharp-input.so.1 \
+        /usr/lib/aarch64-linux-gnu/libkeysharp-input.so.1; then
         conflicts="${conflicts} ${portable_library}"
     fi
 done

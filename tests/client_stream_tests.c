@@ -4,9 +4,19 @@
 #undef NDEBUG
 #include <assert.h>
 #include <stdint.h>
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <poll.h>
+
+_Static_assert(sizeof(ksi_service_info) == 64u, "service-info layout");
+_Static_assert(sizeof(ksi_connect_options) == 72u, "connect-options layout");
+_Static_assert(sizeof(ksi_key_state) == 224u, "keyboard-state layout");
+_Static_assert(sizeof(ksi_lease_message) == 288u, "lease-message layout");
+_Static_assert(offsetof(ksi_lease_message, state) == 32u, "lease keyboard-state offset");
 
 #define LE32(value) \
     (uint8_t)((uint32_t)(value)), \
@@ -17,6 +27,8 @@
 #define HOOK_REQUEST_ID UINT64_C(17)
 
 ksi_connection *ksi_client_test_adopt_descriptor(int descriptor);
+void ksi_client_test_set_role(ksi_connection *connection, uint32_t role);
+void ksi_client_test_set_timeout(ksi_connection *connection, uint32_t timeout_ms);
 void ksi_client_test_set_outstanding_hook_request(
     ksi_connection *connection, uint64_t request_id);
 
@@ -192,8 +204,220 @@ static void check_case(const round_trip_case *test)
     assert(close(sockets[1]) == 0);
 }
 
+static void write_u64(uint8_t *bytes, uint64_t value)
+{
+    for (size_t i = 0u; i < 8u; i++) bytes[i] = (uint8_t)(value >> (8u * i));
+}
+
+static void write_event_header(uint8_t *header, uint16_t opcode, uint32_t size)
+{
+    memset(header, 0, KSI_FRAME_HEADER_SIZE);
+    memcpy(header, KSI_FRAME_MAGIC, 4u);
+    ksi_device_write(header + 4u, KSI_PROTOCOL_MAJOR, 2u);
+    ksi_device_write(header + 8u, opcode, 2u);
+    ksi_device_write(header + 10u, KSI_FRAME_FLAG_EVENT, 2u);
+    ksi_device_write(header + 12u, size, 4u);
+}
+
+static void check_pollable_drain(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    ksi_connection *connection = ksi_client_test_adopt_descriptor(sockets[0]);
+    assert(connection != NULL);
+    ksi_error error; ksi_error_init(&error);
+    ksi_lease_message message; ksi_lease_message_init(&message);
+    struct pollfd descriptor = { .fd = ksi_connection_fd(connection), .events = POLLIN };
+    assert(descriptor.fd >= 0 && poll(&descriptor, 1u, 0) == 0);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_TIMEOUT);
+    uint8_t header[KSI_FRAME_HEADER_SIZE], payload[8u] = { 0 };
+    write_event_header(header, KSI_OPCODE_SESSION_GRANTED, sizeof(payload));
+    ksi_device_write(payload, KSI_SCOPE_INPUT_CONTROL, 4u);
+    transfer(sockets[1], header, 7u, true);
+    assert(poll(&descriptor, 1u, 0) == 1);
+    assert(ksi_lease_next(connection, 1u, &message, &error) == KSI_STATUS_TIMEOUT);
+    assert(poll(&descriptor, 1u, 0) == 0);
+    transfer(sockets[1], header + 7u, sizeof(header) - 7u, true);
+    transfer(sockets[1], payload, 3u, true);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_TIMEOUT);
+    transfer(sockets[1], payload + 3u, sizeof(payload) - 3u, true);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+    assert(message.kind == KSI_LEASE_GRANTED && message.granted_scopes == KSI_SCOPE_INPUT_CONTROL);
+    assert(poll(&descriptor, 1u, 0) == 0);
+    // A synchronous reply can consume events whose kernel bytes no longer exist.
+    transfer(sockets[1], header, sizeof(header), true);
+    transfer(sockets[1], payload, sizeof(payload), true);
+    write_success(sockets[1], KSI_OPCODE_PING, KSI_STATUS_PAYLOAD_SIZE);
+    assert(ksi_ping(connection, &error) == KSI_STATUS_OK);
+    assert(poll(&descriptor, 1u, 0) == 1);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+    assert(poll(&descriptor, 1u, 0) == 0);
+    ksi_client_test_set_role(connection, KSI_ROLE_AUTHORIZATION_LEASE);
+    uint8_t state_payload[KSI_KEY_STATE_EVENT_PAYLOAD_SIZE] = { 0 };
+    ksi_device_write(state_payload, KSI_LEASE_KEYBOARD_SNAPSHOT, 4u);
+    ksi_device_write(state_payload + 4u, 0x20u, 4u);
+    write_u64(state_payload + 8u, 17u);
+    ksi_device_write(state_payload + 16u, 0x10u, 4u);
+    state_payload[20u] = 1u;
+    state_payload[24u + 5u] = 4u;
+    write_event_header(header, KSI_OPCODE_KEY_STATE_EVENT, sizeof(state_payload));
+    transfer(sockets[1], header, sizeof(header), true);
+    transfer(sockets[1], state_payload, sizeof(state_payload), true);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+    assert(message.kind == KSI_LEASE_KEYBOARD_SNAPSHOT && message.sequence == 17u);
+    assert(message.physical_modifiers_lr == 0x20u && message.state.modifiers_lr == 0x10u);
+    assert(message.state.caps_lock == 1u && message.state.logical_keys[5u] == 4u);
+    ksi_device_write(state_payload, KSI_LEASE_KEYBOARD_DELTA, 4u);
+    write_u64(state_payload + 8u, 19u);
+    transfer(sockets[1], header, sizeof(header), true);
+    transfer(sockets[1], state_payload, sizeof(state_payload), true);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK && message.sequence == 19u);
+    ksi_device_write(state_payload, KSI_LEASE_KEYBOARD_SNAPSHOT, 4u);
+    transfer(sockets[1], header, sizeof(header), true);
+    transfer(sockets[1], state_payload, sizeof(state_payload), true);
+    uint8_t response_header[KSI_FRAME_HEADER_SIZE];
+    write_event_header(response_header, KSI_OPCODE_KEY_STATE_SUBSCRIBE, KSI_STATUS_PAYLOAD_SIZE);
+    ksi_device_write(response_header + 10u, KSI_FRAME_FLAG_RESPONSE, 2u);
+    write_u64(response_header + 16u, 2u);
+    uint8_t status_payload[KSI_STATUS_PAYLOAD_SIZE] = { 0 };
+    transfer(sockets[1], response_header, sizeof(response_header), true);
+    transfer(sockets[1], status_payload, sizeof(status_payload), true);
+    assert(ksi_key_state_subscribe(connection, &error) == KSI_STATUS_OK);
+    assert(poll(&descriptor, 1u, 0) == 1);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+    assert(message.kind == KSI_LEASE_KEYBOARD_SNAPSHOT && message.sequence == 19u);
+    for (uint64_t sequence = 20u; sequence <= 51u; sequence++) {
+        ksi_device_write(state_payload, KSI_LEASE_KEYBOARD_DELTA, 4u);
+        write_u64(state_payload + 8u, sequence);
+        transfer(sockets[1], header, sizeof(header), true);
+        transfer(sockets[1], state_payload, sizeof(state_payload), true);
+    }
+    write_event_header(response_header, KSI_OPCODE_AUTHORIZE, KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE);
+    ksi_device_write(response_header + 10u, KSI_FRAME_FLAG_RESPONSE, 2u);
+    write_u64(response_header + 16u, 3u);
+    uint8_t authorize_result[KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE] = { 0 };
+    ksi_device_write(authorize_result + 8u, KSI_SCOPE_INPUT_MONITORING, 4u);
+    transfer(sockets[1], response_header, sizeof(response_header), true);
+    transfer(sockets[1], authorize_result, sizeof(authorize_result), true);
+    ksi_permission_scopes granted;
+    assert(ksi_authorize(connection, KSI_AUTH_CHECK, KSI_SCOPE_INPUT_MONITORING, &granted, &error) == KSI_STATUS_OK);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+    assert(message.kind == KSI_LEASE_KEYBOARD_SNAPSHOT && message.sequence == 51u);
+    assert(poll(&descriptor, 1u, 0) == 0);
+    // Drain pending data before reporting the peer's shutdown.
+    write_event_header(header, KSI_OPCODE_SESSION_GRANTED, sizeof(payload));
+    transfer(sockets[1], header, sizeof(header), true);
+    transfer(sockets[1], payload, sizeof(payload), true);
+    close(sockets[1]);
+    assert(poll(&descriptor, 1u, 0) == 1);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+    assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_UNAVAILABLE);
+    assert(ksi_ping(connection, &error) == KSI_STATUS_UNAVAILABLE);
+    ksi_disconnect(connection);
+}
+
+static uint64_t test_milliseconds(void)
+{
+    struct timespec now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static void *write_state_burst(void *context)
+{
+    int fd = *(int *)context;
+    uint8_t header[KSI_FRAME_HEADER_SIZE], state[KSI_KEY_STATE_EVENT_PAYLOAD_SIZE] = { 0 };
+    write_event_header(header, KSI_OPCODE_KEY_STATE_EVENT, sizeof(state));
+    ksi_device_write(state, KSI_LEASE_KEYBOARD_DELTA, 4u);
+    for (uint64_t sequence = 1u; sequence <= 10u; sequence++) {
+        write_u64(state + 8u, sequence);
+        if (send(fd, header, sizeof(header), MSG_NOSIGNAL) != (ssize_t)sizeof(header)
+            || send(fd, state, sizeof(state), MSG_NOSIGNAL) != (ssize_t)sizeof(state)) break;
+        /* The fixture publishes often enough to keep resetting a relative timeout. */
+        struct timespec interval = { .tv_nsec = 30000000L };
+        while (nanosleep(&interval, &interval) != 0) assert(errno == EINTR);
+    }
+    return NULL;
+}
+
+static void check_response_deadline(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    ksi_connection *connection = ksi_client_test_adopt_descriptor(sockets[0]);
+    assert(connection != NULL);
+    ksi_client_test_set_timeout(connection, 80u);
+    pthread_t producer;
+    assert(pthread_create(&producer, NULL, write_state_burst, &sockets[1]) == 0);
+    ksi_error error; ksi_error_init(&error);
+    uint64_t before = test_milliseconds();
+    assert(ksi_ping(connection, &error) == KSI_STATUS_TIMEOUT);
+    assert(test_milliseconds() - before < 250u);
+    assert(pthread_join(producer, NULL) == 0);
+    ksi_lease_message message; ksi_lease_message_init(&message);
+    ksi_status status;
+    while ((status = ksi_lease_next(connection, 0u, &message, &error)) == KSI_STATUS_OK) {}
+    assert(status == KSI_STATUS_UNAVAILABLE);
+    struct pollfd ready = { .fd = ksi_connection_fd(connection), .events = POLLIN };
+    assert(poll(&ready, 1u, 0) == 1);
+    assert(ksi_ping(connection, &error) == KSI_STATUS_UNAVAILABLE);
+    ksi_disconnect(connection); close(sockets[1]);
+}
+
+static void check_terminal_readiness(void)
+{
+    for (unsigned malformed = 0u; malformed < 2u; malformed++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+        ksi_connection *connection = ksi_client_test_adopt_descriptor(sockets[0]);
+        assert(connection != NULL);
+        uint8_t header[KSI_FRAME_HEADER_SIZE], grant[8u] = { 0 };
+        write_event_header(header, KSI_OPCODE_SESSION_GRANTED, sizeof(grant));
+        ksi_device_write(grant, KSI_SCOPE_INPUT_CONTROL, 4u);
+        transfer(sockets[1], header, sizeof(header), true);
+        transfer(sockets[1], grant, sizeof(grant), true);
+        write_event_header(header, KSI_OPCODE_SESSION_GRANTED, sizeof(grant));
+        if (malformed == 0u) header[4u] = KSI_PROTOCOL_MAJOR - 1u;
+        else ksi_device_write(header + 10u, 0xffffu, 2u);
+        transfer(sockets[1], header, sizeof(header), true);
+        ksi_error error; ksi_error_init(&error);
+        ksi_status expected = malformed == 0u ? KSI_STATUS_UNSUPPORTED : KSI_STATUS_INTERNAL;
+        assert(ksi_ping(connection, &error) == expected);
+        ksi_lease_message message; ksi_lease_message_init(&message);
+        assert(ksi_lease_next(connection, 0u, &message, &error) == KSI_STATUS_OK);
+        struct pollfd ready = { .fd = ksi_connection_fd(connection), .events = POLLIN };
+        assert(poll(&ready, 1u, 0) == 1);
+        assert(ksi_lease_next(connection, 0u, &message, &error) == expected);
+        assert(poll(&ready, 1u, 0) == 1);
+        ksi_disconnect(connection); close(sockets[1]);
+    }
+    for (unsigned malformed = 0u; malformed < 2u; malformed++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+        ksi_connection *connection = ksi_client_test_adopt_descriptor(sockets[0]);
+        assert(connection != NULL);
+        uint8_t header[KSI_FRAME_HEADER_SIZE], payload[KSI_BLOCK_INPUT_RESULT_PAYLOAD_SIZE] = { 0 };
+        uint32_t size = malformed == 0u ? KSI_STATUS_PAYLOAD_SIZE + 4u : sizeof(payload);
+        write_event_header(header, malformed == 0u ? KSI_OPCODE_PING : KSI_OPCODE_SET_BLOCK_INPUT, size);
+        ksi_device_write(header + 10u, KSI_FRAME_FLAG_RESPONSE, 2u);
+        write_u64(header + 16u, 1u);
+        if (malformed != 0u) payload[12u] = 1u;
+        transfer(sockets[1], header, sizeof(header), true);
+        transfer(sockets[1], payload, size, true);
+        ksi_error error; ksi_error_init(&error);
+        assert((malformed == 0u ? call_ping(connection, &error) : call_block_input(connection, &error)) == KSI_STATUS_INTERNAL);
+        struct pollfd ready = { .fd = ksi_connection_fd(connection), .events = POLLIN };
+        assert(poll(&ready, 1u, 0) == 1);
+        ksi_disconnect(connection); close(sockets[1]);
+    }
+}
+
 int main(void)
 {
+    alarm(5u);
+    check_response_deadline();
+    check_terminal_readiness();
+    check_pollable_drain();
     for (size_t index = 0u; index < sizeof(cases) / sizeof(cases[0]); index++)
         check_case(&cases[index]);
     return 0;

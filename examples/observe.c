@@ -7,20 +7,29 @@ int main(void)
     ksi_service_info info;
     ksi_error error;
     ksi_connection *connection = NULL;
+    ksi_connection *lease = NULL;
     ksi_permission_scopes granted;
     ksi_operations active;
     ksi_connect_options_init(&options);
     ksi_service_info_init(&info);
     ksi_error_init(&error);
+    options.role = KSI_ROLE_AUTHORIZATION_LEASE;
+    options.requested_scopes = 0u;
+    if (ksi_connect(&options, &lease, &info, &error) != KSI_STATUS_OK
+        || ksi_authorize(lease, KSI_AUTH_REQUEST, KSI_SCOPE_INPUT_MONITORING,
+            &granted, &error) != KSI_STATUS_OK) {
+        fprintf(stderr, "%s\n", error.message);
+        ksi_disconnect(lease);
+        return 1;
+    }
     options.role = KSI_ROLE_OBSERVER_STREAM;
-    options.requested_scopes = KSI_SCOPE_INPUT_MONITORING;
+    options.lease_id = info.lease_id;
     if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
-        || ksi_authorize(connection, KSI_AUTH_REQUEST, KSI_SCOPE_INPUT_MONITORING,
-            &granted, &error) != KSI_STATUS_OK
         || ksi_hook_subscribe(connection, KSI_HOOK_KEYBOARD, &active, &error) != KSI_STATUS_OK
         || ksi_hook_subscribe(connection, KSI_HOOK_MOUSE, &active, &error) != KSI_STATUS_OK) {
         fprintf(stderr, "%s\n", error.message);
         ksi_disconnect(connection);
+        ksi_disconnect(lease);
         return 1;
     }
     for (;;) {
@@ -39,5 +48,6 @@ int main(void)
         } else if (message.kind == KSI_OBSERVER_SESSION_REVOKED) break;
     }
     ksi_disconnect(connection);
+    ksi_disconnect(lease);
     return 0;
 }

@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+#if defined(__cplusplus)
+#  define KSI_ALIGN64 alignas(8)
+#else
+#  define KSI_ALIGN64 _Alignas(8)
+#endif
+
 #define KSI_DEVICE_NAME_CAPACITY 256u
 #define KSI_DEVICE_PATH_CAPACITY 512u
 #define KSI_DEVICE_PHYSICAL_CAPACITY 256u
@@ -55,13 +61,13 @@ enum {
 typedef struct ksi_raw_input_event {
     uint32_t struct_size;
     uint32_t device_id;
-    uint64_t time_ms;
+    KSI_ALIGN64 uint64_t time_ms;
     uint16_t type;
     uint16_t code;
     int32_t value;
     uint32_t flags;
     uint32_t reserved0;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_raw_input_event;
 
 typedef struct ksi_device_info {
@@ -87,7 +93,7 @@ typedef struct ksi_device_info {
     uint32_t button_count;
     uint32_t reserved2;
     uint16_t button_codes[KSI_DEVICE_BUTTON_CAPACITY];
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_device_info;
 
 typedef struct ksi_gamepad_axis_state {
@@ -103,12 +109,12 @@ typedef struct ksi_gamepad_axis_state {
 typedef struct ksi_gamepad_state {
     uint32_t struct_size;
     uint32_t device_id;
-    uint64_t device_generation;
+    KSI_ALIGN64 uint64_t device_generation;
     uint32_t button_count;
     uint32_t axis_count;
     uint8_t buttons[KSI_DEVICE_BUTTON_BITMAP_BYTES];
     ksi_gamepad_axis_state axes[KSI_DEVICE_AXIS_CAPACITY];
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_gamepad_state;
 
 #endif

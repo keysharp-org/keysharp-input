@@ -194,7 +194,7 @@ jobs:
           mv "$package" "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb"
           abi_minor=$(awk '/^#define KSI_CLIENT_ABI_MINOR / { gsub(/u/, "", $3); print $3 }' include/keysharp_input/client.h)
           test "$(dpkg-deb -f "dist/keysharp-input_${VERSION}_${DEB_ARCH}.deb" Provides)" = \
-            "keysharp-input-client-abi-0 (= 0.${abi_minor})"
+            "keysharp-input-client-abi-1 (= 1.${abi_minor})"
 
       - name: Attest release binaries
         uses: actions/attest@v4

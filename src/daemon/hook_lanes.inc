@@ -159,6 +159,8 @@ static void output_queue_wake(const ksi_output_queue *q)
     }
 
     wake_pipe_write(q->wake_write_fd);
+    if (q->state != NULL && q->state->commands != NULL)
+        ksi_pipe_ring_wake(&q->state->commands->ring);
 }
 
 static void output_queue_close(ksi_output_queue *q)
@@ -469,6 +471,7 @@ static void output_queue_sync_owners(ksi_daemon_state *state)
     pthread_mutex_lock(&q->mutex);
     q->owner_count = 0u;
     for (nfds_t i = 0u; i < state->client_count; i++) {
+        if (state->clients[i].authorization_lease != NULL && !state->clients[i].authorization_lease->active) continue;
         q->owners[q->owner_count].connection_id = state->clients[i].connection_id;
         q->owners[q->owner_count++].hooks = state->clients[i].hook_subscriptions
             & (uint32_t)~state->clients[i].quarantined_hooks;
@@ -601,7 +604,7 @@ static void synth_completion_send_result(
     uint32_t status,
     uint32_t detail)
 {
-    uint8_t payload[KSI_STATUS_PAYLOAD_SIZE];
+    uint8_t payload[KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE] = { 0 };
 
     /* A completion without a sender only keeps its batch atomic while hooks run. */
     if (completion == NULL || completion->send_ref == NULL) {
@@ -623,13 +626,20 @@ static void synth_completion_send_result(
      * response (menu-mask down/up deliberately use separate requests). */
     if (can_reply) {
         ksi_status_encode(payload, status, detail);
+        if (status == KSI_STATUS_OK) {
+            if (completion->state != NULL) {
+                publish_keyboard_states(completion->state);
+                ksi_wire_write_u32(payload + 8u, completion->state->keyboard_snapshot.modifiers_lr);
+                ksi_wire_write_u64(payload + 16u, completion->state->keyboard_sequence);
+            } else ksi_wire_write_u64(payload + 16u, 1u);
+        }
         if (hook_send_ref_send(
                 completion->send_ref,
                 KSI_OPCODE_SYNTHESIZE_INPUT,
                 KSI_FRAME_FLAG_RESPONSE,
                 completion->request_id,
                 payload,
-                sizeof(payload)) != 0) {
+                status == KSI_STATUS_OK ? sizeof(payload) : KSI_STATUS_PAYLOAD_SIZE) != 0) {
             hook_send_ref_invalidate(completion->send_ref);
         }
     } else {
@@ -660,11 +670,18 @@ static void synth_completion_release_one(ksi_synth_completion *completion)
         atomic_fetch_sub(&completion->state->active_synthetic_transactions, 1u);
     }
 
+    if (completion->state != NULL && completion->state->commands != NULL) {
+        ksi_daemon_command command = { .type = KSI_DAEMON_COMMAND_SYNTH_ACK };
+        command.data.synth_ack = completion;
+        if (ksi_pipe_ring_push(&completion->state->commands->ring, &command)) return;
+        hook_send_ref_invalidate(completion->send_ref);
+        synth_completion_destroy(completion);
+        return;
+    }
     terminal_result = atomic_load(&completion->terminal_result);
     status_bits = (uint32_t)terminal_result;
     status = status_bits;
-    synth_completion_send_result(
-        completion, status, (uint32_t)(terminal_result >> 32u));
+    synth_completion_send_result(completion, status, (uint32_t)(terminal_result >> 32u));
     synth_completion_destroy(completion);
 }
 

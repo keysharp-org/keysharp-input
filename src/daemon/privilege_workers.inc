@@ -11,9 +11,6 @@ typedef struct ksi_identify_task {
     uint64_t start_time;
     int client_fd;
     uint64_t connection_id;
-    bool revalidate;
-    ksp_identity identity;
-    ksi_hook_send_ref *send_ref;
 } ksi_identify_task;
 
 typedef struct ksi_prompt_task {
@@ -39,37 +36,18 @@ static void *identify_worker(void *arg)
 
     result = calloc(1, sizeof(*result));
 
-    if (result != NULL) {
-        ksp_identity identity;
-        result->has_identity = task->revalidate
-            ? ksp_identity_revalidate_cached(&task->identity, &identity) == 0
-            : ksp_identity_identify(task->pid, task->uid, task->start_time, &identity) == 0;
-        if (result->has_identity) {
-            result->identity = identity;
-            (void)snprintf(result->exe_path, sizeof(result->exe_path),
-                "%s", identity.executable);
-            (void)snprintf(result->exe_hash, sizeof(result->exe_hash),
-                "%s", identity.hash);
-            result->start_time = identity.start_time;
-        }
-    }
+    if (result != NULL)
+        result->has_identity = ksp_identity_identify(task->pid, task->uid,
+            task->start_time, &result->identity) == 0;
 
     memset(&command, 0, sizeof(command));
-    command.type = task->revalidate ? KSI_DAEMON_COMMAND_CLIENT_REVALIDATED
-        : KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED;
+    command.type = KSI_DAEMON_COMMAND_CLIENT_IDENTIFIED;
     command.client_fd = task->client_fd;
     command.connection_id = task->connection_id;
     command.data.identified.result = result;
 
-    if (task->revalidate && (result == NULL || !result->has_identity)) {
-        hook_send_ref_invalidate(task->send_ref);
-    }
-    if (!ksi_pipe_ring_push(&task->commands->ring, &command)) {
-        if (task->revalidate) hook_send_ref_invalidate(task->send_ref);
-        free(result);
-    }
+    if (!ksi_pipe_ring_push(&task->commands->ring, &command)) free(result);
 
-    if (task->send_ref != NULL) hook_send_ref_release(task->send_ref);
     free(task);
     return NULL;
 }
@@ -101,35 +79,6 @@ static bool start_identify_task(
         return false;
     }
 
-    return true;
-}
-
-static void free_revalidation_task(void *context)
-{
-    ksi_identify_task *task = context;
-    hook_send_ref_release(task->send_ref);
-    free(task);
-}
-
-static bool start_revalidation_task(ksi_daemon_state *state, ksi_client *client)
-{
-    ksi_identify_task *task = calloc(1u, sizeof(*task));
-    if (task == NULL || !hook_send_ref_acquire(client->hook_send_ref)) {
-        free(task);
-        return false;
-    }
-    task->commands = state->commands;
-    task->client_fd = client->fd;
-    task->connection_id = client->connection_id;
-    task->revalidate = true;
-    task->identity = client->identity;
-    task->send_ref = client->hook_send_ref;
-    if (!ksi_worker_pool_submit(&g_identify_worker_pool, identify_worker,
-            free_revalidation_task, task)) {
-        free_revalidation_task(task);
-        return false;
-    }
-    client->revalidation_pending = true;
     return true;
 }
 
@@ -237,11 +186,7 @@ static bool start_prompt_task(
     uint64_t connection_id,
     uint32_t requested,
     uint32_t missing,
-    const char *exe_path,
-    const char *exe_hash,
-    pid_t pid,
-    uid_t uid,
-    uint64_t start_time)
+    const ksp_identity *identity)
 {
     ksi_prompt_task *task;
     task = malloc(sizeof(*task));
@@ -265,15 +210,7 @@ static bool start_prompt_task(
     task->connection_id = connection_id;
     task->requested_scopes = requested;
     task->missing_scopes = missing;
-    memset(&task->identity, 0, sizeof(task->identity));
-    task->identity.pid = pid;
-    task->identity.uid = uid;
-    task->identity.start_time = start_time;
-    (void)snprintf(task->identity.executable,
-        sizeof(task->identity.executable), "%s",
-        exe_path != NULL ? exe_path : "");
-    (void)snprintf(task->identity.hash, sizeof(task->identity.hash), "%s",
-        exe_hash != NULL ? exe_hash : "");
+    task->identity = *identity;
 
     if (!ksi_worker_pool_submit(&g_worker_pool, prompt_worker, free_prompt_task, task)) {
         free_prompt_task(task);

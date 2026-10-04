@@ -24,8 +24,8 @@
 extern "C" {
 #endif
 
-#define KSI_CLIENT_ABI_MAJOR 0u
-#define KSI_CLIENT_ABI_MINOR 4u
+#define KSI_CLIENT_ABI_MAJOR 1u
+#define KSI_CLIENT_ABI_MINOR 0u
 #define KSI_DEFAULT_SOCKET_PATH "/run/keysharp-input/keysharp-input.sock"
 #define KSI_SOCKET_ENV "KEYSHARP_INPUT_SOCKET"
 
@@ -41,7 +41,7 @@ typedef struct ksi_error {
     int32_t system_error;
     uint32_t reserved0;
     char message[KSI_ERROR_MESSAGE_CAPACITY];
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_error;
 
 typedef struct ksi_connect_options {
@@ -52,7 +52,10 @@ typedef struct ksi_connect_options {
     const char *socket_path;
     uint32_t timeout_ms;
     uint32_t flags;
-    uint64_t reserved[4];
+    /* Zero for a lease; other roles attach to the ID returned by its HELLO.
+     * Binding requires the same process identity and ends when the lease closes. */
+    KSI_ALIGN64 uint64_t lease_id;
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_connect_options;
 
 typedef struct ksi_service_info {
@@ -60,18 +63,19 @@ typedef struct ksi_service_info {
     uint32_t abi_major;
     uint32_t abi_minor;
     uint32_t granted_scopes;
-    uint64_t available_operations;
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t available_operations;
+    KSI_ALIGN64 uint64_t lease_id;
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_service_info;
 
 typedef struct ksi_permission_entry {
     uint32_t struct_size;
     uint32_t scopes;
-    uint64_t granted_at_utc;
+    KSI_ALIGN64 uint64_t granted_at_utc;
     char hash[KSI_PERMISSION_HASH_HEX_SIZE];
     char executable[KSI_EXECUTABLE_PATH_SIZE];
     uint8_t reserved[7];
-    uint64_t reserved64[4];
+    KSI_ALIGN64 uint64_t reserved64[4];
 } ksi_permission_entry;
 
 typedef struct ksi_permission_revoke {
@@ -79,10 +83,10 @@ typedef struct ksi_permission_revoke {
     uint32_t target_kind;
     uint32_t scopes;
     uint32_t reserved0;
-    uint64_t pid;
+    KSI_ALIGN64 uint64_t pid;
     char hash[KSI_PERMISSION_HASH_HEX_SIZE];
     uint8_t reserved1[7];
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_permission_revoke;
 
 /* Return true to continue. False drains the response and returns CANCELLED. */
@@ -108,6 +112,14 @@ KSI_API ksi_status ksi_connect(
     ksi_service_info *service_info,
     ksi_error *error);
 KSI_API void ksi_disconnect(ksi_connection *connection);
+/* Borrowed poll descriptor: readable for queued messages, socket input, EOF or
+ * errors. Drain *_next(..., 0, ...) until TIMEOUT before polling. Partial frames
+ * survive TIMEOUT; EOF returns UNAVAILABLE after preceding messages drain. */
+KSI_API int ksi_connection_fd(const ksi_connection *connection);
+/* Last successful synthesis acknowledgement in the lease keyboard sequence. */
+KSI_API uint64_t ksi_connection_sequence(const ksi_connection *connection);
+/* Authorization changes belong to the lease alone. Its reply follows the grant
+ * event and replacement keyboard snapshot, when subscribed. */
 KSI_API ksi_status ksi_authorize(
     ksi_connection *connection,
     ksi_authorization_mode authorization_mode,
@@ -115,8 +127,6 @@ KSI_API ksi_status ksi_authorize(
     ksi_permission_scopes *granted_scopes,
     ksi_error *error);
 KSI_API ksi_status ksi_ping(ksi_connection *connection, ksi_error *error);
-KSI_API ksi_permission_scopes ksi_connection_granted_scopes(
-    const ksi_connection *connection);
 KSI_API ksi_operations ksi_connection_available_operations(
     const ksi_connection *connection);
 
@@ -130,24 +140,14 @@ KSI_API ksi_status ksi_permissions_revoke(
     const ksi_permission_revoke *request,
     ksi_error *error);
 
-/* Waits for a revocation on an authorization-lease connection. A timeout of
- * UINT32_MAX waits indefinitely. */
-KSI_API ksi_status ksi_lease_next(
-    ksi_connection *connection,
-    uint32_t timeout_ms,
-    ksi_permission_scopes *revoked_scopes,
-    ksi_error *error);
-KSI_API ksi_permission_scopes ksi_lease_granted_scopes(
-    const ksi_connection *connection);
-
 typedef struct ksi_keyboard_input {
     uint16_t vk;
     uint16_t scan;
     uint32_t flags;
     uint32_t time;
     uint32_t reserved0;
-    uint64_t extra_info;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t extra_info;
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_keyboard_input;
 
 typedef struct ksi_mouse_input {
@@ -157,8 +157,8 @@ typedef struct ksi_mouse_input {
     uint32_t flags;
     uint32_t time;
     uint32_t reserved0;
-    uint64_t extra_info;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t extra_info;
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_mouse_input;
 
 typedef struct ksi_input {
@@ -168,7 +168,7 @@ typedef struct ksi_input {
         ksi_keyboard_input keyboard;
         ksi_mouse_input mouse;
     } data;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_input;
 
 typedef struct ksi_keyboard_hook_event {
@@ -176,8 +176,8 @@ typedef struct ksi_keyboard_hook_event {
     uint32_t vk_code;
     uint32_t scan_code;
     uint32_t flags;
-    uint64_t time_ms;
-    uint64_t extra_info;
+    KSI_ALIGN64 uint64_t time_ms;
+    KSI_ALIGN64 uint64_t extra_info;
     uint32_t device_id;
     uint32_t reserved0;
 } ksi_keyboard_hook_event;
@@ -189,8 +189,8 @@ typedef struct ksi_mouse_hook_event {
     uint32_t mouse_data;
     uint32_t flags;
     uint32_t reserved0;
-    uint64_t time_ms;
-    uint64_t extra_info;
+    KSI_ALIGN64 uint64_t time_ms;
+    KSI_ALIGN64 uint64_t extra_info;
     uint32_t device_id;
     int32_t delta_x;
     int32_t delta_y;
@@ -200,12 +200,12 @@ typedef struct ksi_mouse_hook_event {
 typedef struct ksi_hook_event {
     uint32_t struct_size;
     uint32_t hook_type;
-    uint64_t request_id;
+    KSI_ALIGN64 uint64_t request_id;
     union {
         ksi_keyboard_hook_event keyboard;
         ksi_mouse_hook_event mouse;
     } event;
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_hook_event;
 
 typedef struct ksi_hook_reply {
@@ -214,7 +214,7 @@ typedef struct ksi_hook_reply {
     const ksi_input *inputs;
     uint32_t input_count;
     uint32_t reserved0;
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_hook_reply;
 
 typedef struct ksi_hook_quarantined {
@@ -222,10 +222,10 @@ typedef struct ksi_hook_quarantined {
     uint32_t hook_type;
     uint32_t reason;
     uint32_t generation;
-    uint64_t event_id;
+    KSI_ALIGN64 uint64_t event_id;
     uint32_t strike_count;
     uint32_t retry_after_ms;
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_hook_quarantined;
 
 typedef uint32_t ksi_hook_message_kind;
@@ -243,7 +243,7 @@ typedef struct ksi_hook_message {
         ksi_hook_quarantined quarantined;
         ksi_permission_scopes revoked_scopes;
     } data;
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_hook_message;
 
 typedef ksi_status (*ksi_nested_hook_handler)(
@@ -278,15 +278,15 @@ KSI_API ksi_status ksi_hook_reply_event(
     const ksi_hook_event *event,
     const ksi_hook_reply *reply,
     ksi_error *error);
-/* Returns once every hook, the caller's own included, has seen the input, as
- * Win32 SendInput does, or once it is queued when KSI_SYNTH_BYPASS_HOOK is set
- * or no hook is subscribed. The status reports whether the input was admitted,
- * not whether it was delivered. */
+/* Acknowledges after hook decisions and ordered logical-state admission,
+ * including bypass batches. The modifier result includes the admitted batch;
+ * queued output need not have reached the compositor when the reply arrives. */
 KSI_API ksi_status ksi_synthesize(
     ksi_connection *connection,
     const ksi_input *inputs,
     uint32_t input_count,
     uint32_t flags,
+    uint32_t *logical_modifiers_lr,
     ksi_error *error);
 KSI_API ksi_status ksi_set_block_input(
     ksi_connection *connection,
@@ -300,7 +300,7 @@ typedef struct ksi_indicator_state {
     uint8_t num_lock;
     uint8_t scroll_lock;
     uint8_t reserved0;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_indicator_state;
 
 typedef struct ksi_pointer_position {
@@ -313,7 +313,7 @@ typedef struct ksi_pointer_position {
     int32_t x_max;
     int32_t y_min;
     int32_t y_max;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_pointer_position;
 
 typedef struct ksi_key_state {
@@ -325,8 +325,37 @@ typedef struct ksi_key_state {
     uint8_t reserved0;
     uint8_t logical_keys[KSI_KEY_STATE_BITMAP_BYTES];
     uint8_t physical_keys[KSI_KEY_STATE_BITMAP_BYTES];
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_key_state;
+
+enum {
+    KSI_LEASE_GRANTED = 1u,
+    KSI_LEASE_REVOKED = 2u,
+    KSI_LEASE_KEYBOARD_SNAPSHOT = 3u,
+    KSI_LEASE_KEYBOARD_DELTA = 4u,
+};
+typedef struct ksi_lease_message {
+    uint32_t struct_size;
+    uint32_t kind;
+    KSI_ALIGN64 uint64_t sequence;
+    uint32_t granted_scopes;
+    uint32_t revoked_scopes;
+    uint32_t physical_modifiers_lr;
+    uint32_t reserved0;
+    ksi_key_state state;
+    KSI_ALIGN64 uint64_t reserved[4];
+} ksi_lease_message;
+KSI_API void ksi_lease_message_init(ksi_lease_message *message);
+/* Re-subscribing produces a replacement snapshot. Each following state change
+ * is the next sequence; gaps require resubscription, reconnects a new snapshot.
+ * Keyboard bitmaps require Input Monitoring; modifiers and toggles are ungated.
+ * Replacement snapshots at the same sequence also change bitmap visibility.
+ * State bursts buffered during an RPC may become one replacement snapshot. */
+KSI_API ksi_status ksi_key_state_subscribe(ksi_connection *connection, ksi_error *error);
+/* Lease roles return typed state/grant events; RPC roles may drain revocations or
+ * detect EOF. UINT32_MAX waits indefinitely, zero never waits for missing bytes. */
+KSI_API ksi_status ksi_lease_next(ksi_connection *connection, uint32_t timeout_ms,
+    ksi_lease_message *message, ksi_error *error);
 
 typedef struct ksi_pointer_buttons {
     uint32_t struct_size;
@@ -334,15 +363,15 @@ typedef struct ksi_pointer_buttons {
     uint8_t reserved0[3];
     uint32_t logical_buttons;
     uint32_t physical_buttons;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_pointer_buttons;
 
 typedef struct ksi_idle_time {
     uint32_t struct_size;
     uint8_t valid;
     uint8_t reserved0[3];
-    uint64_t idle_time_ms;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t idle_time_ms;
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_idle_time;
 
 typedef struct ksi_modifier_state {
@@ -353,7 +382,7 @@ typedef struct ksi_modifier_state {
     uint8_t num_lock;
     uint8_t scroll_lock;
     uint8_t reserved0;
-    uint64_t reserved[2];
+    KSI_ALIGN64 uint64_t reserved[2];
 } ksi_modifier_state;
 
 KSI_API void ksi_input_init(ksi_input *input);
@@ -404,15 +433,15 @@ KSI_API ksi_status ksi_get_modifier_state(
 typedef struct ksi_observer_message {
     uint32_t struct_size;
     uint32_t kind;
-    uint64_t device_generation;
-    uint64_t dropped_events;
+    KSI_ALIGN64 uint64_t device_generation;
+    KSI_ALIGN64 uint64_t dropped_events;
     union {
         ksi_hook_event input;
         ksi_device_info device;
         ksi_raw_input_event raw_input;
         ksi_permission_scopes revoked_scopes;
     } data;
-    uint64_t reserved[4];
+    KSI_ALIGN64 uint64_t reserved[4];
 } ksi_observer_message;
 
 typedef bool (*ksi_device_visitor)(const ksi_device_info *device, void *context);
@@ -445,7 +474,9 @@ KSI_API ksi_status ksi_observer_next(ksi_connection *connection,
  * returning. Event and reply pointers are borrowed only for the duration of
  * the call that receives or sends them. A nested callback must not disconnect
  * the connection or free its context: defer destruction until the outer API
- * call returns. Replacement event arrays must remain alive until that return. */
+ * call returns. Replacement event arrays must remain alive until that return.
+ * A synchronous request timeout requires retiring the connection: a late reply
+ * cannot be matched to a subsequent request. *_next timeouts keep it usable. */
 
 #ifdef __cplusplus
 }

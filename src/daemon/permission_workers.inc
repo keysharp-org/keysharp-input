@@ -108,9 +108,7 @@ static void *permission_worker(void *context)
     if (permission_task_cancelled(task)) {
         task->status = KSI_STATUS_CANCELLED;
     } else if (task->kind == KSI_PERMISSION_CHECK) {
-        ksp_identity verified;
-        if (ksp_identity_revalidate_cached(&task->identity, &verified) != 0
-            || ksp_store_check_at_generation(task->state->permissions, task->uid,
+        if (ksp_store_check_at_generation(task->state->permissions, task->uid,
                 task->identity.hash, KSI_INPUT_PERMISSION_SCOPES,
                 &task->allowed, &task->store_generation) != 0) task->status = KSI_STATUS_DENIED;
     } else if (task->kind == KSI_PERMISSION_LIST) {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keysharp-input
-    VERSION 0.4.0
+    VERSION 1.0.0
     DESCRIPTION "Standalone privileged Linux input broker"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-input"
     LANGUAGES C)
@@ -49,7 +49,7 @@ target_link_libraries(keysharp-input-client PRIVATE
 set_target_properties(keysharp-input-client PROPERTIES
     OUTPUT_NAME keysharp-input
     VERSION ${PROJECT_VERSION}
-    SOVERSION 0
+    SOVERSION 1
     EXPORT_NAME client
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES)
@@ -315,7 +315,7 @@ if(BUILD_TESTING)
         _GNU_SOURCE _POSIX_C_SOURCE=200809L KSI_CLIENT_TESTING
         KSI_PRODUCT_VERSION="${PROJECT_VERSION}")
     target_link_libraries(keysharp-input-client-stream-tests PRIVATE
-        KeysharpPermissions::permissions)
+        KeysharpPermissions::permissions Threads::Threads)
     add_test(NAME keysharp-input-client-stream-tests
         COMMAND keysharp-input-client-stream-tests)
 
@@ -561,7 +561,7 @@ set(CPACK_DEBIAN_PACKAGE_DEPENDS "polkitd, udev, kmod, systemd")
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_input/client.h"
     KEYSHARP_INPUT_ABI_MINOR_LINE REGEX "^#define KSI_CLIENT_ABI_MINOR ")
 string(REGEX MATCH "[0-9]+" KEYSHARP_INPUT_ABI_MINOR "${KEYSHARP_INPUT_ABI_MINOR_LINE}")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-input-client-abi-0 (= 0.${KEYSHARP_INPUT_ABI_MINOR})")
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-input-client-abi-1 (= 1.${KEYSHARP_INPUT_ABI_MINOR})")
 set(KEYSHARP_INPUT_DEBIAN_CONTROLS)
 foreach(script preinst postinst prerm postrm)
     file(COPY packaging/debian/${script}

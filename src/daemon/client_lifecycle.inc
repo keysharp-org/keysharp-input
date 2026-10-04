@@ -16,6 +16,21 @@ static void remove_client(ksi_daemon_state *state, nfds_t index)
     nfds_t * const count = &state->client_count;
     const uint64_t connection_id = clients[index].connection_id;
 
+    ksi_authorization_lease *lease = clients[index].authorization_lease;
+    if (lease != NULL && clients[index].connection_role == KSI_ROLE_AUTHORIZATION_LEASE) {
+        lease->active = false;
+        lease->granted_scopes = 0u;
+        for (nfds_t i = 0u; i < *count; i++) {
+            if (i != index && clients[i].authorization_lease == lease) {
+                clients[i].hook_subscriptions = clients[i].observer_subscriptions = clients[i].block_input_mask = 0u;
+                hook_send_ref_invalidate(clients[i].hook_send_ref);
+                if (!synthetic_hook_queue_push_release(&state->synthetic_hook_queue, clients[i].connection_id))
+                    release_connection_output(state, clients[i].connection_id, 0u);
+            }
+        }
+    }
+    if (lease != NULL && --lease->references == 0u) free(lease);
+    clients[index].authorization_lease = NULL;
     hook_send_ref_invalidate(clients[index].hook_send_ref);
     hook_send_ref_release(clients[index].hook_send_ref);
     clients[index].hook_send_ref = NULL;

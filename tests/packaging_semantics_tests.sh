@@ -16,9 +16,9 @@ trap cleanup EXIT HUP INT TERM
 sed -n '/^is_root_protected_chain() {$/,/^archive_dir=/p' \
     "$source_dir/packaging/install-release.sh" | sed '$d' \
     > "$temporary/install-functions.sh"
-expected_client_abi_major=$(awk '$2 == "KSI_CLIENT_ABI_MAJOR" { gsub(/u$/, "", $3); print $3 }' \
+expected_client_abi_major=$(awk '$2 == "KSI_CLIENT_ABI_MAJOR" { gsub(/u[[:space:]]*$/, "", $3); print $3 }' \
     "$source_dir/include/keysharp_input/client.h")
-expected_client_abi_minor=$(awk '$2 == "KSI_CLIENT_ABI_MINOR" { gsub(/u$/, "", $3); print $3 }' \
+expected_client_abi_minor=$(awk '$2 == "KSI_CLIENT_ABI_MINOR" { gsub(/u[[:space:]]*$/, "", $3); print $3 }' \
     "$source_dir/include/keysharp_input/client.h")
 for component in major minor; do
     installer_value=$(sed -n "s/^expected_client_abi_${component}=//p" \
@@ -77,18 +77,18 @@ wait "$upgrade_pid" 2>/dev/null || true
 upgrade_pid=
 
 mkdir -p "$temporary/live-lib"
-printf '%s\n' old > "$temporary/live-lib/libkeysharp-input.so.0.4.0"
+printf '%s\n' old > "$temporary/live-lib/libkeysharp-input.so.1.0.0"
 old_inode=$(stat -c '%i' \
-    "$temporary/live-lib/libkeysharp-input.so.0.4.0")
+    "$temporary/live-lib/libkeysharp-input.so.1.0.0")
 printf '%s\n' new > "$temporary/new-library"
 atomic_install_file "$temporary/new-library" \
-    "$temporary/live-lib/libkeysharp-input.so.0.4.0" 0755
+    "$temporary/live-lib/libkeysharp-input.so.1.0.0" 0755
 new_inode=$(stat -c '%i' \
-    "$temporary/live-lib/libkeysharp-input.so.0.4.0")
+    "$temporary/live-lib/libkeysharp-input.so.1.0.0")
 [ "$old_inode" != "$new_inode" ]
-atomic_install_symlink libkeysharp-input.so.0.4.0 \
-    "$temporary/live-lib/libkeysharp-input.so.0"
-atomic_install_symlink libkeysharp-input.so.0 \
+atomic_install_symlink libkeysharp-input.so.1.0.0 \
+    "$temporary/live-lib/libkeysharp-input.so.1"
+atomic_install_symlink libkeysharp-input.so.1 \
     "$temporary/live-lib/libkeysharp-input.so"
 [ "$(cat "$temporary/live-lib/libkeysharp-input.so")" = new ]
 
@@ -147,13 +147,13 @@ mkdir -p "$temporary/bin"
 cat > "$temporary/bin/dpkg-query" <<'EOF'
 #!/bin/sh
 printf '%s\n' \
-    'ii |unrelated-provider, keysharp-input-client-abi-0 (= 0.2)' \
-    'rc |ignored-provider, keysharp-input-client-abi-0'
+    'ii |unrelated-provider, keysharp-input-client-abi-1 (= 1.0)' \
+    'rc |ignored-provider, keysharp-input-client-abi-1'
 EOF
 chmod 0755 "$temporary/bin/dpkg-query"
 old_path=$PATH
 PATH="$temporary/bin:$PATH"
-installed_debian_provider_satisfies keysharp-input-client-abi-0
+installed_debian_provider_satisfies keysharp-input-client-abi-1
 if installed_debian_provider_satisfies ignored-provider; then
     echo "a removed package was accepted as an installed provider" >&2
     exit 1
@@ -161,11 +161,11 @@ fi
 PATH=$old_path
 
 printf '%s\n' '#!/bin/sh' \
-    "printf '%s\\n' client_abi_major=$expected_client_abi_major client_abi_minor=$((expected_client_abi_minor - 1))" \
+    "printf '%s\\n' client_abi_major=$((expected_client_abi_major - 1)) client_abi_minor=$expected_client_abi_minor" \
     > "$temporary/old-info"
 chmod 0755 "$temporary/old-info"
 if client_abi_matches "$temporary/old-info"; then
-    echo "an older client ABI minor was accepted" >&2
+    echo "an older client ABI major was accepted" >&2
     exit 1
 fi
 
@@ -175,15 +175,15 @@ sed -n '/^path_present() {$/,/^case /p' \
 # shellcheck source=/dev/null
 . "$temporary/preinst-functions.sh"
 mkdir -p "$temporary/local" "$temporary/package"
-printf 'stale\n' > "$temporary/local/libkeysharp-input.so.0"
-portable_library_conflicts "$temporary/local/libkeysharp-input.so.0" \
-    "$temporary/package/libkeysharp-input.so.0"
-printf 'packaged\n' > "$temporary/package/libkeysharp-input.so.0"
-rm -f -- "$temporary/local/libkeysharp-input.so.0"
-ln -s ../package/libkeysharp-input.so.0 \
-    "$temporary/local/libkeysharp-input.so.0"
-if portable_library_conflicts "$temporary/local/libkeysharp-input.so.0" \
-    "$temporary/package/libkeysharp-input.so.0"; then
+printf 'stale\n' > "$temporary/local/libkeysharp-input.so.1"
+portable_library_conflicts "$temporary/local/libkeysharp-input.so.1" \
+    "$temporary/package/libkeysharp-input.so.1"
+printf 'packaged\n' > "$temporary/package/libkeysharp-input.so.1"
+rm -f -- "$temporary/local/libkeysharp-input.so.1"
+ln -s ../package/libkeysharp-input.so.1 \
+    "$temporary/local/libkeysharp-input.so.1"
+if portable_library_conflicts "$temporary/local/libkeysharp-input.so.1" \
+    "$temporary/package/libkeysharp-input.so.1"; then
     echo "an alias to the packaged client library was rejected" >&2
     exit 1
 fi
