@@ -87,7 +87,7 @@ static void update_buffered_readiness(ksi_connection *connection)
         || connection->observer_dropped != 0u || connection->lease_count != 0u
         || (connection->role == KSI_ROLE_OBSERVER_STREAM && connection->pending_revoked_scopes != 0u)) {
         value = 1u;
-        (void)write(connection->ready_fd, &value, sizeof(value));
+        while (write(connection->ready_fd, &value, sizeof(value)) < 0 && errno == EINTR) {}
     }
 }
 
