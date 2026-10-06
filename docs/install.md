@@ -69,11 +69,22 @@ Install a newer release using the same command and channel. Downloaded `.deb` fi
 do not configure an update repository; the PPA does. Check releases for updates, including
 security fixes; ABI compatibility alone does not mean a release is current.
 
+To switch a source/archive installation to Debian or PPA packages, run the portable
+uninstaller first. It removes the current ABI 1 library and older ABI 0 copies.
+
 Remove a package through its package manager. Remove the default source/archive
 installation with:
 
 ```sh
 sudo /usr/local/share/doc/keysharp-input/uninstall.sh
+```
+
+The portable v1.0.0 uninstaller leaves its ABI 1 library behind. After running that
+uninstaller, remove the remaining portable library before retrying the Debian install:
+
+```sh
+sudo rm -f -- /usr/local/lib/libkeysharp-input.so.1 /usr/local/lib/libkeysharp-input.so.1.*
+sudo ldconfig
 ```
 
 Uninstall keeps the shared grants under `/var/lib/keysharp-permissions/v1`.

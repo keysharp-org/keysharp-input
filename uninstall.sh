@@ -44,6 +44,8 @@ rm -f -- \
     /usr/local/lib/libkeysharp-input.so \
     /usr/local/lib/libkeysharp-input.so.0 \
     /usr/local/lib/libkeysharp-input.so.0.* \
+    /usr/local/lib/libkeysharp-input.so.1 \
+    /usr/local/lib/libkeysharp-input.so.1.* \
     /usr/local/lib/pkgconfig/keysharp-input.pc \
     /usr/local/lib/cmake/KeysharpInput/KeysharpInputConfig.cmake \
     /usr/local/lib/cmake/KeysharpInput/KeysharpInputConfigVersion.cmake \

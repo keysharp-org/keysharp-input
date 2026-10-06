@@ -188,4 +188,77 @@ if portable_library_conflicts "$temporary/local/libkeysharp-input.so.1" \
     exit 1
 fi
 
+uninstall_root=$temporary/uninstall-root
+mkdir -p "$uninstall_root/usr/local/bin" "$uninstall_root/usr/local/lib" \
+    "$uninstall_root/usr/local/share/doc/keysharp-input" \
+    "$uninstall_root/etc/systemd/system" "$uninstall_root/usr/bin" \
+    "$uninstall_root/usr/lib" "$uninstall_root/var/lib/keysharp-permissions/v1" \
+    "$uninstall_root/run/keysharp-permissions" "$temporary/uninstall-bin"
+# Translate every system path before running the uninstaller against a disposable tree.
+sed "s|/usr/|$uninstall_root/usr/|g; s|/etc/|$uninstall_root/etc/|g; \
+    s|/var/|$uninstall_root/var/|g; s|/run/|$uninstall_root/run/|g" \
+    "$source_dir/uninstall.sh" > "$temporary/uninstall.sh"
+cat > "$temporary/uninstall-bin/mock" <<'EOF'
+#!/bin/sh
+set -eu
+case "${0##*/}" in
+    id) printf '0\n' ;;
+    dpkg-query) printf '%s' "$KSI_UNINSTALL_TEST_STATUS" ;;
+    systemctl|ldconfig) printf '%s %s\n' "${0##*/}" "$*" >> "$KSI_UNINSTALL_TEST_CALLS" ;;
+    *) exit 99 ;;
+esac
+EOF
+chmod 0755 "$temporary/uninstall-bin/mock"
+for command in id dpkg-query systemctl ldconfig; do
+    ln -s mock "$temporary/uninstall-bin/$command"
+done
+cat > "$uninstall_root/usr/local/bin/keysharp-input" <<'EOF'
+#!/bin/sh
+printf 'keysharp-input %s\n' "$*" >> "$KSI_UNINSTALL_TEST_CALLS"
+EOF
+chmod 0755 "$uninstall_root/usr/local/bin/keysharp-input"
+for path in \
+    usr/local/lib/libkeysharp-input.so.0.4.0 \
+    usr/local/lib/libkeysharp-input.so.1.0.0 \
+    usr/local/share/doc/keysharp-input/uninstall.sh \
+    etc/systemd/system/keysharp-input.service \
+    etc/systemd/system/keysharp-input.socket \
+    usr/bin/keysharp-input usr/lib/libkeysharp-input.so.1 \
+    usr/local/lib/libunrelated.so \
+    var/lib/keysharp-permissions/v1/grant run/keysharp-permissions/lease; do
+    printf 'keep-or-remove\n' > "$uninstall_root/$path"
+done
+ln -s libkeysharp-input.so.0.4.0 "$uninstall_root/usr/local/lib/libkeysharp-input.so.0"
+ln -s libkeysharp-input.so.1.0.0 "$uninstall_root/usr/local/lib/libkeysharp-input.so.1"
+ln -s libkeysharp-input.so.1 "$uninstall_root/usr/local/lib/libkeysharp-input.so"
+KSI_UNINSTALL_TEST_CALLS=$temporary/uninstall-calls
+export KSI_UNINSTALL_TEST_CALLS
+if PATH="$temporary/uninstall-bin:$PATH" KSI_UNINSTALL_TEST_STATUS='ii ' \
+    sh "$temporary/uninstall.sh" > "$temporary/uninstall-output" 2>&1; then
+    echo "portable uninstaller accepted an installed Debian package" >&2
+    exit 1
+fi
+[ ! -e "$KSI_UNINSTALL_TEST_CALLS" ]
+[ -x "$uninstall_root/usr/local/bin/keysharp-input" ]
+[ -f "$uninstall_root/usr/local/lib/libkeysharp-input.so.1.0.0" ]
+PATH="$temporary/uninstall-bin:$PATH" KSI_UNINSTALL_TEST_STATUS='rc ' \
+    sh "$temporary/uninstall.sh" > "$temporary/uninstall-output" 2>&1
+for path in \
+    usr/local/bin/keysharp-input usr/local/lib/libkeysharp-input.so \
+    usr/local/lib/libkeysharp-input.so.0 usr/local/lib/libkeysharp-input.so.0.4.0 \
+    usr/local/lib/libkeysharp-input.so.1 usr/local/lib/libkeysharp-input.so.1.0.0 \
+    usr/local/share/doc/keysharp-input \
+    etc/systemd/system/keysharp-input.service etc/systemd/system/keysharp-input.socket; do
+    [ ! -e "$uninstall_root/$path" ] && [ ! -L "$uninstall_root/$path" ]
+done
+for path in \
+    usr/bin/keysharp-input usr/lib/libkeysharp-input.so.1 \
+    usr/local/lib/libunrelated.so \
+    var/lib/keysharp-permissions/v1/grant run/keysharp-permissions/lease; do
+    [ -f "$uninstall_root/$path" ]
+done
+grep -q '^systemctl disable --now keysharp-input.service keysharp-input.socket$' \
+    "$KSI_UNINSTALL_TEST_CALLS"
+grep -q '^keysharp-input daemon --remove-input-access$' "$KSI_UNINSTALL_TEST_CALLS"
+
 echo "keysharp-input packaging semantics passed"
