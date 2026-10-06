@@ -73,7 +73,18 @@ Both builds read the client ABI capability from the public header.
 Launchpad accepts each version once, so the workflow first builds every series and
 architecture from that upload with `packaging/ppa/rehearse.sh`: in a clean container
 of the series, offline and unprivileged, as Launchpad does. Rerunning the workflow
-uploads only what the PPA lacks. The `ppa_revision` input uploads a released version
+uploads only what the PPA lacks. Each signed upload is attempted up to three times,
+with 10 and 20 second delays between failures; signed files stay identical across
+attempts, and an accepted version is skipped before trying again.
+
+When the GitHub release already exists, dispatch the Release workflow from `main`
+with its existing `tag` and `ppa_only=true`. This builds and rehearses the tagged
+source for the PPA without recreating or uploading GitHub release assets. The
+uploader comes from the workflow revision so fixes to upload tooling apply to an
+existing tag. Keep `ppa_revision=1` to complete a missing upload; raise it only
+when replacing a version Launchpad already accepted.
+
+The `ppa_revision` input uploads a released version
 again as `<version>-1~<series><revision>`, reusing the upstream tarball Launchpad
 already holds. To rehearse locally, with Docker installed:
 

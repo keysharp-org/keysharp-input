@@ -37,5 +37,23 @@ for changes in "$@"; do
   fi
   # debsign asks before replacing a signature and after a failed one; no stdin makes it decide at once.
   debsign --no-conf --re-sign -p "${GNUPGHOME}/sign" -k "${fingerprint}" "${changes}" </dev/null
-  dput "ppa:${ppa}" "${changes}"
+  # Keep signed files identical across retries of a partial transfer.
+  for attempt in 1 2 3; do
+    if dput "ppa:${ppa}" "${changes}"; then
+      break
+    else
+      upload_status=$?
+    fi
+    if python3 "${here}/launchpad.py" has-version "${ppa}" "${source}" "${version}"; then
+      echo "ppa:${ppa} accepted ${source} ${version}; skipping another upload."
+      break
+    fi
+    if [[ "${attempt}" -eq 3 ]]; then
+      echo "Upload of ${changes} (${source} ${version}) to ppa:${ppa} failed after ${attempt} attempts." >&2
+      exit "${upload_status}"
+    fi
+    delay=$((attempt * 10))
+    echo "Upload failed; retrying ${source} ${version} in ${delay} seconds." >&2
+    sleep "${delay}"
+  done
 done
