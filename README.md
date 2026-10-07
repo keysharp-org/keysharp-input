@@ -2,12 +2,22 @@
 
 A Linux service and C library for global keyboard and mouse hooks, input synthesis,
 blocking and physical input-state queries. The same API works on X11 and Wayland.
-Applications use `libkeysharp-input.so.0`; the root service owns evdev and uinput access.
+Applications use `libkeysharp-input.so.1`; the root service owns evdev and uinput access.
 
 ## Install
 
-Download your architecture's release from [GitHub Releases](https://github.com/keysharp-org/keysharp-input/releases).
-On Debian or Ubuntu:
+On Ubuntu 24.04 or 26.04 and distributions based on those releases, use the Launchpad PPA
+to install the package and receive updates:
+
+```sh
+sudo apt install software-properties-common
+sudo add-apt-repository ppa:descolada/keysharp
+sudo apt update
+sudo apt install keysharp-input
+```
+
+For a downloaded package on Debian or Ubuntu, choose your architecture's release from
+[GitHub Releases](https://github.com/keysharp-org/keysharp-input/releases):
 
 ```sh
 sudo apt install ./keysharp-input_<version>_<arch>.deb
@@ -24,7 +34,7 @@ Keysharp users can install both brokers with [Keysharp's Linux setup](https://gi
 cc examples/type-keys.c $(pkg-config --cflags --libs keysharp-input) -o type-keys
 ```
 
-Or link `KeysharpInput::client` after `find_package(KeysharpInput 0.2 CONFIG REQUIRED)`.
+Or link `KeysharpInput::client` after `find_package(KeysharpInput 1.0 CONFIG REQUIRED)`.
 Complete examples demonstrate [typing keys](examples/type-keys.c) and
 [watching and suppressing a key](examples/suppress-key.c). These examples interact
 with your desktop when run.
@@ -75,7 +85,7 @@ Manage grants with `keysharp-input permissions list` and `keysharp-input permiss
 
 Applications use the public client library; the socket protocol is private.
 Product releases are independent of Keysharp. The Debian capability
-`keysharp-input-client-abi-0` identifies the client ABI; its provided version records
+`keysharp-input-client-abi-1` identifies the client ABI; its provided version records
 the ABI major and minor. Applications should require or recommend the needed minor
 according to whether input features are optional. An application's
 uninstaller must leave this shared service installed.

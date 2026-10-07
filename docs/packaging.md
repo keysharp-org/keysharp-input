@@ -1,13 +1,13 @@
 # Packaging
 
-The 0.4.0 package contains one executable, one shared client library, its public
+The package contains one executable, one shared client library, its public
 headers, and two systemd units:
 
 ```text
 /usr/bin/keysharp-input
-/usr/lib/libkeysharp-input.so.0.4.0
-/usr/lib/libkeysharp-input.so.0 -> libkeysharp-input.so.0.4.0
-/usr/lib/libkeysharp-input.so -> libkeysharp-input.so.0
+/usr/lib/libkeysharp-input.so.<product-version>
+/usr/lib/libkeysharp-input.so.<abi-major> -> libkeysharp-input.so.<product-version>
+/usr/lib/libkeysharp-input.so -> libkeysharp-input.so.<abi-major>
 /usr/include/keysharp_input/client.h
 /usr/include/keysharp_input/constants.h
 /usr/include/keysharp_input/devices.h
@@ -21,7 +21,7 @@ The package also installs one polkit policy, one udev rule, and one tmpfiles
 declaration. The service socket is
 `/run/keysharp-input/keysharp-input.sock`.
 
-Debian metadata provides `keysharp-input-client-abi-0` with version `0.<minor>`
+Debian metadata provides `keysharp-input-client-abi-<major>` with version `<major>.<minor>`
 derived from the public header, independent of the product release. Consumers can
 require an additive API with a versioned dependency. Applications depend on
 the client ABI; the daemon protocol is private to the matching client library.
@@ -77,16 +77,23 @@ uploads only what the PPA lacks. Each signed upload is attempted up to three tim
 with 10 and 20 second delays between failures; signed files stay identical across
 attempts, and an accepted version is skipped before trying again.
 
-When the GitHub release already exists, dispatch the Release workflow from `main`
-with its existing `tag` and `ppa_only=true`. This builds and rehearses the tagged
-source for the PPA without recreating or uploading GitHub release assets. The
-uploader comes from the workflow revision so fixes to upload tooling apply to an
-existing tag. Keep `ppa_revision=1` to complete a missing upload; raise it only
-when replacing a version Launchpad already accepted.
+Dispatch the Release workflow from `main` with `ppa_only=true` to build, rehearse
+and upload PPA packages for a release tag. Set `RELEASE_TAG` to that tag and
+`PPA_REVISION` to the packaging revision:
 
-The `ppa_revision` input uploads a released version
-again as `<version>-1~<series><revision>`, reusing the upstream tarball Launchpad
-already holds. To rehearse locally, with Docker installed:
+```bash
+gh workflow run release.yml --repo keysharp-org/keysharp-input --ref main \
+  -f tag="$RELEASE_TAG" -f ppa_only=true -f ppa_revision="$PPA_REVISION"
+```
+
+The package version is `<version>-1~<series><revision>`. Use revision `1` for
+the first upload and a higher unused revision for a new upload of the same release.
+Launchpad reuses the accepted upstream tarball for that product version;
+upstream source changes require a new product version and release tag.
+The tagged tree supplies upstream source, Debian packaging and rehearsal tools;
+the workflow revision supplies signing and upload tooling.
+
+To rehearse locally, with Docker installed:
 
 ```bash
 SERIES=noble bash packaging/ppa/build-source.sh

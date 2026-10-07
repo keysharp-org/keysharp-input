@@ -85,5 +85,5 @@ jobs:
           submodules: recursive
       - name: Check lifecycle scripts
         run: shellcheck install.sh uninstall.sh packaging/install-release.sh packaging/check-runtime.sh packaging/debian/preinst packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm packaging/ppa/*.sh tests/ppa_upload_tests.sh
-      - name: Test PPA upload recovery
+      - name: Test PPA upload behavior
         run: bash tests/ppa_upload_tests.sh .

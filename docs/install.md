@@ -1,22 +1,23 @@
 # Installation and development
 
-Download a release for your architecture from [GitHub Releases](https://github.com/keysharp-org/keysharp-input/releases).
-Debian packages use `amd64` or `arm64`; archives use `x64` or `arm64`.
-
 ## Install
 
-On Debian or Ubuntu:
+On Ubuntu 24.04 or 26.04 and distributions based on those releases, use Keysharp's
+Launchpad PPA to install the package and receive updates:
+
+```sh
+sudo apt install software-properties-common
+sudo add-apt-repository ppa:descolada/keysharp
+sudo apt update
+sudo apt install keysharp-input
+```
+
+For a downloaded package on Debian or Ubuntu, choose your architecture's release from
+[GitHub Releases](https://github.com/keysharp-org/keysharp-input/releases).
+Debian packages use `amd64` or `arm64`; archives use `x64` or `arm64`.
 
 ```sh
 sudo apt install ./keysharp-input_<version>_<arch>.deb
-```
-
-On Ubuntu 24.04 or 26.04, Keysharp's Launchpad PPA supplies the same package and
-keeps it updated:
-
-```sh
-sudo add-apt-repository ppa:descolada/keysharp
-sudo apt install keysharp-input
 ```
 
 On another systemd distribution:
@@ -34,7 +35,7 @@ polkit, udev, kmod and systemd. A running systemd system manager is required.
 installs missing dependencies. Other distributions must supply these dependencies
 through their own package manager. Archives target glibc 2.35 or newer.
 
-Both routes install the library, CLI and service, configure the virtual input
+These routes install the library, CLI and service, configure the virtual input
 devices, and enable the service. Applications receive access through grants;
 ordinary applications are not added to the input group.
 
@@ -70,21 +71,13 @@ do not configure an update repository; the PPA does. Check releases for updates,
 security fixes; ABI compatibility alone does not mean a release is current.
 
 To switch a source/archive installation to Debian or PPA packages, run the portable
-uninstaller first. It removes the current ABI 1 library and older ABI 0 copies.
+uninstaller first.
 
 Remove a package through its package manager. Remove the default source/archive
 installation with:
 
 ```sh
 sudo /usr/local/share/doc/keysharp-input/uninstall.sh
-```
-
-The portable v1.0.0 uninstaller leaves its ABI 1 library behind. After running that
-uninstaller, remove the remaining portable library before retrying the Debian install:
-
-```sh
-sudo rm -f -- /usr/local/lib/libkeysharp-input.so.1 /usr/local/lib/libkeysharp-input.so.1.*
-sudo ldconfig
 ```
 
 Uninstall keeps the shared grants under `/var/lib/keysharp-permissions/v1`.

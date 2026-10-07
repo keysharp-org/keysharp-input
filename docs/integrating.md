@@ -8,13 +8,13 @@ pkg-config --cflags --libs keysharp-input
 ```
 
 ```cmake
-find_package(KeysharpInput 0.2 CONFIG REQUIRED)
+find_package(KeysharpInput 1.0 CONFIG REQUIRED)
 target_link_libraries(my-client PRIVATE KeysharpInput::client)
 ```
 
-The public ABI is 0.4 and the library SONAME is `libkeysharp-input.so.0`.
+The public ABI is 1.0 and the library SONAME is `libkeysharp-input.so.1`.
 `ksi_client_abi_major()` and `ksi_client_abi_minor()` provide runtime
-introspection. Socket protocol 2.0 is an implementation detail of this ABI.
+introspection. The socket protocol is private to the matching client library.
 
 ## Connections
 
@@ -26,10 +26,15 @@ interactive authorization request; clients that only make noninteractive or
 latency-sensitive calls can set a shorter value. The environment
 variable `KEYSHARP_INPUT_SOCKET` is consulted before that default.
 
-HELLO can request no scopes. This is useful for learning the service's
-available operations without opening a permission dialog. Call `ksi_authorize`
-later with `KSI_AUTH_REQUEST` when the user invokes a feature that needs a
-durable scope.
+Connect without scopes to learn the service's available operations without
+opening a permission dialog. To request permissions, connect with
+`KSI_ROLE_AUTHORIZATION_LEASE` and call `ksi_authorize` with `KSI_AUTH_REQUEST`
+when the user invokes a feature that needs a durable scope.
+
+Keep that lease connection open. For RPC, callback or observer connections that
+need its grants, set `ksi_connect_options.lease_id` to the lease ID returned in
+`ksi_service_info`. The connections must belong to the same process; closing
+the lease ends its authorization for the attached connections.
 
 Use separate connections for unrelated concurrent work. One connection is
 used by one thread at a time. The callback API is deliberately reentrant:
@@ -170,12 +175,11 @@ See [the complete gamepad example](../examples/read-gamepad.c).
 
 ## Device key state
 
-`ksi_get_key_state` reports the seat. `ksi_get_device_key_state` (client ABI
-0.4) selects one source by the positive ID from `ksi_devices_list` or a hook or
+`ksi_get_key_state` reports the seat. `ksi_get_device_key_state` selects one
+source by the positive ID from `ksi_devices_list` or a hook or
 observer event; zero selects the seat, and events from synthesis carry zero, so
 check the ID before a device query. Unknown or removed IDs return
-`KSI_STATUS_NOT_FOUND`, and a service older than ABI 0.4 answers a device query
-with `KSI_STATUS_INVALID_REQUEST`. Both queries require Input Monitoring.
+`KSI_STATUS_NOT_FOUND`. Both queries require Input Monitoring.
 
 Physical state is read from the kernel for every source, so it also covers
 sources another remapper has grabbed. The bitmaps hold every `EV_KEY` code a
@@ -314,9 +318,16 @@ device for it, that creation is deliberately non-fatal, and `ksi_synthesize`
 returns `UNAVAILABLE` for an absolute move when the device is missing.
 
 For settings UI, use an authorization-lease connection. `ksi_lease_next`
-blocks until a revocation or timeout, and `ksi_lease_granted_scopes` reads the
-updated grant cache. All request loops consume `SESSION_REVOKED` events and
-clear their cached scopes.
+returns typed grant, revocation and subscribed keyboard-state messages;
+each message's `granted_scopes` records the current grant mask. All request loops
+consume revocation events and clear their cached scopes.
+
+`ksi_key_state_subscribe` starts a seat keyboard-state stream on the lease.
+It returns a replacement snapshot followed by state changes with sequence
+numbers. Resubscribe after a sequence gap and obtain a new snapshot after
+reconnecting. Modifier and toggle state is ungated; key bitmaps require Input
+Monitoring and are zeroed without it. A replacement snapshot at the same
+sequence can change bitmap visibility after authorization.
 
 Permission administration is typed. `ksi_permissions_list` calls a visitor for
 each record; returning false drains the response and returns `CANCELLED`.
@@ -344,7 +355,7 @@ features usable when the broker is unavailable.
 
 ## Packaging
 
-Debian clients should depend on `keysharp-input-client-abi-0`, not the private
+Debian clients should depend on `keysharp-input-client-abi-1`, not the private
 socket protocol token. Use `Depends` when privileged input is essential or
 `Recommends` when it is optional. Do not invoke this component's uninstaller
 from another application's uninstaller.

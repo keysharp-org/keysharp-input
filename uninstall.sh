@@ -26,26 +26,10 @@ if [ -x /usr/local/bin/keysharp-input ]; then
     /usr/local/bin/keysharp-input daemon --remove-input-access || true
 fi
 
-library_payload=
-if [ -L /usr/local/lib/libkeysharp-input.so.0 ]; then
-    candidate=$(readlink -f -- /usr/local/lib/libkeysharp-input.so.0 2>/dev/null || true)
-    case "$candidate" in
-        /usr/local/lib/libkeysharp-input.so.0.*)
-            if [ -f "$candidate" ] \
-                && [ "$(stat -Lc '%u' -- "$candidate" 2>/dev/null || true)" = 0 ]; then
-                library_payload=$candidate
-            fi
-            ;;
-    esac
-fi
-
 rm -f -- \
     /usr/local/bin/keysharp-input \
     /usr/local/lib/libkeysharp-input.so \
-    /usr/local/lib/libkeysharp-input.so.0 \
-    /usr/local/lib/libkeysharp-input.so.0.* \
-    /usr/local/lib/libkeysharp-input.so.1 \
-    /usr/local/lib/libkeysharp-input.so.1.* \
+    /usr/local/lib/libkeysharp-input.so.[0-9]* \
     /usr/local/lib/pkgconfig/keysharp-input.pc \
     /usr/local/lib/cmake/KeysharpInput/KeysharpInputConfig.cmake \
     /usr/local/lib/cmake/KeysharpInput/KeysharpInputConfigVersion.cmake \
@@ -62,8 +46,7 @@ rm -f -- \
     /usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf \
     /usr/share/polkit-1/actions/org.keysharp.input.policy \
     /etc/udev/rules.d/70-keysharp-input-uaccess.rules
-[ -z "$library_payload" ] || rm -f -- "$library_payload"
-# The directory is this package's alone, so what an older install left there goes too.
+# This project owns the entire documentation directory.
 rm -rf -- /usr/local/share/doc/keysharp-input
 rmdir --ignore-fail-on-non-empty \
     /usr/local/lib/cmake/KeysharpInput \

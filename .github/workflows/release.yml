@@ -10,12 +10,12 @@ on:
         required: true
         type: string
       ppa_revision:
-        description: PPA upload revision; raise it to upload a version Launchpad already has again
+        description: PPA packaging revision for this release
         required: false
         type: string
         default: "1"
       ppa_only:
-        description: Recover only the PPA upload without republishing GitHub release assets
+        description: Build and upload PPA packages for the tag without publishing GitHub assets
         required: false
         type: boolean
         default: false
@@ -334,8 +334,7 @@ jobs:
           SERIES: ${{ matrix.series }}
         run: bash packaging/ppa/rehearse.sh dist/ppa/keysharp-input_*~"$SERIES"*.dsc "$SERIES" dist/rehearsal
 
-  # Independent of the GitHub publish job, which refuses a rerun once the release exists, so a rerun
-  # still uploads just the series Launchpad does not have.
+  # GitHub assets and PPA packages publish independently.
   publish-ppa:
     needs:
       - prepare
@@ -344,7 +343,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Recovery can use fixed upload tooling while the source artifacts stay pinned to the tag.
+          # Upload tools come from the workflow commit; source packages come from the release tag.
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 

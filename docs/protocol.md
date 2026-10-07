@@ -1,4 +1,4 @@
-# Private IPC protocol 2.0
+# Private IPC protocol 3.0
 
 Applications and language bindings should use `keysharp_input/client.h`. This
 document defines the binary transport for service maintenance, diagnostics, and
@@ -12,7 +12,7 @@ layout is never sent. The header is exactly 24 bytes:
 | Offset | Type | Field |
 |---:|---|---|
 | 0 | byte[4] | magic `KSIP` |
-| 4 | u16 | major, `2` |
+| 4 | u16 | major, `3` |
 | 6 | u16 | minor, `0` |
 | 8 | u16 | opcode |
 | 10 | u16 | flags |
@@ -36,18 +36,32 @@ HELLO must be the first request and may appear exactly once.
 
 | Opcode | Name | Request | Successful result body |
 |---:|---|---|---|
-| `0x0001` | HELLO | `{u16 role,u16 auth_mode,u32 scopes,u64 reserved=0}` | `{u32 granted,u32 reserved=0,u64 available_operations}` |
+| `0x0001` | HELLO | `{u16 role,u16 auth_mode,u32 scopes,u64 lease_id}` | `{u32 granted,u32 reserved=0,u64 available_operations,u64 lease_id}` |
 | `0x0002` | AUTHORIZE | `{u16 auth_mode,u16 reserved=0,u32 scopes,u64 reserved=0}` | `{u32 granted,u32 reserved=0}` |
 | `0x0003` | PING | empty | empty |
 | `0x0004` | PERMISSIONS_LIST | empty | streamed, below |
 | `0x0005` | PERMISSIONS_REVOKE | 48 bytes, below | empty |
 | `0x0006` | SESSION_REVOKED | server EVENT | `{u32 revoked_scopes,u32 reserved=0}` |
+| `0x0007` | SESSION_GRANTED | server EVENT | `{u32 granted_scopes,u32 reserved=0}` |
+| `0x0008` | KEY_STATE_SUBSCRIBE | empty | empty |
+| `0x0009` | KEY_STATE_EVENT | server EVENT | `{u32 kind,u32 physical_modifiers,u64 sequence,key_state}` |
 
 Roles are RPC=0, EVENT_STREAM=1, CALLBACK_STREAM=2, and
 AUTHORIZATION_LEASE=3, and OBSERVER_STREAM=4. This service accepts all except
 the reserved EVENT_STREAM role. Authorization modes are CHECK=0 and REQUEST=1. Input
 scopes are InputMonitoring=`0x01` and InputControl=`0x02`; foreign bits are
 rejected.
+
+An authorization lease connects with lease ID zero and receives its ID in the
+HELLO result. Other connections attach to that ID from the same process and
+inherit its grants; requested scopes must be satisfied by that lease. AUTHORIZE
+and KEY_STATE_SUBSCRIBE operate on the authorization-lease role. Closing the
+lease ends attached authorization.
+
+KEY_STATE_SUBSCRIBE sends an initial snapshot and subscribes to seat state
+changes. KEY_STATE_EVENT kind is snapshot=3 or delta=4; both carry the full
+200-byte key-state body and a nonzero sequence. Without Input Monitoring, key
+bitmaps are zeroed while modifier and toggle state remains available.
 
 LIST sends zero or more RESPONSE|MORE frames. Each successful frame body is
 `{u32 scopes,u32 path_length,u64 granted_at_utc,u8 hash[32],byte path[]}`.
@@ -86,7 +100,7 @@ Operation availability and granted permission scopes are separate masks.
 | `0x1001` | UNSUBSCRIBE_HOOK | same | same |
 | `0x1002` | HOOK_EVENT | server request, below | client response, below |
 | `0x1003` | HOOK_QUARANTINED | server EVENT, 32 bytes | none |
-| `0x1010` | SYNTHESIZE_INPUT | `{u32 count,u32 flags,input[count]}` | empty |
+| `0x1010` | SYNTHESIZE_INPUT | `{u32 count,u32 flags,input[count]}` | `{u32 logical_modifiers,u32 reserved=0,u64 sequence}` |
 | `0x1012` | SET_BLOCK_INPUT | `{u32 mask,u32 reserved=0}` | `{u32 effective,u32 reserved=0}` |
 | `0x1020` | GET_INDICATOR_STATE | empty | 4 bytes |
 | `0x1021` | GET_POINTER_POSITION | empty | 28 bytes |

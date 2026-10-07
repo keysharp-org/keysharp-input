@@ -51,22 +51,24 @@ if is_root_protected_file "$temporary/ordinary"; then
     exit 1
 fi
 
-# A sandbox carries only /bin/sh, so locate on PATH the one binary this needs: a process
-# that stays alive across its own replacement. The copy keeps the name "sleep" because a
-# multi-call coreutils, which is what a sandbox usually supplies, picks its program from
-# argv[0] and refuses to run under any other name. The replacement is written here.
-sleep_binary=$(command -v sleep)
-[ -x "$sleep_binary" ]
+shell_binary=$(command -v sh)
+[ -x "$shell_binary" ]
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$temporary/replacement"
 chmod 0755 "$temporary/replacement"
 
 mkdir "$temporary/live"
-live_executable=$temporary/live/sleep
-cp "$sleep_binary" "$live_executable"
+live_executable=$temporary/live/sh
+cp "$shell_binary" "$live_executable"
 chmod 0755 "$live_executable"
 old_inode=$(stat -c '%i' "$live_executable")
-"$live_executable" 30 &
+mkfifo "$temporary/ready" "$temporary/block"
+exec 3<> "$temporary/block"
+# The child announces readiness after startup, then blocks in the shell's read builtin.
+"$live_executable" -c 'printf "%s\n" ready; read -r ignored' \
+    < "$temporary/block" > "$temporary/ready" &
 upgrade_pid=$!
+IFS= read -r ready < "$temporary/ready"
+[ "$ready" = ready ]
 atomic_install_file "$temporary/replacement" "$live_executable" 0755
 new_inode=$(stat -c '%i' "$live_executable")
 [ "$old_inode" != "$new_inode" ]
@@ -75,6 +77,7 @@ kill -0 "$upgrade_pid"
 kill "$upgrade_pid"
 wait "$upgrade_pid" 2>/dev/null || true
 upgrade_pid=
+exec 3>&-
 
 mkdir -p "$temporary/live-lib"
 printf '%s\n' old > "$temporary/live-lib/libkeysharp-input.so.1.0.0"

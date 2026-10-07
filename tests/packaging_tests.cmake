@@ -58,13 +58,13 @@ foreach(required
     "expected_client_abi_major=${client_abi_major}"
     "expected_client_abi_minor=${client_abi_minor}"
     "bin/keysharp-input"
-    "lib/libkeysharp-input.so.${project_version}"
+    "lib/libkeysharp-input.so.$expected_version"
     "include/keysharp_input/client.h"
     "include/keysharp_input/constants.h"
     "client_abi_matches"
     "installation_complete_for_channel"
-    "atomic_install_file \"$archive_dir/lib/libkeysharp-input.so.${project_version}\""
-    "atomic_install_symlink libkeysharp-input.so.${project_version}"
+    "atomic_install_file \"$archive_dir/lib/libkeysharp-input.so.$expected_version\""
+    "atomic_install_symlink \"libkeysharp-input.so.$expected_version\""
     "atomic_install_file \"$archive_dir/bin/keysharp-input\""
     "current_library=$(portable_library_payload)"
     "--skip-if-compatible")
@@ -76,8 +76,8 @@ endforeach()
 
 foreach(forbidden
     "install -D -m 0755 \"$archive_dir/bin/keysharp-input\""
-    "install -D -m 0755 \"$archive_dir/lib/libkeysharp-input.so.${project_version}\""
-    "ln -sfn libkeysharp-input.so.${project_version}")
+    "install -D -m 0755 \"$archive_dir/lib/libkeysharp-input.so.$expected_version\""
+    "ln -sfn \"libkeysharp-input.so.$expected_version\"")
     string(FIND "${installer}" "${forbidden}" found)
     if(NOT found EQUAL -1)
         message(FATAL_ERROR "portable installer overwrites a live artifact: ${forbidden}")

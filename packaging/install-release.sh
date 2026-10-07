@@ -57,7 +57,7 @@ portable_library_payload() {
     [ -L "$link" ] || return 1
     resolved=$(readlink -f -- "$link" 2>/dev/null) || return 1
     case "$resolved" in
-        /usr/local/lib/libkeysharp-input.so.1.*) ;;
+        /usr/local/lib/libkeysharp-input.so.[0-9]*) ;;
         *) return 1 ;;
     esac
     is_root_protected_file "$resolved" || return 1
@@ -387,7 +387,7 @@ installation_complete_for_channel() {
 archive_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 for required in \
     bin/keysharp-input \
-    lib/libkeysharp-input.so.1.0.0 \
+    "lib/libkeysharp-input.so.$expected_version" \
     include/keysharp_input/client.h \
     include/keysharp_input/constants.h \
     include/keysharp_input/devices.h \
@@ -438,9 +438,9 @@ cleanup_install_temporary() {
     [ -z "$atomic_temporary" ] || rm -f -- "$atomic_temporary"
 }
 trap cleanup_install_temporary EXIT HUP INT TERM
-atomic_install_file "$archive_dir/lib/libkeysharp-input.so.1.0.0" \
-    /usr/local/lib/libkeysharp-input.so.1.0.0 0755
-atomic_install_symlink libkeysharp-input.so.1.0.0 \
+atomic_install_file "$archive_dir/lib/libkeysharp-input.so.$expected_version" \
+    "/usr/local/lib/libkeysharp-input.so.$expected_version" 0755
+atomic_install_symlink "libkeysharp-input.so.$expected_version" \
     /usr/local/lib/libkeysharp-input.so.1
 atomic_install_symlink libkeysharp-input.so.1 \
     /usr/local/lib/libkeysharp-input.so
@@ -490,7 +490,6 @@ if command -v systemd-tmpfiles >/dev/null 2>&1; then
         /usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf
 fi
 systemctl daemon-reload
-# The binary owns the /etc udev rule: it replaces what an older release left
-# there and refuses to overwrite an edited one.
+# The binary owns the /etc udev rule and preserves local edits.
 /usr/local/bin/keysharp-input daemon --install-input-access
 echo "Installed keysharp-input $expected_version."

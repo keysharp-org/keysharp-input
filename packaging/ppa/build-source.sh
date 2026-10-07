@@ -6,7 +6,7 @@
 # Environment:
 #   VERSION        upstream version; defaults to the CMake project version
 #   SERIES         Ubuntu series to build for (default: "noble resolute")
-#   PPA_REVISION   the N in <version>-1~<series>N; raise it to upload the same version again
+#   PPA_REVISION   positive packaging revision N in <version>-1~<series>N
 #   PPA            owner/name; when that PPA already holds this version's upstream tarball, it is
 #                  reused, because Launchpad accepts no other file under the same name
 #   OUTPUT_DIR     default: dist/ppa

@@ -410,7 +410,7 @@ KSI_API ksi_status ksi_get_key_state(
     ksi_key_state *state,
     ksi_error *error);
 /* device_id comes from the device list or a hook event (synthesis carries 0,
- * the seat); an unknown ID returns NOT_FOUND and a pre-0.4 service INVALID_REQUEST.
+ * the seat); an unknown ID returns NOT_FOUND.
  * The key bitmaps hold every EV_KEY code of that device; modifiers and locks are the seat's. */
 KSI_API ksi_status ksi_get_device_key_state(
     ksi_connection *connection,

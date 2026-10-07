@@ -12,7 +12,7 @@ Three things ship together:
 
 - `keysharp-input` — the CLI and the service binary (`daemon`, `probe`, `info`,
   `permissions`).
-- `libkeysharp-input.so.0` — the public client library, header `keysharp_input/client.h`.
+- `libkeysharp-input.so.1` — the public client library, header `keysharp_input/client.h`.
 - systemd units, a polkit action, and a udev rule giving forwarding clones their
   source's bus metadata.
 
@@ -26,8 +26,8 @@ This is an independent project. [Keysharp](https://github.com/keysharp-org/Keysh
 is currently its main consumer, but it is a consumer like any other, and nothing here
 may assume Keysharp is the caller.
 
-- **The contract is the client ABI**, expressed as `libkeysharp-input.so.0`, the
-  pkg-config/CMake package, and the Debian capability `keysharp-input-client-abi-0`.
+- **The contract is the client ABI**, expressed as `libkeysharp-input.so.1`, the
+  pkg-config/CMake package, and the Debian capability `keysharp-input-client-abi-1`.
   Product versions select release artifacts; the client ABI decides compatibility.
 - **Releases are independent.** This project versions and releases on its own cadence.
   Keysharp resolves it at install time from this repository's own releases, so a
