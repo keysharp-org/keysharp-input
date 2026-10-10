@@ -176,6 +176,7 @@ jobs:
           cp -R examples "$root/examples"
           install -m 0755 packaging/install-release.sh "$root/install.sh"
           install -m 0755 packaging/check-runtime.sh "$root/check-runtime.sh"
+          install -m 0755 packaging/configure-library-path.sh "$root/configure-library-path.sh"
           install -m 0755 uninstall.sh "$root/uninstall.sh"
           install -m 0644 LICENSE README.md PROVENANCE.md "$root/"
           mkdir -p dist

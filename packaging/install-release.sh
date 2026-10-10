@@ -5,7 +5,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=1.0.0
+expected_version=1.0.1
 expected_client_abi_major=1
 expected_client_abi_minor=0
 
@@ -400,7 +400,7 @@ for required in \
     systemd/keysharp-input.socket \
     tmpfiles/keysharp-input-permissions.conf \
     polkit/org.keysharp.input.policy \
-    uninstall.sh LICENSE README.md; do
+    configure-library-path.sh uninstall.sh LICENSE README.md; do
     if [ ! -s "$archive_dir/$required" ]; then
         echo "Portable archive is incomplete: $required is missing." >&2
         exit 1
@@ -482,8 +482,11 @@ install -D -m 0644 "$archive_dir/README.md" \
 install -D -m 0755 "$archive_dir/uninstall.sh" \
     /usr/local/share/doc/keysharp-input/uninstall.sh
 
-if command -v ldconfig >/dev/null 2>&1; then
-    ldconfig
+sh "$archive_dir/configure-library-path.sh" /usr/local/lib
+ldconfig
+if ! /usr/local/bin/keysharp-input info >/dev/null; then
+    echo "Installed keysharp-input cannot load its client library after refreshing the linker cache." >&2
+    exit 1
 fi
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create \

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keysharp-input
-    VERSION 1.0.0
+    VERSION 1.0.1
     DESCRIPTION "Standalone privileged Linux input broker"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-input"
     LANGUAGES C)
@@ -247,9 +247,23 @@ if(KEYSHARP_INPUT_SETUP_ON_INSTALL)
     # directory have to exist before it is invoked.
     install(CODE "
         if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
+            set(_libdir \"${CMAKE_INSTALL_LIBDIR}\")
+            if(NOT IS_ABSOLUTE \"\${_libdir}\")
+                set(_libdir \"\${CMAKE_INSTALL_PREFIX}/\${_libdir}\")
+            endif()
+            execute_process(COMMAND sh
+                \"${CMAKE_CURRENT_SOURCE_DIR}/packaging/configure-library-path.sh\"
+                \"\${_libdir}\" RESULT_VARIABLE _library_path_result)
+            if(NOT _library_path_result EQUAL 0)
+                message(FATAL_ERROR \"keysharp-input library directory registration failed\")
+            endif()
             find_program(_ldconfig ldconfig PATHS /sbin /usr/sbin NO_CACHE)
-            if(_ldconfig)
-                execute_process(COMMAND \"\${_ldconfig}\")
+            if(NOT _ldconfig)
+                message(FATAL_ERROR \"ldconfig is required to register the keysharp-input client library\")
+            endif()
+            execute_process(COMMAND \"\${_ldconfig}\" RESULT_VARIABLE _ldconfig_result)
+            if(NOT _ldconfig_result EQUAL 0)
+                message(FATAL_ERROR \"keysharp-input linker cache refresh failed\")
             endif()
             find_program(_tmpfiles systemd-tmpfiles NO_CACHE)
             if(_tmpfiles)
@@ -261,6 +275,11 @@ if(KEYSHARP_INPUT_SETUP_ON_INSTALL)
                 endif()
             endif()
             set(_bin \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/keysharp-input\")
+            execute_process(COMMAND \"\${_bin}\" info
+                OUTPUT_QUIET RESULT_VARIABLE _client_load_result)
+            if(NOT _client_load_result EQUAL 0)
+                message(FATAL_ERROR \"Installed keysharp-input cannot load its client library after refreshing the linker cache\")
+            endif()
             execute_process(
                 COMMAND \"\${_bin}\" daemon --install-input-access
                 RESULT_VARIABLE _service_setup_result)

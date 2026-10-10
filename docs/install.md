@@ -39,6 +39,13 @@ These routes install the library, CLI and service, configure the virtual input
 devices, and enable the service. Applications receive access through grants;
 ordinary applications are not added to the input group.
 
+Source and archive installs register their library directory in
+`/etc/ld.so.conf.d/keysharp-input.conf` before refreshing the linker cache and
+starting the service. This also makes the client library discoverable to other
+applications on distributions that do not search `/usr/local/lib` by default.
+An edited file at that path is preserved; remove it and rerun the installer to
+restore the generated configuration.
+
 ## Check and repair
 
 ```sh
@@ -81,6 +88,8 @@ sudo /usr/local/share/doc/keysharp-input/uninstall.sh
 ```
 
 Uninstall keeps the shared grants under `/var/lib/keysharp-permissions/v1`.
+It removes the linker configuration only when its contents still match the
+generated `/usr/local/lib` entry, and preserves other linker configuration files.
 Revoke unwanted grants with `keysharp-input permissions revoke` before removal.
 
 ## Build from source

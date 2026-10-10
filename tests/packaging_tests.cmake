@@ -41,7 +41,8 @@ foreach(required
     "SOVERSION ${client_abi_major}"
     "include/keysharp_input/client.h"
     "include/keysharp_input/constants.h"
-    "KeysharpInputTargets")
+    "KeysharpInputTargets"
+    "packaging/configure-library-path.sh")
     string(FIND "${cmake_source}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "CMake packaging is missing ${required}")
@@ -61,6 +62,7 @@ foreach(required
     "lib/libkeysharp-input.so.$expected_version"
     "include/keysharp_input/client.h"
     "include/keysharp_input/constants.h"
+    "configure-library-path.sh"
     "client_abi_matches"
     "installation_complete_for_channel"
     "atomic_install_file \"$archive_dir/lib/libkeysharp-input.so.$expected_version\""
@@ -71,6 +73,16 @@ foreach(required
     string(FIND "${installer}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "portable installer is missing ${required}")
+    endif()
+endforeach()
+
+file(READ "${SOURCE_DIR}/.github/workflows/release.yml" release_workflow)
+foreach(required
+    "packaging/configure-library-path.sh"
+    "$root/configure-library-path.sh")
+    string(FIND "${release_workflow}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "portable release is missing ${required}")
     endif()
 endforeach()
 

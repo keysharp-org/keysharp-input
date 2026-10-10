@@ -129,7 +129,7 @@ client that stops answering cannot lock the user out. Keep that path working.
   `.pc`. `nix/package.nix` sets them back to relative values, and the `.pc.in` uses
   `@CMAKE_INSTALL_FULL_LIBDIR@` rather than composing `${prefix}` itself.
 - **The installed binary has no RPATH** and links the client library, so anything that
-  runs it during install must come after `ldconfig`.
+  runs it during install must come after library-directory registration and `ldconfig`.
 - **The permission store refuses any parent a third party can write to.** That rules out
   `/tmp` for test fixtures, and it means a checkout under a world-writable mount fails
   the permission tests.

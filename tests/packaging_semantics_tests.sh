@@ -163,6 +163,41 @@ if installed_debian_provider_satisfies ignored-provider; then
 fi
 PATH=$old_path
 
+library_directory=$temporary/linker-root/usr/local/lib
+linker_configuration=$temporary/linker-root/etc/ld.so.conf.d/keysharp-input.conf
+mkdir -p "$library_directory" "${linker_configuration%/*}"
+printf '%s\n' "$library_directory" > "$temporary/expected-linker.conf"
+sh "$source_dir/packaging/configure-library-path.sh" \
+    "$library_directory" "$linker_configuration"
+cmp "$temporary/expected-linker.conf" "$linker_configuration"
+[ "$(stat -c '%a' "$linker_configuration")" = 644 ]
+configuration_inode=$(stat -c '%i' "$linker_configuration")
+sh "$source_dir/packaging/configure-library-path.sh" \
+    "$library_directory" "$linker_configuration"
+[ "$(stat -c '%i' "$linker_configuration")" = "$configuration_inode" ]
+printf '# locally managed\n%s\n' "$library_directory" \
+    > "$linker_configuration"
+cp "$linker_configuration" "$temporary/edited-linker.conf"
+if sh "$source_dir/packaging/configure-library-path.sh" \
+    "$library_directory" "$linker_configuration" \
+    > "$temporary/linker-output" 2>&1; then
+    echo "an edited linker configuration was overwritten" >&2
+    exit 1
+fi
+cmp "$temporary/edited-linker.conf" "$linker_configuration"
+rm -f -- "$linker_configuration"
+ln -s "$temporary/expected-linker.conf" "$linker_configuration"
+if sh "$source_dir/packaging/configure-library-path.sh" \
+    "$library_directory" "$linker_configuration" \
+    > "$temporary/linker-output" 2>&1; then
+    echo "a symbolic-link linker configuration was accepted" >&2
+    exit 1
+fi
+[ -L "$linker_configuration" ]
+[ "$(readlink "$linker_configuration")" = "$temporary/expected-linker.conf" ]
+printf '%s\n' "$library_directory" > "$temporary/expected-linker-content"
+cmp "$temporary/expected-linker-content" "$temporary/expected-linker.conf"
+
 printf '%s\n' '#!/bin/sh' \
     "printf '%s\\n' client_abi_major=$((expected_client_abi_major - 1)) client_abi_minor=$expected_client_abi_minor" \
     > "$temporary/old-info"
@@ -171,6 +206,161 @@ if client_abi_matches "$temporary/old-info"; then
     echo "an older client ABI major was accepted" >&2
     exit 1
 fi
+
+installer_root=$temporary/installer-root
+installer_archive=$temporary/installer-archive
+mkdir -p "$installer_root" "$temporary/installer-bin" \
+    "$installer_archive/bin" "$installer_archive/lib" \
+    "$installer_archive/include/keysharp_input" "$installer_archive/pkgconfig" \
+    "$installer_archive/cmake" "$installer_archive/systemd" \
+    "$installer_archive/tmpfiles" "$installer_archive/polkit"
+installer_version=$(sed -n 's/^expected_version=//p' \
+    "$source_dir/packaging/install-release.sh")
+for path in \
+    "lib/libkeysharp-input.so.$installer_version" \
+    include/keysharp_input/client.h include/keysharp_input/constants.h \
+    include/keysharp_input/devices.h pkgconfig/keysharp-input.pc \
+    cmake/KeysharpInputConfig.cmake cmake/KeysharpInputConfigVersion.cmake \
+    cmake/KeysharpInputTargets.cmake cmake/KeysharpInputTargets-release.cmake \
+    uninstall.sh LICENSE README.md; do
+    printf 'archive payload\n' > "$installer_archive/$path"
+done
+# shellcheck disable=SC2016 # The fixture expands its PATH when launched.
+sed "s|/usr/|$installer_root/usr/|g; s|/etc/|$installer_root/etc/|g; \
+    s|/var/|$installer_root/var/|g; s|/run/|$installer_root/run/|g" \
+    "$source_dir/packaging/install-release.sh" \
+    | sed 's|^PATH=.*|PATH="$KSI_INSTALL_TEST_PATH"|' \
+    > "$installer_archive/install.sh"
+sed "s|/etc/|$installer_root/etc/|g" \
+    "$source_dir/packaging/configure-library-path.sh" \
+    > "$installer_archive/configure-library-path.sh"
+sed "s|@CMAKE_INSTALL_FULL_BINDIR@|$installer_root/usr/local/bin|g; \
+    s|@KEYSHARP_INPUT_TMPFILES_CONFIG@|$installer_root/usr/local/lib/tmpfiles.d/keysharp-input-permissions.conf|g; \
+    s|+/usr/bin/systemd-tmpfiles|+$installer_root/usr/bin/systemd-tmpfiles|g; \
+    s|/var/|$installer_root/var/|g; s|/run/|$installer_root/run/|g" \
+    "$source_dir/systemd/keysharp-input.service.in" \
+    > "$installer_archive/systemd/keysharp-input.service"
+sed "s|/run/|$installer_root/run/|g" \
+    "$source_dir/systemd/keysharp-input.socket" \
+    > "$installer_archive/systemd/keysharp-input.socket"
+sed "s|/var/|$installer_root/var/|g; s|/run/|$installer_root/run/|g" \
+    "$source_dir/systemd/keysharp-input-permissions.conf" \
+    > "$installer_archive/tmpfiles/keysharp-input-permissions.conf"
+cp "$source_dir/polkit/org.keysharp.input.policy" \
+    "$installer_archive/polkit/org.keysharp.input.policy"
+cat > "$installer_archive/check-runtime.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$installer_archive/bin/keysharp-input" <<'EOF'
+#!/bin/sh
+set -eu
+[ -f "$KSI_INSTALL_TEST_CACHE" ] || exit 80
+cmp -s "$KSI_INSTALL_TEST_EXPECTED_CONFIG" \
+    "$KSI_INSTALL_TEST_ROOT/etc/ld.so.conf.d/keysharp-input.conf" || exit 81
+case "$*" in
+    info)
+        printf 'info\n' >> "$KSI_INSTALL_TEST_CALLS"
+        printf 'client_abi_major=%s\nclient_abi_minor=%s\n' \
+            "$KSI_INSTALL_TEST_ABI_MAJOR" "$KSI_INSTALL_TEST_ABI_MINOR"
+        ;;
+    'daemon --install-input-access')
+        grep -q '^info$' "$KSI_INSTALL_TEST_CALLS"
+        printf 'daemon\n' >> "$KSI_INSTALL_TEST_CALLS"
+        install -D -m 0644 "$KSI_INSTALL_TEST_UDEV_RULE" \
+            "$KSI_INSTALL_TEST_ROOT/etc/udev/rules.d/70-keysharp-input-uaccess.rules"
+        ;;
+    *) exit 82 ;;
+esac
+EOF
+chmod 0755 "$installer_archive/bin/keysharp-input"
+cat > "$temporary/installer-bin/mock" <<'EOF'
+#!/bin/sh
+set -eu
+case "${0##*/}" in
+    id) printf '0\n' ;;
+    dpkg-query) exit 1 ;;
+    stat)
+        if [ "${1:-}" = -Lc ] && [ "${2:-}" = '%u %a' ]; then
+            printf '0 755\n'
+        else
+            exec "$KSI_INSTALL_TEST_STAT" "$@"
+        fi
+        ;;
+    ldconfig)
+        printf 'ldconfig\n' >> "$KSI_INSTALL_TEST_CALLS"
+        [ "${KSI_INSTALL_TEST_FAIL_CACHE:-0}" = 0 ] || exit 83
+        cmp -s "$KSI_INSTALL_TEST_EXPECTED_CONFIG" \
+            "$KSI_INSTALL_TEST_ROOT/etc/ld.so.conf.d/keysharp-input.conf"
+        printf 'ready\n' > "$KSI_INSTALL_TEST_CACHE"
+        ;;
+    systemctl|systemd-tmpfiles) ;;
+    *) exit 99 ;;
+esac
+EOF
+chmod 0755 "$temporary/installer-bin/mock"
+for command in id dpkg-query stat ldconfig systemctl systemd-tmpfiles; do
+    ln -s mock "$temporary/installer-bin/$command"
+done
+KSI_INSTALL_TEST_ROOT=$installer_root
+KSI_INSTALL_TEST_CALLS=$temporary/installer-calls
+KSI_INSTALL_TEST_CACHE=$temporary/installer-cache
+KSI_INSTALL_TEST_EXPECTED_CONFIG=$temporary/installer-expected.conf
+KSI_INSTALL_TEST_ABI_MAJOR=$expected_client_abi_major
+KSI_INSTALL_TEST_ABI_MINOR=$expected_client_abi_minor
+KSI_INSTALL_TEST_UDEV_RULE=$source_dir/udev/70-keysharp-input-uaccess.rules
+KSI_INSTALL_TEST_STAT=$(command -v stat)
+KSI_INSTALL_TEST_PATH="$temporary/installer-bin:$old_path"
+export KSI_INSTALL_TEST_ROOT KSI_INSTALL_TEST_CALLS KSI_INSTALL_TEST_CACHE \
+    KSI_INSTALL_TEST_EXPECTED_CONFIG KSI_INSTALL_TEST_ABI_MAJOR \
+    KSI_INSTALL_TEST_ABI_MINOR KSI_INSTALL_TEST_UDEV_RULE KSI_INSTALL_TEST_STAT \
+    KSI_INSTALL_TEST_PATH
+printf '%s\n' "$installer_root/usr/local/lib" \
+    > "$KSI_INSTALL_TEST_EXPECTED_CONFIG"
+install_portable_fixture() {
+    if sh "$installer_archive/install.sh" "$@" \
+        > "$temporary/installer-output" 2>&1; then
+        return 0
+    fi
+    cat "$temporary/installer-output" >&2
+    return 1
+}
+install_portable_fixture
+printf 'ldconfig\ninfo\ndaemon\n' > "$temporary/expected-installer-calls"
+cmp "$temporary/expected-installer-calls" "$KSI_INSTALL_TEST_CALLS"
+
+# Reproduce an interrupted installation whose files exist but cannot be loaded.
+rm -f -- "$installer_root/etc/ld.so.conf.d/keysharp-input.conf" \
+    "$KSI_INSTALL_TEST_CACHE" "$KSI_INSTALL_TEST_CALLS"
+install_portable_fixture --skip-if-compatible
+cmp "$temporary/expected-installer-calls" "$KSI_INSTALL_TEST_CALLS"
+configuration_inode=$(stat -c '%i' \
+    "$installer_root/etc/ld.so.conf.d/keysharp-input.conf")
+install_portable_fixture
+[ "$(stat -c '%i' "$installer_root/etc/ld.so.conf.d/keysharp-input.conf")" \
+    = "$configuration_inode" ]
+
+rm -f -- "$KSI_INSTALL_TEST_CACHE" "$KSI_INSTALL_TEST_CALLS"
+if KSI_INSTALL_TEST_FAIL_CACHE=1 sh "$installer_archive/install.sh" \
+    > "$temporary/installer-output" 2>&1; then
+    echo "the portable installer accepted a failed linker-cache refresh" >&2
+    exit 1
+fi
+printf 'ldconfig\n' > "$temporary/expected-failed-installer-calls"
+cmp "$temporary/expected-failed-installer-calls" "$KSI_INSTALL_TEST_CALLS"
+
+printf '# local configuration\n' \
+    > "$installer_root/etc/ld.so.conf.d/keysharp-input.conf"
+cp "$installer_root/etc/ld.so.conf.d/keysharp-input.conf" \
+    "$temporary/installer-edited.conf"
+rm -f -- "$KSI_INSTALL_TEST_CALLS"
+if sh "$installer_archive/install.sh" > "$temporary/installer-output" 2>&1; then
+    echo "the portable installer accepted an edited linker configuration" >&2
+    exit 1
+fi
+[ ! -e "$KSI_INSTALL_TEST_CALLS" ]
+cmp "$temporary/installer-edited.conf" \
+    "$installer_root/etc/ld.so.conf.d/keysharp-input.conf"
 
 sed -n '/^path_present() {$/,/^case /p' \
     "$source_dir/packaging/debian/preinst" | sed '$d' \
@@ -194,7 +384,8 @@ fi
 uninstall_root=$temporary/uninstall-root
 mkdir -p "$uninstall_root/usr/local/bin" "$uninstall_root/usr/local/lib" \
     "$uninstall_root/usr/local/share/doc/keysharp-input" \
-    "$uninstall_root/etc/systemd/system" "$uninstall_root/usr/bin" \
+    "$uninstall_root/etc/systemd/system" "$uninstall_root/etc/ld.so.conf.d" \
+    "$uninstall_root/usr/bin" \
     "$uninstall_root/usr/lib" "$uninstall_root/var/lib/keysharp-permissions/v1" \
     "$uninstall_root/run/keysharp-permissions" "$temporary/uninstall-bin"
 # Translate every system path before running the uninstaller against a disposable tree.
@@ -234,6 +425,8 @@ done
 ln -s libkeysharp-input.so.0.4.0 "$uninstall_root/usr/local/lib/libkeysharp-input.so.0"
 ln -s libkeysharp-input.so.1.0.0 "$uninstall_root/usr/local/lib/libkeysharp-input.so.1"
 ln -s libkeysharp-input.so.1 "$uninstall_root/usr/local/lib/libkeysharp-input.so"
+printf '%s\n' "$uninstall_root/usr/local/lib" \
+    > "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf"
 KSI_UNINSTALL_TEST_CALLS=$temporary/uninstall-calls
 export KSI_UNINSTALL_TEST_CALLS
 if PATH="$temporary/uninstall-bin:$PATH" KSI_UNINSTALL_TEST_STATUS='ii ' \
@@ -251,6 +444,7 @@ for path in \
     usr/local/lib/libkeysharp-input.so.0 usr/local/lib/libkeysharp-input.so.0.4.0 \
     usr/local/lib/libkeysharp-input.so.1 usr/local/lib/libkeysharp-input.so.1.0.0 \
     usr/local/share/doc/keysharp-input \
+    etc/ld.so.conf.d/keysharp-input.conf \
     etc/systemd/system/keysharp-input.service etc/systemd/system/keysharp-input.socket; do
     [ ! -e "$uninstall_root/$path" ] && [ ! -L "$uninstall_root/$path" ]
 done
@@ -263,5 +457,20 @@ done
 grep -q '^systemctl disable --now keysharp-input.service keysharp-input.socket$' \
     "$KSI_UNINSTALL_TEST_CALLS"
 grep -q '^keysharp-input daemon --remove-input-access$' "$KSI_UNINSTALL_TEST_CALLS"
+
+printf '# locally managed\n%s\n' "$uninstall_root/usr/local/lib" \
+    > "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf"
+cp "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf" \
+    "$temporary/uninstall-edited-linker.conf"
+PATH="$temporary/uninstall-bin:$PATH" KSI_UNINSTALL_TEST_STATUS='rc ' \
+    sh "$temporary/uninstall.sh" > "$temporary/uninstall-output" 2>&1
+cmp "$temporary/uninstall-edited-linker.conf" \
+    "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf"
+rm -f -- "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf"
+ln -s "$temporary/uninstall-edited-linker.conf" \
+    "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf"
+PATH="$temporary/uninstall-bin:$PATH" KSI_UNINSTALL_TEST_STATUS='rc ' \
+    sh "$temporary/uninstall.sh" > "$temporary/uninstall-output" 2>&1
+[ -L "$uninstall_root/etc/ld.so.conf.d/keysharp-input.conf" ]
 
 echo "keysharp-input packaging semantics passed"

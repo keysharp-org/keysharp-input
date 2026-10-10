@@ -51,6 +51,11 @@ rm -rf -- /usr/local/share/doc/keysharp-input
 rmdir --ignore-fail-on-non-empty \
     /usr/local/lib/cmake/KeysharpInput \
     /usr/local/include/keysharp_input 2>/dev/null || true
+configuration=/etc/ld.so.conf.d/keysharp-input.conf
+if [ ! -L "$configuration" ] && [ -f "$configuration" ] \
+    && printf '%s\n' /usr/local/lib | cmp -s - "$configuration"; then
+    rm -f -- "$configuration"
+fi
 if command -v ldconfig >/dev/null 2>&1; then
     ldconfig
 fi

@@ -48,6 +48,10 @@ SHA256SUMS
 
 Archives contain the executable, SONAME library, public headers, pkg-config and
 CMake metadata, service files, policy, installer, and standalone docs.
+The archive's `configure-library-path.sh` registers `/usr/local/lib` in
+`/etc/ld.so.conf.d/keysharp-input.conf` before `ldconfig` and service setup.
+Direct source installation registers its configured library directory through
+the same helper. File-only staging does not change the host's linker configuration.
 
 `install.sh --skip-if-compatible` leaves an installed package or portable copy
 untouched when its public client ABI and required runtime resources are
@@ -60,6 +64,8 @@ The portable uninstaller removes only its known `/usr/local` files and exact
 service support files. It never removes `/var/lib/keysharp-permissions` or
 `/run/keysharp-permissions`. Another application's uninstaller must not invoke
 it; package-manager dependency tracking decides when the broker is unused.
+The generated linker configuration is removed only if its contents are unchanged;
+edited files and unrelated linker configuration are preserved.
 
 ## Launchpad PPA
 
