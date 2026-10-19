@@ -22,6 +22,7 @@
 #define HOOK_EVENT 0x1002u
 #define HOOK_QUARANTINED 0x1003u
 #define SYNTHESIZE 0x1010u
+#define UNKNOWN_OPERATION 7u
 #define FUTURE_SCOPE_REVOKED 0x00000004u
 #define FUTURE_SCOPE_KEPT 0x00000008u
 #define FUTURE_HOOK_TYPE 15u
@@ -38,6 +39,11 @@ typedef struct server_state {
     int listener;
     int failed;
 } server_state;
+
+typedef struct callback_state {
+    unsigned int hooks;
+    unsigned int devices;
+} callback_state;
 
 static uint16_t read_u16(const uint8_t *p)
 {
@@ -124,17 +130,30 @@ static void *server_main(void *argument)
         || opcode != HELLO || flags != 0u || size != 16u
         || read_u16(payload) != KSI_ROLE_CALLBACK_STREAM) goto fail;
     memset(payload, 0, 32u); write_u32(payload, KSI_STATUS_OK);
-    write_u32(payload + 8u, KSI_SCOPE_INPUT_CONTROL | FUTURE_SCOPE_REVOKED
+    write_u32(payload + 8u, KSI_SCOPE_INPUT_CONTROL | KSI_SCOPE_INPUT_MONITORING | FUTURE_SCOPE_REVOKED
         | FUTURE_SCOPE_KEPT);
     write_u64(payload + 16u, KSI_OPERATION_HOOK_KEYBOARD
-        | KSI_OPERATION_SYNTHESIZE_KEYBOARD | FUTURE_OPERATION);
+        | KSI_OPERATION_SYNTHESIZE_KEYBOARD | KSI_OPERATION_QUERY_DEVICES | FUTURE_OPERATION);
     if (!send_frame(fd, HELLO, RESPONSE, outer_id, payload, 32u)) goto fail;
 
     if (!receive_frame(fd, &opcode, &flags, &outer_id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_DEVICES_SUBSCRIBE || flags != 0u || size != 0u) goto fail;
+    memset(payload, 0, KSI_STATUS_PAYLOAD_SIZE);
+    if (!send_frame(fd, opcode, RESPONSE, outer_id, payload, KSI_STATUS_PAYLOAD_SIZE)) goto fail;
+
+    if (!receive_frame(fd, &opcode, &flags, &outer_id, payload, sizeof(payload), &size)
         || opcode != SYNTHESIZE || flags != 0u) goto fail;
+    ksi_device_info device = { .struct_size = sizeof(device), .device_id = 7u,
+        .name = "Nested keyboard", .unique = "native-unit", .capabilities = KSI_DEVICE_KEYBOARD };
+    memset(payload, 0, KSI_OBSERVER_PREFIX_SIZE);
+    write_u32(payload, KSI_OBSERVER_DEVICE_ADDED); write_u64(payload + 8u, 2u);
+    ksi_device_encode(payload + KSI_OBSERVER_PREFIX_SIZE, &device);
+    if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload,
+            KSI_OBSERVER_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE)) goto fail;
     memset(payload, 0, 48u); write_u32(payload, KSI_HOOK_KEYBOARD);
     write_u32(payload + 8u, KSI_MESSAGE_KEY_DOWN);
     write_u32(payload + 12u, 0x41u);
+    write_u32(payload + 40u, 7u);
     if (!send_frame(fd, HOOK_EVENT, 0u, event_id, payload, 48u)) goto fail;
 
     if (!receive_frame(fd, &opcode, &flags, &nested_id, payload, sizeof(payload), &size)
@@ -161,6 +180,11 @@ static void *server_main(void *argument)
         || opcode != PING || flags != 0u || nested_id == 0u || size != 0u)
         goto fail;
 
+    memset(payload, 0, KSI_OBSERVER_PREFIX_SIZE);
+    write_u32(payload, KSI_OBSERVER_DEVICE_REMOVED); write_u64(payload + 8u, 3u);
+    ksi_device_encode(payload + KSI_OBSERVER_PREFIX_SIZE, &device);
+    if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload,
+            KSI_OBSERVER_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE)) goto fail;
     memset(payload, 0, 8u);
     if (!send_frame(fd, PING, RESPONSE, nested_id, payload, 8u)) goto fail;
     close(fd); return NULL;
@@ -172,11 +196,20 @@ static ksi_status nested_handler(
     ksi_connection *connection, const ksi_hook_event *event,
     ksi_hook_reply *reply, void *context, ksi_error *error)
 {
-    unsigned int *calls = context;
-    (*calls)++;
-    if (event->hook_type != KSI_HOOK_KEYBOARD) return KSI_STATUS_INTERNAL;
+    callback_state *calls = context;
+    calls->hooks++;
+    if (event->hook_type != KSI_HOOK_KEYBOARD || event->event.keyboard.device_id != 7u
+        || calls->devices != 1u) return KSI_STATUS_INTERNAL;
     ksi_hook_reply_init(reply);
     return ksi_synthesize(connection, NULL, 0u, KSI_SYNTH_BYPASS_HOOK, NULL, error);
+}
+
+static void device_handler(const ksi_observer_message *message, void *context)
+{
+    callback_state *calls = context;
+    if (message->kind == KSI_OBSERVER_DEVICE_ADDED && message->device_generation == 2u
+        && message->data.device.device_id == 7u
+        && strcmp(message->data.device.unique, "native-unit") == 0) calls->devices++;
 }
 
 static void *observer_server(void *argument)
@@ -204,6 +237,10 @@ static void *observer_server(void *argument)
     if (!send_frame(fd, KSI_OPCODE_OBSERVER_EVENT, EVENT, 0u, payload, 72u)) goto fail;
     memset(payload, 0, 16u); write_u32(payload + 8u, KSI_OPERATION_OBSERVE_KEYBOARD);
     if (!send_frame(fd, KSI_OPCODE_SUBSCRIBE_HOOK, RESPONSE, id, payload, 16u)) goto fail;
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_DEVICES_SUBSCRIBE || size != 0u) goto fail;
+    memset(payload, 0, KSI_STATUS_PAYLOAD_SIZE);
+    if (!send_frame(fd, KSI_OPCODE_DEVICES_SUBSCRIBE, RESPONSE, id, payload, KSI_STATUS_PAYLOAD_SIZE)) goto fail;
     if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
         || opcode != KSI_OPCODE_DEVICES_LIST || size != KSI_DEVICE_LIST_REQUEST_SIZE) goto fail;
     ksi_device_info device = { .struct_size = sizeof(device), .device_id = 7u,
@@ -276,8 +313,82 @@ static bool visit_gamepad(const ksi_device_info *device, void *context)
     return true;
 }
 
-static int run_client_test(bool observer)
+static void *metadata_server(void *argument)
 {
+    server_state *state = argument;
+    uint8_t payload[64];
+    uint16_t opcode, flags;
+    uint64_t id;
+    size_t size;
+    int fd = accept(state->listener, NULL, NULL);
+    if (fd < 0) { state->failed = 1; return NULL; }
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != HELLO || size != KSI_HELLO_PAYLOAD_SIZE
+        || read_u16(payload) != KSI_ROLE_AUTHORIZATION_LEASE
+        || read_u32(payload + 4u) != 0u) goto fail;
+    memset(payload, 0, KSI_HELLO_RESULT_PAYLOAD_SIZE);
+    write_u64(payload + 16u, KSI_OPERATION_QUERY_DEVICES);
+    write_u64(payload + 24u, 12u);
+    if (!send_frame(fd, HELLO, RESPONSE, id, payload, KSI_HELLO_RESULT_PAYLOAD_SIZE)) goto fail;
+    if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+        || opcode != KSI_OPCODE_DEVICES_AUTHORIZE || size != 0u) goto fail;
+    memset(payload, 0, KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE);
+    write_u32(payload + 8u, KSI_SCOPE_INPUT_MONITORING);
+    if (!send_frame(fd, KSI_OPCODE_DEVICES_AUTHORIZE, RESPONSE, id, payload,
+            KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE)) goto fail;
+    if (read(fd, payload, 1u) != 0) goto fail;
+    close(fd);
+    return NULL;
+fail:
+    state->failed = 1;
+    close(fd);
+    return NULL;
+}
+
+/* A 1.0 service answers the device operations as unknown and stays usable. */
+static void *legacy_server(void *argument)
+{
+    static const uint16_t requests[] = { KSI_OPCODE_DEVICES_AUTHORIZE,
+        KSI_OPCODE_DEVICES_SUBSCRIBE, KSI_OPCODE_DEVICES_SUBSCRIBE };
+    server_state *state = argument;
+    uint8_t payload[64];
+    uint16_t opcode, flags;
+    uint64_t id;
+    size_t size;
+    for (size_t i = 0u; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        int fd = accept(state->listener, NULL, NULL);
+        if (fd < 0) { state->failed = 1; return NULL; }
+        if (!receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+            || opcode != HELLO || size != KSI_HELLO_PAYLOAD_SIZE) goto fail;
+        memset(payload, 0, KSI_HELLO_RESULT_PAYLOAD_SIZE);
+        write_u32(payload + 8u, KSI_SCOPE_INPUT_MONITORING);
+        write_u64(payload + 24u, 12u);
+        if (!send_frame(fd, HELLO, RESPONSE, id, payload, KSI_HELLO_RESULT_PAYLOAD_SIZE)
+            || !receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+            || opcode != requests[i] || size != 0u) goto fail;
+        write_u32(payload, KSI_STATUS_UNSUPPORTED);
+        write_u32(payload + 4u, UNKNOWN_OPERATION);
+        if (!send_frame(fd, opcode, RESPONSE, id, payload, KSI_STATUS_PAYLOAD_SIZE)
+            || !receive_frame(fd, &opcode, &flags, &id, payload, sizeof(payload), &size)
+            || opcode != PING || size != 0u) goto fail;
+        memset(payload, 0, KSI_STATUS_PAYLOAD_SIZE);
+        if (!send_frame(fd, PING, RESPONSE, id, payload, KSI_STATUS_PAYLOAD_SIZE)
+            || read(fd, payload, 1u) != 0) goto fail;
+        close(fd);
+        continue;
+fail:
+        state->failed = 1;
+        close(fd);
+        return NULL;
+    }
+    return NULL;
+}
+
+static int run_client_test(unsigned int mode)
+{
+    bool observer = mode == 1u;
+    bool metadata = mode == 2u;
+    bool legacy = mode == 3u;
     char directory[] = "/tmp/keysharp-input-client-XXXXXX";
     char socket_path[108];
     struct sockaddr_un address;
@@ -288,7 +399,7 @@ static int run_client_test(bool observer)
     ksi_error error;
     ksi_connection *connection = NULL;
     ksi_hook_message message;
-    unsigned int callback_calls = 0u;
+    callback_state callback_calls = {0};
     int result = 1;
 
     ksi_connect_options_init(&options);
@@ -302,12 +413,52 @@ static int run_client_test(bool observer)
     memcpy(address.sun_path, socket_path, strlen(socket_path) + 1u);
     if (bind(server.listener, (struct sockaddr *)&address, sizeof(address)) != 0
         || listen(server.listener, 1) != 0
-        || pthread_create(&thread, NULL, observer ? observer_server : server_main, &server) != 0) goto done;
+        || pthread_create(&thread, NULL, legacy ? legacy_server : metadata ? metadata_server
+            : observer ? observer_server : server_main, &server) != 0) goto done;
 
     options.socket_path = socket_path;
-    options.role = observer ? KSI_ROLE_OBSERVER_STREAM : KSI_ROLE_CALLBACK_STREAM;
-    options.requested_scopes = observer ? KSI_SCOPE_INPUT_MONITORING : KSI_SCOPE_INPUT_CONTROL;
+    options.role = metadata ? KSI_ROLE_AUTHORIZATION_LEASE
+        : observer ? KSI_ROLE_OBSERVER_STREAM : KSI_ROLE_CALLBACK_STREAM;
+    options.requested_scopes = metadata ? 0u
+        : observer ? KSI_SCOPE_INPUT_MONITORING : KSI_SCOPE_INPUT_CONTROL;
     ksi_service_info_init(&info); ksi_error_init(&error);
+    if (legacy) {
+        static const uint32_t roles[] = { KSI_ROLE_AUTHORIZATION_LEASE,
+            KSI_ROLE_OBSERVER_STREAM, KSI_ROLE_CALLBACK_STREAM };
+        options.timeout_ms = 2000u;
+        options.requested_scopes = 0u;
+        for (size_t i = 0u; i < sizeof(roles) / sizeof(roles[0]); i++) {
+            ksi_permission_scopes granted = 0u;
+            ksi_status status;
+            options.role = roles[i];
+            if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK) goto joined;
+            if (roles[i] == KSI_ROLE_AUTHORIZATION_LEASE) {
+                status = ksi_devices_authorize(connection, &granted, &error);
+            } else {
+                if (roles[i] == KSI_ROLE_CALLBACK_STREAM
+                    && ksi_set_device_change_handler(connection, device_handler,
+                        &callback_calls, &error) != KSI_STATUS_OK) goto joined;
+                status = ksi_devices_subscribe(connection, &error);
+            }
+            if (status != KSI_STATUS_UNSUPPORTED || error.detail != UNKNOWN_OPERATION
+                || granted != 0u || ksi_ping(connection, &error) != KSI_STATUS_OK) goto joined;
+            ksi_disconnect(connection);
+            connection = NULL;
+        }
+        result = 0;
+        goto joined;
+    }
+    if (metadata) {
+        ksi_permission_scopes granted = 0u;
+        if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
+            || info.lease_id != 12u
+            || ksi_devices_subscribe(connection, &error) != KSI_STATUS_INVALID_REQUEST
+            || ksi_devices_authorize(connection, &granted, &error) != KSI_STATUS_OK
+            || granted != KSI_SCOPE_INPUT_MONITORING)
+            goto joined;
+        result = 0;
+        goto joined;
+    }
     if (observer) {
         ksi_observer_message observation;
         ksi_operations active = 0u;
@@ -323,6 +474,7 @@ static int run_client_test(bool observer)
             || ksi_observer_next(connection, 1000u, &observation, &error) != KSI_STATUS_OK
             || observation.kind != KSI_OBSERVER_INPUT || observation.data.input.request_id != 0u
             || observation.data.input.event.keyboard.device_id != 7u
+            || ksi_devices_subscribe(connection, &error) != KSI_STATUS_OK
             || ksi_devices_list(connection, visit_device, &device_count, NULL, &error) != KSI_STATUS_OK
             || device_count != 1u
             || ksi_gamepads_list(connection, visit_gamepad, &gamepad_count, &generation, &error) != KSI_STATUS_OK
@@ -346,15 +498,19 @@ static int run_client_test(bool observer)
         goto joined;
     }
     if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
+        || ksi_devices_subscribe(connection, &error) != KSI_STATUS_INVALID_REQUEST
         || ksi_set_nested_hook_handler(connection, nested_handler,
             &callback_calls, &error) != KSI_STATUS_OK
+        || ksi_set_device_change_handler(connection, device_handler,
+            &callback_calls, &error) != KSI_STATUS_OK
+        || ksi_devices_subscribe(connection, &error) != KSI_STATUS_OK
         || ksi_synthesize(connection, NULL, 0u,
             KSI_SYNTH_BYPASS_HOOK, NULL, &error) != KSI_STATUS_OK
         || ksi_connection_sequence(connection) != 2u
-        || callback_calls != 1u
+        || callback_calls.hooks != 1u || callback_calls.devices != 1u
         || ksi_connection_available_operations(connection)
             != (KSI_OPERATION_HOOK_KEYBOARD | KSI_OPERATION_SYNTHESIZE_KEYBOARD
-                | FUTURE_OPERATION)) goto joined;
+                | KSI_OPERATION_QUERY_DEVICES | FUTURE_OPERATION)) goto joined;
     ksi_hook_message_init(&message);
     if (ksi_hook_next(connection, 0u, &message, &error) != KSI_STATUS_OK
         || message.kind != KSI_HOOK_MESSAGE_QUARANTINED
@@ -368,7 +524,9 @@ static int run_client_test(bool observer)
     ksi_hook_message_init(&message);
     if (ksi_hook_next(connection, 1u, &message, &error) != KSI_STATUS_TIMEOUT)
         goto joined;
-    if (ksi_ping(connection, &error) != KSI_STATUS_OK) goto joined;
+    if (ksi_set_device_change_handler(connection, NULL, NULL, &error) != KSI_STATUS_OK
+        || ksi_ping(connection, &error) != KSI_STATUS_OK
+        || callback_calls.devices != 1u) goto joined;
     result = 0;
 joined:
     ksi_disconnect(connection); pthread_join(thread, NULL);
@@ -381,5 +539,6 @@ done:
 
 int main(void)
 {
-    return run_client_test(false) || run_client_test(true);
+    return run_client_test(0u) || run_client_test(1u) || run_client_test(2u)
+        || run_client_test(3u);
 }

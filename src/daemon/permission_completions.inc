@@ -28,6 +28,8 @@ static void process_permission_done(ksi_daemon_state *state, ksi_permission_task
         }
         for (nfds_t i = 0u; i < state->client_count; i++) state->clients[i].permission_refresh_pending = false;
         if (update_grab_state(state) != 0) permission_monitor_fail_open(state);
+        /* Resumed observers hear what the refresh made them miss before newer input. */
+        flush_observers(state);
         return;
     }
 
@@ -71,7 +73,8 @@ static void process_permission_done(ksi_daemon_state *state, ksi_permission_task
         send_pending_authorization_status(client, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE, 0u);
         return;
     }
-    if (granted != 0u && (client->connection_role != KSI_ROLE_OBSERVER_STREAM
+    if (granted != 0u && client->pending_authorization_opcode != KSI_OPCODE_DEVICES_AUTHORIZE
+        && (client->connection_role != KSI_ROLE_OBSERVER_STREAM
             || (granted & KSP_SCOPE_INPUT_CONTROL) != 0u)) prepare_requested_scopes(state, granted);
     client->pending_authorization = false;
     finish_client_authorization(state, client, client->pending_authorization_opcode,

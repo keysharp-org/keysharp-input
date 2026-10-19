@@ -57,6 +57,8 @@ struct ksi_connection {
     uint32_t recursion_depth;
     ksi_nested_hook_handler nested_handler;
     void *nested_context;
+    ksi_device_change_handler device_handler;
+    void *device_context;
     ksi_hook_message notifications[KSI_CLIENT_NOTIFICATION_CAPACITY];
     uint32_t notification_head;
     uint32_t notification_count;
@@ -845,9 +847,17 @@ static bool queue_service_event(
     if (connection->role == KSI_ROLE_AUTHORIZATION_LEASE || connection->role == KSI_ROLE_RPC)
         return queue_lease_event(connection, header);
     ksi_hook_message_init(&message);
-    if (header->opcode == KSI_OPCODE_OBSERVER_EVENT && connection->role == KSI_ROLE_OBSERVER_STREAM) {
+    if (header->opcode == KSI_OPCODE_OBSERVER_EVENT
+        && (connection->role == KSI_ROLE_OBSERVER_STREAM || connection->role == KSI_ROLE_CALLBACK_STREAM)) {
         ksi_observer_message observation;
         if (!decode_observer(header, connection->rx, &observation)) return false;
+        if (connection->role == KSI_ROLE_CALLBACK_STREAM) {
+            if (observation.kind < KSI_OBSERVER_DEVICE_ADDED
+                || observation.kind > KSI_OBSERVER_OVERFLOW) return false;
+            if (connection->device_handler != NULL)
+                connection->device_handler(&observation, connection->device_context);
+            return true;
+        }
         if (connection->observer_count == KSI_CLIENT_NOTIFICATION_CAPACITY) {
             if (connection->observer_dropped != UINT64_MAX) connection->observer_dropped++;
         } else {
@@ -1321,6 +1331,33 @@ uint64_t ksi_connection_sequence(const ksi_connection *connection)
     return connection == NULL ? 0u : connection->sequence;
 }
 
+static ksi_status authorize_request(
+    ksi_connection *connection,
+    uint16_t opcode,
+    const void *payload,
+    size_t payload_size,
+    ksi_permission_scopes *granted_scopes,
+    ksi_error *error)
+{
+    ksi_wire_header response;
+    ksi_status status = simple_request(connection, opcode,
+        payload, payload_size, KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE,
+        &response, error);
+
+    if (status != KSI_STATUS_OK) {
+        return status;
+    }
+    if (read_u32(connection->rx + 12u) != 0u) {
+        return invalid_result(connection, error, "authorization");
+    }
+    connection->granted_scopes |= read_u32(connection->rx + 8u)
+        & (uint32_t)KSI_SCOPE_ALL;
+    if (granted_scopes != NULL) {
+        *granted_scopes = connection->granted_scopes;
+    }
+    return KSI_STATUS_OK;
+}
+
 ksi_status ksi_authorize(
     ksi_connection *connection,
     ksi_authorization_mode authorization_mode,
@@ -1329,8 +1366,6 @@ ksi_status ksi_authorize(
     ksi_error *error)
 {
     uint8_t payload[KSI_AUTHORIZE_PAYLOAD_SIZE] = { 0 };
-    ksi_wire_header response;
-    ksi_status status;
 
     if (connection == NULL || authorization_mode > KSI_AUTH_REQUEST
         || requested_scopes == 0u
@@ -1340,22 +1375,8 @@ ksi_status ksi_authorize(
     }
     write_u16(payload, (uint16_t)authorization_mode);
     write_u32(payload + 4u, requested_scopes);
-    status = simple_request(connection, KSI_OPCODE_AUTHORIZE,
-        payload, sizeof(payload), KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE,
-        &response, error);
-    if (status != KSI_STATUS_OK) {
-        return status;
-    }
-    if (read_u32(connection->rx + 12u) != 0u) {
-        set_error(error, 0u, 0, "service returned invalid authorization data");
-        return terminal_failure(connection, KSI_STATUS_INTERNAL);
-    }
-    connection->granted_scopes |= read_u32(connection->rx + 8u)
-        & (uint32_t)KSI_SCOPE_ALL;
-    if (granted_scopes != NULL) {
-        *granted_scopes = connection->granted_scopes;
-    }
-    return KSI_STATUS_OK;
+    return authorize_request(connection, KSI_OPCODE_AUTHORIZE,
+        payload, sizeof(payload), granted_scopes, error);
 }
 
 ksi_status ksi_ping(ksi_connection *connection, ksi_error *error)
@@ -1651,6 +1672,36 @@ ksi_status ksi_gamepads_list(ksi_connection *connection,
 {
     return devices_list_paged(connection, KSI_OPCODE_GAMEPADS_LIST,
         visitor, context, snapshot_generation, error);
+}
+
+ksi_status ksi_devices_authorize(ksi_connection *lease,
+    ksi_permission_scopes *granted_scopes, ksi_error *error)
+{
+    if (lease == NULL || lease->role != KSI_ROLE_AUTHORIZATION_LEASE)
+        return invalid_output(error, "device authorization lease");
+    return authorize_request(lease, KSI_OPCODE_DEVICES_AUTHORIZE,
+        NULL, 0u, granted_scopes, error);
+}
+
+ksi_status ksi_set_device_change_handler(ksi_connection *connection,
+    ksi_device_change_handler handler, void *context, ksi_error *error)
+{
+    if (connection == NULL || connection->role != KSI_ROLE_CALLBACK_STREAM)
+        return invalid_output(error, "device callback stream");
+    connection->device_handler = handler;
+    connection->device_context = context;
+    clear_error(error);
+    return KSI_STATUS_OK;
+}
+
+ksi_status ksi_devices_subscribe(ksi_connection *connection, ksi_error *error)
+{
+    if (connection == NULL || (connection->role != KSI_ROLE_OBSERVER_STREAM
+            && (connection->role != KSI_ROLE_CALLBACK_STREAM || connection->device_handler == NULL)))
+        return invalid_output(error, "device observer");
+    ksi_wire_header response;
+    return simple_request(connection, KSI_OPCODE_DEVICES_SUBSCRIBE, NULL, 0u,
+        KSI_STATUS_PAYLOAD_SIZE, &response, error);
 }
 
 ksi_status ksi_get_gamepad_state(ksi_connection *connection, uint32_t device_id,

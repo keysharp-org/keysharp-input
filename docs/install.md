@@ -69,7 +69,8 @@ same channel, or reinstall the package. The source and archive installers do not
 overwrite an edited `/etc/udev/rules.d/70-keysharp-input-uaccess.rules`; remove
 it and rerun the installer to restore the shipped rule. Do not layer a tar
 installation over a package. Inspect `journalctl -u keysharp-input.service` for device or authorization
-failures. Holding **Backspace+Escape+Enter** releases grabs, hooks and input blocking.
+failures. Holding **Backspace+Escape+Enter** releases grabs, hooks and input blocking;
+a client that requests blocking again afterwards blocks input again.
 
 ## Upgrade and remove
 

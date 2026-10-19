@@ -569,6 +569,7 @@ static bool output_queue_push_release_owner(
 static bool input_owner_matches_uid(
     const ksi_daemon_state *state, uid_t uid);
 static void update_observer_callbacks(ksi_daemon_state *state);
+static void flush_observers(ksi_daemon_state *state);
 static uint64_t current_input_generation(const ksi_daemon_state *state);
 static uint64_t advance_input_generation(ksi_daemon_state *state);
 static void request_fail_open(ksi_daemon_state *state);
@@ -752,8 +753,7 @@ static void set_active_input_owner(
         &state->active_input_uid_valid, false, memory_order_release);
     generation = advance_input_generation(state);
     for (nfds_t i = 0u; i < state->client_count; i++) {
-        state->clients[i].observer_count = 0u;
-        state->clients[i].observer_dropped = 0u;
+        observer_discard(state, &state->clients[i]);
     }
 
     lane_flush_passthrough(&state->keyboard_lane);
@@ -799,6 +799,9 @@ static void set_active_input_owner(
         fprintf(stderr,
             "keysharp-input: failed to restore active seat0 user's grabs\n");
     }
+
+    /* The returning owner's observers hear what they missed before its input. */
+    flush_observers(state);
 
     fprintf(stderr,
         "keysharp-input: seat0 input owner uid=%ld generation=%llu\n",

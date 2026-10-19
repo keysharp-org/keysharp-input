@@ -1,10 +1,13 @@
+#include <fcntl.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -20,9 +23,13 @@ void recorded_apply_end_grab(uint64_t next, const uint8_t *held);
 /* White-box coverage for the daemon's private admission and operation gates. */
 #define ksp_store_check_at_generation delayed_permission_check
 #define ksi_linux_forward_apply_end_grab recorded_apply_end_grab
+#define ksi_linux_devices_set_observer_callback recorded_set_observer_callback
+#define ksi_linux_devices_set_raw_observer_callback recorded_set_raw_observer_callback
 #include "../src/daemon.c"
 #undef ksp_store_check_at_generation
 #undef ksi_linux_forward_apply_end_grab
+#undef ksi_linux_devices_set_observer_callback
+#undef ksi_linux_devices_set_raw_observer_callback
 
 void ksi_linux_forward_apply_end_grab(uint64_t next, const uint8_t *held);
 static uint64_t applied_end_grab;
@@ -30,6 +37,26 @@ void recorded_apply_end_grab(uint64_t next, const uint8_t *held)
 {
     applied_end_grab = next;
     ksi_linux_forward_apply_end_grab(next, held);
+}
+
+void ksi_linux_devices_set_observer_callback(ksi_hook_event_callback callback,
+    ksi_device_change_callback device_callback, void *context);
+void ksi_linux_devices_set_raw_observer_callback(ksi_raw_device_callback callback, void *context);
+/* The observer callbacks the daemon installed last. */
+static ksi_hook_event_callback installed_input;
+static ksi_device_change_callback installed_device;
+static ksi_raw_device_callback installed_raw;
+void recorded_set_observer_callback(ksi_hook_event_callback callback,
+    ksi_device_change_callback device_callback, void *context)
+{
+    installed_input = callback;
+    installed_device = device_callback;
+    ksi_linux_devices_set_observer_callback(callback, device_callback, context);
+}
+void recorded_set_raw_observer_callback(ksi_raw_device_callback callback, void *context)
+{
+    installed_raw = callback;
+    ksi_linux_devices_set_raw_observer_callback(callback, context);
 }
 
 #include <libevdev/libevdev.h>
@@ -60,10 +87,18 @@ static pthread_mutex_t permission_barrier = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t permission_condition = PTHREAD_COND_INITIALIZER;
 static bool permission_worker_entered;
 static bool release_permission_worker;
+/* A store holding stored_grants for every executable. */
+static char store_fixture;
+static atomic_uint stored_grants;
 
 static int delayed_permission_check(const ksp_store *store, uid_t uid,
     const char *hash, uint32_t scopes, uint32_t *allowed, uint64_t *generation)
 {
+    if (store == (const ksp_store *)&store_fixture) {
+        *allowed = atomic_load(&stored_grants) & scopes;
+        *generation = 1u;
+        return 0;
+    }
     if (!atomic_load(&delay_permission_io))
         return ksp_store_check_at_generation(store, uid, hash, scopes, allowed, generation);
     pthread_mutex_lock(&permission_barrier);
@@ -1386,7 +1421,7 @@ static bool test_hook_routed_send_replies_after_hooks(void)
 
 static bool read_service_event(int fd, uint16_t opcode, uint8_t *payload, size_t size)
 {
-    uint8_t frame[KSI_FRAME_HEADER_SIZE + KSI_KEY_STATE_EVENT_PAYLOAD_SIZE];
+    uint8_t frame[KSI_FRAME_HEADER_SIZE + KSI_OBSERVER_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE];
     size_t received;
     struct pollfd wait = { .fd = fd, .events = POLLIN };
     CHECK(poll(&wait, 1u, 1000) == 1);
@@ -1534,9 +1569,392 @@ static bool test_identity_accept_guard(void)
     return true;
 }
 
+static unsigned int inventory_preparations;
+static void record_inventory_preparation(uint32_t scopes)
+{
+    (void)scopes;
+    inventory_preparations++;
+}
+
+/* Runs daemon commands until the client's permission check has completed. */
+static bool finish_permission_check(ksi_daemon_state *state, const ksi_client *client)
+{
+    struct pollfd wake = { .fd = ksi_pipe_ring_wake_fd(&state->commands->ring), .events = POLLIN };
+    uint64_t deadline = monotonic_ms() + 1000u;
+    while (client->permission_task != NULL && monotonic_ms() < deadline) {
+        if (poll(&wake, 1u, 100) == 1) ksi_pipe_ring_drain_wake(&state->commands->ring);
+        process_daemon_commands(state);
+    }
+    return client->permission_task == NULL;
+}
+
+/* DEVICES_AUTHORIZE runs a real check that never prompts, and answers as
+ * AUTHORIZE does: grant event, replacement snapshot, then the reply. */
+static bool authorize_inventory(ksi_daemon_state *state, ksi_client *client,
+    int peer, uint64_t request_id, uint32_t status, uint32_t granted)
+{
+    uint8_t grant[KSI_SESSION_REVOKED_PAYLOAD_SIZE];
+    uint8_t snapshot[KSI_KEY_STATE_EVENT_PAYLOAD_SIZE];
+    uint8_t result[KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE] = { 0 };
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_AUTHORIZE, request_id, NULL, 0u));
+    CHECK(client->pending_authorization && client->pending_authorization_mode == KSI_AUTH_CHECK
+        && client->permission_task != NULL);
+    CHECK(finish_permission_check(state, client));
+    CHECK(read_service_event(peer, KSI_OPCODE_SESSION_GRANTED, grant, sizeof(grant)));
+    CHECK(ksi_wire_read_u32(grant) == granted);
+    CHECK(read_service_event(peer, KSI_OPCODE_KEY_STATE_EVENT, snapshot, sizeof(snapshot)));
+    CHECK(ksi_wire_read_u32(snapshot) == 3u);
+    CHECK(read_status_response(peer, KSI_OPCODE_DEVICES_AUTHORIZE, request_id,
+        status == KSI_STATUS_OK ? KSI_AUTHORIZE_RESULT_PAYLOAD_SIZE : KSI_STATUS_PAYLOAD_SIZE,
+        status, KSI_DETAIL_NONE, result));
+    CHECK(status != KSI_STATUS_OK || ksi_wire_read_u32(result + 8u) == granted);
+    CHECK(!client->pending_authorization && client->state == KSI_CLIENT_STATE_READY);
+    CHECK(client_grants(client) == granted);
+    return true;
+}
+
+static bool test_inventory_authorization_and_notifications(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    ksi_daemon_command_queue commands;
+    int sockets[2];
+    uint8_t request[KSI_HOOK_SUBSCRIPTION_PAYLOAD_SIZE] = { 0 };
+    uint8_t snapshot[KSI_KEY_STATE_EVENT_PAYLOAD_SIZE];
+    const ksi_platform_backend backend = { .prepare_scopes = record_inventory_preparation };
+    CHECK(state != NULL && command_queue_init(&commands) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    CHECK(ksi_worker_pool_init(&g_permission_worker_pool) == 0);
+    state->backend = &backend;
+    state->commands = &commands;
+    state->permissions = (ksp_store *)&store_fixture;
+    state->client_count = 1u;
+    ksi_client *client = &state->clients[0];
+    *client = (ksi_client){ .fd = sockets[0], .uid = getuid(), .connection_id = 7u,
+        .state = KSI_CLIENT_STATE_READY, .connection_role = KSI_ROLE_AUTHORIZATION_LEASE,
+        .hello_complete = true, .identity_attempted = true, .has_identity = true,
+        .authorization_lease = test_lease(0u), .hook_send_ref = hook_send_ref_create(sockets[0]),
+        .rx_buffer = calloc(1u, KSI_MAX_MESSAGE_SIZE) };
+    CHECK(client->hook_send_ref != NULL && client->rx_buffer != NULL);
+    CHECK(dispatch_request(state, client, KSI_OPCODE_KEY_STATE_SUBSCRIBE, 1u, NULL, 0u));
+    CHECK(read_service_event(sockets[1], KSI_OPCODE_KEY_STATE_EVENT, snapshot, sizeof(snapshot)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_KEY_STATE_SUBSCRIBE, 1u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_AUTHORIZE, 2u, request, 1u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_AUTHORIZE, 2u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE, NULL));
+    inventory_preparations = 0u;
+    /* A store without Input Monitoring denies, and Input Control is not taken from it. */
+    atomic_store(&stored_grants, KSI_SCOPE_INPUT_CONTROL);
+    CHECK(authorize_inventory(state, client, sockets[1], 3u, KSI_STATUS_DENIED, 0u));
+    atomic_store(&stored_grants, KSI_SCOPE_INPUT_MONITORING | KSI_SCOPE_INPUT_CONTROL);
+    CHECK(authorize_inventory(state, client, sockets[1], 4u, KSI_STATUS_OK, KSI_SCOPE_INPUT_MONITORING));
+    CHECK(inventory_preparations == 0u && !state->interception_active);
+    CHECK(client_has_scope(client, KSI_SCOPE_INPUT_MONITORING));
+
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_SUBSCRIBE, 5u, NULL, 0u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_SUBSCRIBE, 5u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_WRONG_ROLE, NULL));
+    client->connection_role = KSI_ROLE_OBSERVER_STREAM;
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_AUTHORIZE, 6u, NULL, 0u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_AUTHORIZE, 6u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_WRONG_ROLE, NULL));
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_SUBSCRIBE, 7u, request, 1u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_SUBSCRIBE, 7u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE, NULL));
+    state->input_owner_enforced = true;
+    atomic_store(&state->active_input_uid, (unsigned int)getuid() + 1u);
+    atomic_store(&state->active_input_uid_valid, true);
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_SUBSCRIBE, 8u, NULL, 0u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_SUBSCRIBE, 8u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
+    state->input_owner_enforced = false;
+    CHECK(client->observer_subscriptions == 0u);
+
+    /* Device notices alone install no input or raw observation. */
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_SUBSCRIBE, 9u, NULL, 0u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_SUBSCRIBE, 9u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+    CHECK(client->observer_subscriptions == KSI_OPERATION_QUERY_DEVICES && client->hook_subscriptions == 0u);
+    CHECK(installed_input == NULL && installed_raw == NULL && installed_device == daemon_observe_device);
+    ksi_wire_write_u32(request, KSI_HOOK_MOUSE);
+    CHECK(dispatch_request(state, client, KSI_OPCODE_SUBSCRIBE_HOOK, 10u, request, sizeof(request)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_SUBSCRIBE_HOOK, 10u,
+        KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+    CHECK(installed_input == daemon_observe_input && installed_raw == daemon_observe_raw);
+    CHECK(dispatch_request(state, client, KSI_OPCODE_UNSUBSCRIBE_HOOK, 11u, request, sizeof(request)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_UNSUBSCRIBE_HOOK, 11u,
+        KSI_HOOK_SUBSCRIPTION_RESULT_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+    CHECK(installed_input == NULL && installed_raw == NULL && installed_device == daemon_observe_device);
+    ksi_keyboard_hook_event key = { .message = KSI_MESSAGE_KEY_DOWN, .vk_code = 'A' };
+    daemon_observe_input(state, KSI_HOOK_KEYBOARD, &key, sizeof(key));
+    CHECK(client->observer_count == 0u);
+    ksi_device_info device = { .struct_size = sizeof(device), .device_id = 7u,
+        .capabilities = KSI_DEVICE_KEYBOARD, .name = "Keyboard", .unique = "native-unit" };
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_ADDED, &device, 2u);
+    CHECK(client->observer_count == 1u
+        && ksi_wire_read_u32(client->observer_queue[0].payload) == KSI_OBSERVER_DEVICE_ADDED
+        && ksi_wire_read_u64(client->observer_queue[0].payload + 8u) == 2u);
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_REMOVED, &device, 3u);
+    CHECK(client->observer_count == 2u
+        && ksi_wire_read_u32(client->observer_queue[1].payload) == KSI_OBSERVER_DEVICE_REMOVED);
+    CHECK(inventory_preparations == 0u && !state->interception_active);
+    client->connection_role = KSI_ROLE_CALLBACK_STREAM;
+    client->observer_count = 0u;
+    client->observer_subscriptions = 0u;
+    update_observer_callbacks(state);
+    CHECK(installed_input == NULL && installed_raw == NULL && installed_device == NULL);
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_SUBSCRIBE, 12u, NULL, 0u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_SUBSCRIBE, 12u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_OK, KSI_DETAIL_NONE, NULL));
+    CHECK(installed_input == NULL && installed_raw == NULL && installed_device == daemon_observe_device);
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_ADDED, &device, 4u);
+    uint8_t metadata[KSI_OBSERVER_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE];
+    CHECK(read_service_event(sockets[1], KSI_OPCODE_OBSERVER_EVENT, metadata, sizeof(metadata)));
+    CHECK(ksi_wire_read_u32(metadata) == KSI_OBSERVER_DEVICE_ADDED
+        && ksi_wire_read_u64(metadata + 8u) == 4u && client->observer_count == 0u);
+    client->authorization_lease->granted_scopes = 0u;
+    CHECK(dispatch_request(state, client, KSI_OPCODE_DEVICES_SUBSCRIBE, 13u, NULL, 0u));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_DEVICES_SUBSCRIBE, 13u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
+    ksi_worker_pool_request_stop(&g_permission_worker_pool);
+    CHECK(ksi_worker_pool_join_before(&g_permission_worker_pool, monotonic_ms() + 1000u));
+    ksi_worker_pool_destroy(&g_permission_worker_pool);
+    hook_send_ref_invalidate(client->hook_send_ref);
+    hook_send_ref_release(client->hook_send_ref);
+    free(client->authorization_lease);
+    free(client->rx_buffer);
+    free(client->observer_queue);
+    ksi_linux_devices_set_observer_callback(NULL, NULL, NULL);
+    ksi_linux_devices_set_raw_observer_callback(NULL, NULL);
+    command_queue_destroy(&commands);
+    close(sockets[1]);
+    free(state);
+    return true;
+}
+
+typedef struct held_send {
+    ksi_hook_send_ref *ref;
+    int result;
+} held_send;
+
+/* A lane writing a hook frame larger than the socket buffer holds the send
+ * lock until the reader drains it. */
+static void *send_held_hook_frame(void *context)
+{
+    static uint8_t payload[KSI_MAX_PAYLOAD_SIZE];
+    held_send *held = context;
+    ksi_ipc_set_write_drain_budget_ms(5000);
+    held->result = hook_send_ref_send(held->ref, KSI_OPCODE_HOOK_EVENT, 0u, 9u,
+        payload, sizeof(payload));
+    return NULL;
+}
+
+typedef struct late_reader {
+    int fd;
+    uint16_t opcodes[2];
+    uint32_t notice_kind;
+} late_reader;
+
+/* Drains only once the publisher has had time to reach the send lock. */
+static void *read_two_frames_late(void *context)
+{
+    late_reader *late = context;
+    uint8_t *frame = malloc(KSI_MAX_MESSAGE_SIZE);
+    const struct timespec delay = { .tv_nsec = 100000000L };
+    (void)nanosleep(&delay, NULL);
+    for (size_t i = 0u; frame != NULL && i < 2u; i++) {
+        ksi_message_header header;
+        size_t size = 0u;
+        if (ksi_ipc_read_framed_message(late->fd, frame, KSI_MAX_MESSAGE_SIZE, &size) != 1
+            || !ksi_frame_header_decode(frame, &header)) break;
+        late->opcodes[i] = header.opcode;
+        if (header.opcode == KSI_OPCODE_OBSERVER_EVENT && size > KSI_FRAME_HEADER_SIZE)
+            late->notice_kind = ksi_wire_read_u32(frame + KSI_FRAME_HEADER_SIZE);
+    }
+    free(frame);
+    return NULL;
+}
+
+/* A device notice waits for the hook frame a lane is writing rather than
+ * retiring a healthy callback stream, and only a failed write retires it. */
+static bool test_callback_notice_waits_for_lane_frame(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    int sockets[2];
+    int capacity = 4096;
+    int queued = 0;
+    const struct timeval receive_timeout = { .tv_sec = 2 };
+    pthread_t lane_thread, reader_thread;
+    CHECK(state != NULL && socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    CHECK(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)) == 0);
+    CHECK(fcntl(sockets[0], F_SETFL, O_NONBLOCK) == 0);
+    CHECK(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout)) == 0);
+    state->client_count = 1u;
+    ksi_client *client = &state->clients[0];
+    *client = (ksi_client){ .fd = sockets[0], .uid = getuid(), .connection_id = 5u,
+        .connection_role = KSI_ROLE_CALLBACK_STREAM, .hello_complete = true,
+        .authorization_lease = test_lease(KSI_SCOPE_INPUT_MONITORING),
+        .observer_subscriptions = KSI_OPERATION_QUERY_DEVICES,
+        .hook_send_ref = hook_send_ref_create(sockets[0]) };
+    CHECK(client->hook_send_ref != NULL);
+
+    held_send held = { .ref = client->hook_send_ref, .result = -2 };
+    CHECK(pthread_create(&lane_thread, NULL, send_held_hook_frame, &held) == 0);
+    /* With its header readable the lane holds the lock, and the rest of its
+     * frame cannot fit until the reader drains it. */
+    for (unsigned int i = 0u; i < 1000u && queued < (int)KSI_FRAME_HEADER_SIZE; i++) {
+        const struct timespec pause = { .tv_nsec = 1000000L };
+        CHECK(ioctl(sockets[1], FIONREAD, &queued) == 0);
+        if (queued < (int)KSI_FRAME_HEADER_SIZE) (void)nanosleep(&pause, NULL);
+    }
+    CHECK(queued >= (int)KSI_FRAME_HEADER_SIZE);
+    late_reader late = { .fd = sockets[1] };
+    CHECK(pthread_create(&reader_thread, NULL, read_two_frames_late, &late) == 0);
+    ksi_device_info device = { .struct_size = sizeof(device), .device_id = 7u,
+        .capabilities = KSI_DEVICE_KEYBOARD };
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_ADDED, &device, 5u);
+    CHECK(pthread_join(reader_thread, NULL) == 0 && pthread_join(lane_thread, NULL) == 0);
+    CHECK(held.result == 0 && hook_send_ref_is_valid(client->hook_send_ref));
+    CHECK(late.opcodes[0] == KSI_OPCODE_HOOK_EVENT && late.opcodes[1] == KSI_OPCODE_OBSERVER_EVENT
+        && late.notice_kind == KSI_OBSERVER_DEVICE_ADDED);
+
+    close(sockets[1]);
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_REMOVED, &device, 6u);
+    CHECK(!hook_send_ref_is_valid(client->hook_send_ref));
+    hook_send_ref_release(client->hook_send_ref);
+    free(client->authorization_lease);
+    free(state);
+    return true;
+}
+
+static bool read_observer_event(int fd, uint32_t kind, uint64_t generation, uint64_t dropped)
+{
+    uint8_t payload[KSI_OBSERVER_PREFIX_SIZE + KSI_DEVICE_INFO_WIRE_SIZE];
+    size_t size = kind == KSI_OBSERVER_OVERFLOW ? KSI_OBSERVER_PREFIX_SIZE : sizeof(payload);
+    CHECK(read_service_event(fd, KSI_OPCODE_OBSERVER_EVENT, payload, size));
+    CHECK(ksi_wire_read_u32(payload) == kind && ksi_wire_read_u64(payload + 16u) == dropped);
+    CHECK(generation == 0u || ksi_wire_read_u64(payload + 8u) == generation);
+    return true;
+}
+
+static bool nothing_to_read(int fd)
+{
+    struct pollfd wait = { .fd = fd, .events = POLLIN };
+    return poll(&wait, 1u, 0) == 0;
+}
+
+/* Device notices skipped or discarded while another uid owns the seat or a
+ * permission refresh is pending come back as one overflow on the first flush or
+ * publish after it, and a pause that lost nothing costs nothing. */
+static bool test_paused_observers_report_one_overflow(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    int observer_socket[2], callback_socket[2];
+    const ksi_device_info device = { .struct_size = sizeof(device), .device_id = 7u,
+        .capabilities = KSI_DEVICE_KEYBOARD };
+    CHECK(state != NULL && output_queue_init(&state->output_queue, state) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, observer_socket) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, callback_socket) == 0);
+    state->input_owner_enforced = true;
+    state->client_count = 2u;
+    ksi_client *observer = &state->clients[0], *callback = &state->clients[1];
+    *observer = (ksi_client){ .fd = observer_socket[0], .uid = getuid(), .connection_id = 1u,
+        .connection_role = KSI_ROLE_OBSERVER_STREAM, .hello_complete = true,
+        .authorization_lease = test_lease(KSI_SCOPE_INPUT_MONITORING),
+        .observer_subscriptions = KSI_OPERATION_QUERY_DEVICES,
+        .observer_queue = calloc(KSI_OBSERVER_QUEUE_CAPACITY, sizeof(ksi_observer_frame)),
+        .hook_send_ref = hook_send_ref_create(observer_socket[0]) };
+    *callback = (ksi_client){ .fd = callback_socket[0], .uid = getuid(), .connection_id = 2u,
+        .connection_role = KSI_ROLE_CALLBACK_STREAM, .hello_complete = true,
+        .authorization_lease = test_lease(KSI_SCOPE_INPUT_MONITORING),
+        .observer_subscriptions = KSI_OPERATION_QUERY_DEVICES,
+        .hook_send_ref = hook_send_ref_create(callback_socket[0]) };
+    CHECK(observer->observer_queue != NULL && observer->hook_send_ref != NULL
+        && callback->hook_send_ref != NULL);
+    set_active_input_owner(state, true, getuid());
+
+    /* The observer still queues one notice when the seat changes hands. */
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_ADDED, &device, 2u);
+    CHECK(observer->observer_count == 1u
+        && read_observer_event(callback_socket[1], KSI_OBSERVER_DEVICE_ADDED, 2u, 0u));
+    set_active_input_owner(state, false, (uid_t)-1);
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_REMOVED, &device, 3u);
+    flush_observers(state);
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_ADDED, &device, 4u);
+    CHECK(observer->observer_count == 0u && nothing_to_read(observer_socket[1]) && nothing_to_read(callback_socket[1]));
+    set_active_input_owner(state, true, getuid());
+    CHECK(read_observer_event(callback_socket[1], KSI_OBSERVER_OVERFLOW, 0u, 2u) && nothing_to_read(callback_socket[1]));
+    flush_observers(state);
+    CHECK(read_observer_event(observer_socket[1], KSI_OBSERVER_OVERFLOW, 0u, 3u));
+    flush_observers(state);
+    CHECK(nothing_to_read(observer_socket[1]) && nothing_to_read(callback_socket[1]));
+
+    observer->permission_refresh_pending = callback->permission_refresh_pending = true;
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_REMOVED, &device, 5u);
+    observer->permission_refresh_pending = callback->permission_refresh_pending = false;
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_ADDED, &device, 6u);
+    CHECK(read_observer_event(callback_socket[1], KSI_OBSERVER_OVERFLOW, 6u, 1u)
+        && read_observer_event(callback_socket[1], KSI_OBSERVER_DEVICE_ADDED, 6u, 0u));
+    flush_observers(state);
+    CHECK(read_observer_event(observer_socket[1], KSI_OBSERVER_OVERFLOW, 6u, 1u)
+        && read_observer_event(observer_socket[1], KSI_OBSERVER_DEVICE_ADDED, 6u, 0u));
+
+    /* Completing a refresh resumes delivery at once. */
+    ksi_permission_task refresh = { .kind = KSI_PERMISSION_REFRESH, .state = state,
+        .permission_generation = atomic_load(&state->permission_generation), .status = KSI_STATUS_OK };
+    observer->permission_refresh_pending = callback->permission_refresh_pending = true;
+    state->permission_refresh_inflight = true;
+    daemon_observe_device(state, KSI_OBSERVER_DEVICE_REMOVED, &device, 7u);
+    process_permission_done(state, &refresh);
+    CHECK(!callback->permission_refresh_pending && read_observer_event(callback_socket[1], KSI_OBSERVER_OVERFLOW, 0u, 1u));
+    flush_observers(state);
+    CHECK(read_observer_event(observer_socket[1], KSI_OBSERVER_OVERFLOW, 0u, 1u));
+    observer->permission_refresh_pending = callback->permission_refresh_pending = true;
+    state->permission_refresh_inflight = true;
+    process_permission_done(state, &refresh);
+    flush_observers(state);
+    CHECK(nothing_to_read(observer_socket[1]) && nothing_to_read(callback_socket[1]));
+
+    /* A queued overflow retains its loss count across another pause. */
+    uint8_t device_wire[KSI_DEVICE_INFO_WIRE_SIZE];
+    ksi_device_encode(device_wire, &device);
+    for (unsigned int i = 0u; i < 2u; i++) {
+        observer->observer_dropped = i == 0u ? 3u : UINT64_MAX - 1u;
+        CHECK(observer_enqueue(observer, KSI_OBSERVER_OVERFLOW, 8u, 0u, NULL, 0u, 100u)
+            && observer_enqueue(observer, KSI_OBSERVER_DEVICE_ADDED, 8u, 0u,
+                device_wire, sizeof(device_wire), 0u));
+        observer->permission_refresh_pending = true;
+        flush_observers(state);
+        observer->permission_refresh_pending = false;
+        flush_observers(state);
+        flush_observers(state);
+        CHECK(read_observer_event(observer_socket[1], KSI_OBSERVER_OVERFLOW, 0u,
+            i == 0u ? 104u : UINT64_MAX));
+        CHECK(nothing_to_read(observer_socket[1]) && nothing_to_read(callback_socket[1]));
+    }
+
+    for (nfds_t i = 0u; i < state->client_count; i++) {
+        hook_send_ref_invalidate(state->clients[i].hook_send_ref);
+        hook_send_ref_release(state->clients[i].hook_send_ref);
+        free(state->clients[i].authorization_lease);
+    }
+    free(observer->observer_queue);
+    close(observer_socket[1]);
+    close(callback_socket[1]);
+    output_queue_close(&state->output_queue);
+    free(state);
+    return true;
+}
+
 int main(void)
 {
+    /* A closed peer or a sink without a reader raises SIGPIPE, which the daemon ignores. */
+    signal(SIGPIPE, SIG_IGN);
     if (!test_identity_accept_guard()
+        || !test_inventory_authorization_and_notifications()
+        || !test_callback_notice_waits_for_lane_frame()
+        || !test_paused_observers_report_one_overflow()
         || !test_lease_state_and_synthesis_order()
         || !test_daemon_admission_and_operation_gates()
         || !test_observer_admission_and_backpressure()
@@ -1560,8 +1978,6 @@ int main(void)
         || !test_hook_routed_send_replies_after_hooks()) {
         return 1;
     }
-    /* A broken sink is a pipe without a reader, as the daemon ignores. */
-    signal(SIGPIPE, SIG_IGN);
     if (!start_sink() || !test_grab_end_through_output_queue()
         || !test_output_actions_reach_sink() || !test_failed_sink_queues_recreation()) {
         return 1;

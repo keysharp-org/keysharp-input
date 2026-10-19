@@ -111,11 +111,33 @@ Operation availability and granted permission scopes are separate masks.
 | `0x1026` | DEVICES_LIST | `{u32 offset,u32 reserved=0,u64 generation}` | paged devices, below |
 | `0x1027` | GAMEPADS_LIST | same | same, gamepads only |
 | `0x1028` | GET_GAMEPAD_STATE | `{u32 device_id,u32 reserved=0,u64 generation}` | gamepad state, below |
+| `0x1029` | DEVICES_SUBSCRIBE | empty | empty |
+| `0x102a` | DEVICES_AUTHORIZE | empty | `{u32 granted,u32 reserved=0}` |
 | `0x1030` | OBSERVER_EVENT | server EVENT | observation, below |
 
 On OBSERVER_STREAM, subscribe/unsubscribe operate on passive subscriptions and
 return observation operation bits. They acquire no grabs and have no decision
 or heartbeat lease. Observer event request IDs are zero.
+
+DEVICES_AUTHORIZE checks Input Monitoring on an authorization lease without
+opening a permission prompt or preparing input forwarding. As with AUTHORIZE,
+its reply follows SESSION_GRANTED and, on a lease subscribed to key state, a
+replacement snapshot. DEVICES_SUBSCRIBE requires an observer with an Input
+Monitoring grant; it subscribes to device changes alone without keyboard, mouse
+or raw input observation. Disconnect ends the subscription. These optional
+operations return UNSUPPORTED on an older service using the same protocol
+version.
+
+Callback streams can also use DEVICES_SUBSCRIBE. Their device notices are written
+during discovery, before admitting input from that device, rather than entering
+the passive observer queue. The write waits for a hook frame already in progress
+on the stream, and only a failed write retires the callback stream. This
+preserves metadata-before-hook ordering on the same socket.
+
+Device notices skipped while another uid owns the seat or a permission refresh
+is pending, and events an observer had queued when delivery paused, are reported
+by one OVERFLOW once delivery resumes. A callback stream receives it before its
+next notice or hook.
 
 GET_KEY_STATE with no payload or device ID zero reports the seat. A positive ID
 selects one listed device and returns NOT_FOUND after its removal; broker-owned

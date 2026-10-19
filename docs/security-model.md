@@ -94,8 +94,9 @@ socket capacity. Overflow is reported explicitly and slow readers cannot hold th
 physical replay path. Device enumeration also requires Input Monitoring.
 
 The Backspace+Escape+Enter physical chord clears subscriptions, input blocking,
-and grabs without consulting a client. Closing a client also releases all of
-its state.
+and grabs without consulting a client. It does not latch: a client that requests
+blocking again afterwards blocks input again. Closing a client also releases all
+of its state.
 
 Users administer their own grants through the authenticated connection:
 

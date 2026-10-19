@@ -220,7 +220,7 @@ static const struct input_absinfo *fake_get_abs_info(const struct libevdev *devi
 /* Paths under /fake/ open as one event node that fake_node describes. */
 #define FAKE_NODE_FD 900
 static struct {
-    const char *name, *phys;
+    const char *name, *phys, *unique;
     struct input_id id;
     unsigned long ev[KSI_BIT_ARRAY_LENGTH(EV_MAX)];
     unsigned long key[KSI_BIT_ARRAY_LENGTH(KEY_MAX)];
@@ -251,8 +251,10 @@ static int fake_node_ioctl(unsigned long request, void *out)
         memcpy(out, &fake_node.id, sizeof(fake_node.id));
         return 0;
     }
-    if (_IOC_TYPE(request) == 'E' && (nr == 0x06u || nr == 0x07u)) {
-        snprintf(out, size, "%s", nr == 0x06u ? fake_node.name : fake_node.phys);
+    if (_IOC_TYPE(request) == 'E' && (nr == 0x06u || nr == 0x07u || nr == 0x08u)) {
+        const char *value = nr == 0x06u ? fake_node.name : nr == 0x07u ? fake_node.phys : fake_node.unique;
+        if (value == NULL) { errno = ENOENT; return -1; }
+        snprintf(out, size, "%s", value);
         return 0;
     }
     if (_IOC_TYPE(request) == 'E' && bits != NULL) {
@@ -482,6 +484,35 @@ static bool test_device_metadata_codec(void)
     ksi_device_encode(wire, &original);
     memset(wire + 24u, 'x', KSI_DEVICE_NAME_CAPACITY);
     CHECK(!ksi_device_decode(wire, sizeof(wire), &decoded));
+    return true;
+}
+
+static bool test_native_device_identity(void)
+{
+    ksi_linux_device_info info;
+    memset(&fake_node, 0, sizeof(fake_node));
+    fake_node.name = "Keyboard and pointer";
+    fake_node.phys = "native-port/input0";
+    fake_node.unique = "aa:bb:cc:dd:ee:ff";
+    fake_node.id = (struct input_id){ .bustype = BUS_BLUETOOTH, .vendor = 0x1234u, .product = 0x5678u };
+    set_long_bit(fake_node.ev, EV_KEY);
+    set_long_bit(fake_node.ev, EV_REL);
+    set_long_bit(fake_node.key, KEY_A);
+    set_long_bit(fake_node.key, BTN_LEFT);
+    set_long_bit(fake_node.rel, REL_X);
+    set_long_bit(fake_node.rel, REL_Y);
+    CHECK(read_device_info("/fake/event1", &info) == 0);
+    CHECK((info.public_info.capabilities & (KSI_DEVICE_KEYBOARD | KSI_DEVICE_MOUSE))
+        == (KSI_DEVICE_KEYBOARD | KSI_DEVICE_MOUSE));
+    CHECK(info.public_info.bus_type == BUS_BLUETOOTH && info.public_info.vendor == 0x1234u
+        && info.public_info.product == 0x5678u);
+    CHECK(strcmp(info.public_info.unique, "aa:bb:cc:dd:ee:ff") == 0);
+    CHECK(strcmp(info.public_info.physical, "native-port/input0") == 0);
+    fake_node.name = NULL;
+    fake_node.unique = NULL;
+    CHECK(read_device_info("/fake/event2", &info) == 0);
+    CHECK(info.public_info.name[0] == '\0' && info.public_info.unique[0] == '\0');
+    CHECK(strcmp(info.public_info.physical, "native-port/input0") == 0);
     return true;
 }
 
@@ -1634,7 +1665,7 @@ int main(void)
     sink_admitted = true;
     if (!test_sync_repairs_lost_release() || !test_keystroke_is_one_packet()
         || !test_observation_without_grab()
-        || !test_high_resolution_wheel() || !test_device_metadata_codec()
+        || !test_high_resolution_wheel() || !test_device_metadata_codec() || !test_native_device_identity()
         || !test_raw_touchpad_observation() || !test_gamepad_classification()
         || !test_gamepad_state_codec() || !test_gamepad_selection()
         || !test_forwarding_preserves_raw_input()

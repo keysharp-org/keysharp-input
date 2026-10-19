@@ -34,7 +34,7 @@ Keysharp users can install both brokers with [Keysharp's Linux setup](https://gi
 cc examples/type-keys.c $(pkg-config --cflags --libs keysharp-input) -o type-keys
 ```
 
-Or link `KeysharpInput::client` after `find_package(KeysharpInput 1.0 CONFIG REQUIRED)`.
+Or link `KeysharpInput::client` after `find_package(KeysharpInput 1.1 CONFIG REQUIRED)`.
 Complete examples demonstrate [typing keys](examples/type-keys.c) and
 [watching and suppressing a key](examples/suppress-key.c). These examples interact
 with your desktop when run.
@@ -67,7 +67,8 @@ until revoked; updated executable content needs a new grant. Input Control is sh
 with a **system-installed** `keysharp-desktop`, so granting or revoking it affects both
 services. See [permissions](docs/permissions.md) and the [security model](docs/security-model.md).
 
-Holding **Backspace+Escape+Enter** releases grabs, hooks and input blocking.
+Holding **Backspace+Escape+Enter** releases grabs, hooks and input blocking. A client
+that requests blocking again afterwards blocks input again.
 
 ## Diagnose
 

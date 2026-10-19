@@ -1,6 +1,15 @@
 #include <keysharp_input/client.h>
 #include <stdio.h>
 
+static void device_changed(const ksi_observer_message *message, void *context)
+{
+    (void)context;
+    if (message->kind >= KSI_OBSERVER_DEVICE_ADDED
+        && message->kind <= KSI_OBSERVER_DEVICE_CHANGED)
+        printf("device %u: %s, unique %s\n", message->data.device.device_id,
+            message->data.device.name, message->data.device.unique);
+}
+
 int main(void)
 {
     ksi_connect_options options;
@@ -32,6 +41,9 @@ int main(void)
     options.role = KSI_ROLE_CALLBACK_STREAM;
     options.lease_id = info.lease_id;
     if (ksi_connect(&options, &connection, &info, &error) != KSI_STATUS_OK
+        || ksi_set_device_change_handler(connection, device_changed, NULL, &error)
+            != KSI_STATUS_OK
+        || ksi_devices_subscribe(connection, &error) != KSI_STATUS_OK
         || ksi_hook_subscribe(connection, KSI_HOOK_KEYBOARD, &active, &error)
             != KSI_STATUS_OK) {
         fprintf(stderr, "subscribe: %s\n", error.message);
@@ -54,7 +66,8 @@ int main(void)
         ksi_hook_reply_init(&reply);
         reply.decision = KSI_HOOK_PASS;
         if (!(message.data.event.event.keyboard.flags & KSI_KEYBOARD_HOOK_UP)) {
-            printf("vk %u\n", message.data.event.event.keyboard.vk_code);
+            printf("device %u, vk %u\n", message.data.event.event.keyboard.device_id,
+                message.data.event.event.keyboard.vk_code);
             fflush(stdout);
             if (message.data.event.event.keyboard.vk_code == 0x1Bu)
                 reply.decision = KSI_HOOK_BLOCK;

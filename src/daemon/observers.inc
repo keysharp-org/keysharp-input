@@ -6,6 +6,37 @@ static bool observer_active(const ksi_daemon_state *state, const ksi_client *cli
         && hook_send_ref_is_valid(client->hook_send_ref);
 }
 
+/* Inactive only while another uid owns the seat or a permission refresh is
+ * pending. The subscriptions resume afterwards, so what they lose meanwhile is
+ * reported then as one overflow. */
+static bool observer_paused(const ksi_daemon_state *state, const ksi_client *client)
+{
+    return client->observer_subscriptions != 0u
+        && hook_send_ref_is_valid(client->hook_send_ref)
+        && (client->permission_refresh_pending || !input_owner_matches_uid(state, client->uid));
+}
+
+static void observer_count_lost(ksi_client *client, uint64_t count)
+{
+    client->observer_dropped = count > UINT64_MAX - client->observer_dropped
+        ? UINT64_MAX : client->observer_dropped + count;
+}
+
+/* Drops what an inactive client has queued. Only a paused one is still owed
+ * the overflow for it. */
+static void observer_discard(const ksi_daemon_state *state, ksi_client *client)
+{
+    if (observer_paused(state, client)) {
+        for (uint32_t i = 0u; i < client->observer_count; i++) {
+            uint32_t index = (client->observer_head + i) % KSI_OBSERVER_QUEUE_CAPACITY;
+            const uint8_t *payload = client->observer_queue[index].payload;
+            observer_count_lost(client, ksi_wire_read_u32(payload) == KSI_OBSERVER_OVERFLOW
+                ? ksi_wire_read_u64(payload + 16u) : 1u);
+        }
+    } else client->observer_dropped = 0u;
+    client->observer_count = 0u;
+}
+
 static bool observer_enqueue(ksi_client *client, uint32_t kind,
     uint64_t generation, uint64_t event_id, const void *body, size_t body_size,
     uint64_t dropped)
@@ -25,19 +56,60 @@ static bool observer_enqueue(ksi_client *client, uint32_t kind,
     return true;
 }
 
+/* A callback stream carries its notices in line with hooks, so this waits for a
+ * lane's frame in progress. Only a failed write retires the stream, which keeps
+ * a later hook from overtaking the notice. */
+static bool observer_send_now(ksi_client *client, uint32_t kind,
+    uint64_t generation, uint64_t dropped, const void *body, size_t body_size)
+{
+    uint8_t payload[KSI_OBSERVER_MAX_PAYLOAD_SIZE] = {0};
+    ksi_wire_write_u32(payload, kind);
+    ksi_wire_write_u64(payload + 8u, generation);
+    ksi_wire_write_u64(payload + 16u, dropped);
+    if (body_size != 0u) memcpy(payload + KSI_OBSERVER_PREFIX_SIZE, body, body_size);
+    if (hook_send_ref_send(client->hook_send_ref, KSI_OPCODE_OBSERVER_EVENT,
+            KSI_FRAME_FLAG_EVENT, 0u, payload, KSI_OBSERVER_PREFIX_SIZE + body_size) == 0)
+        return true;
+    hook_send_ref_invalidate(client->hook_send_ref);
+    return false;
+}
+
+/* Reports lost notices ahead of anything newer: queued for an observer, written
+ * at once on a callback stream. */
+static bool observer_report_lost(ksi_client *client, uint64_t generation)
+{
+    if (client->observer_dropped == 0u) return true;
+    bool reported = client->connection_role == KSI_ROLE_CALLBACK_STREAM
+        ? observer_send_now(client, KSI_OBSERVER_OVERFLOW, generation,
+            client->observer_dropped, NULL, 0u)
+        : observer_enqueue(client, KSI_OBSERVER_OVERFLOW, generation, 0u,
+            NULL, 0u, client->observer_dropped);
+    if (reported) client->observer_dropped = 0u;
+    return reported;
+}
+
 static void observer_publish(ksi_daemon_state *state, uint32_t kind,
     uint32_t subscription, uint64_t generation, uint64_t event_id,
     const void *body, size_t size)
 {
+    bool device = kind >= KSI_OBSERVER_DEVICE_ADDED && kind <= KSI_OBSERVER_DEVICE_CHANGED;
     for (nfds_t i = 0; i < state->client_count; i++) {
         ksi_client *client = &state->clients[i];
-        if (!observer_active(state, client)
-            || (subscription != 0u && (client->observer_subscriptions & subscription) == 0u)) continue;
-        if (client->observer_dropped != 0u
-            && observer_enqueue(client, KSI_OBSERVER_OVERFLOW, generation, 0u,
-                NULL, 0u, client->observer_dropped)) client->observer_dropped = 0u;
-        if (!observer_enqueue(client, kind, generation, event_id, body, size, 0u)
-            && client->observer_dropped != UINT64_MAX) client->observer_dropped++;
+        if (!observer_active(state, client)) {
+            if (device && observer_paused(state, client)) observer_count_lost(client, 1u);
+            continue;
+        }
+        if (subscription != 0u && (client->observer_subscriptions & subscription) == 0u) continue;
+        if (client->connection_role == KSI_ROLE_CALLBACK_STREAM) {
+            /* Discovery publishes before reading input from the new node. A
+             * callback stream subscribes to device notices alone. */
+            if (device && observer_report_lost(client, generation))
+                (void)observer_send_now(client, kind, generation, 0u, body, size);
+            continue;
+        }
+        (void)observer_report_lost(client, generation);
+        if (!observer_enqueue(client, kind, generation, event_id, body, size, 0u))
+            observer_count_lost(client, 1u);
     }
 }
 
@@ -78,13 +150,15 @@ static void daemon_observe_raw(void *context, const ksi_raw_input_event *event)
 
 static void update_observer_callbacks(ksi_daemon_state *state)
 {
-    bool active = false;
+    uint32_t subscriptions = 0u;
     for (nfds_t i = 0; i < state->client_count; i++)
-        active |= state->clients[i].observer_subscriptions != 0u;
-    ksi_linux_devices_set_observer_callback(active ? daemon_observe_input : NULL,
-        active ? daemon_observe_device : NULL, active ? state : NULL);
-    ksi_linux_devices_set_raw_observer_callback(active ? daemon_observe_raw : NULL,
-        active ? state : NULL);
+        subscriptions |= state->clients[i].observer_subscriptions;
+    bool input = (subscriptions & (KSI_OPERATION_HOOK_KEYBOARD | KSI_OPERATION_HOOK_MOUSE)) != 0u;
+    ksi_linux_devices_set_observer_callback(input ? daemon_observe_input : NULL,
+        subscriptions != 0u ? daemon_observe_device : NULL, subscriptions != 0u ? state : NULL);
+    ksi_linux_devices_set_raw_observer_callback(
+        (subscriptions & KSI_OPERATION_HOOK_MOUSE) != 0u ? daemon_observe_raw : NULL,
+        subscriptions != 0u ? state : NULL);
 }
 
 static void flush_observers(ksi_daemon_state *state)
@@ -92,8 +166,7 @@ static void flush_observers(ksi_daemon_state *state)
     for (nfds_t i = 0; i < state->client_count; i++) {
         ksi_client *client = &state->clients[i];
         if (!observer_active(state, client)) {
-            client->observer_count = 0u;
-            client->observer_dropped = 0u;
+            observer_discard(state, client);
             continue;
         }
         for (size_t budget = 0u; budget < 32u && client->observer_count != 0u; budget++) {
@@ -103,9 +176,6 @@ static void flush_observers(ksi_daemon_state *state)
             client->observer_head = (client->observer_head + 1u) % KSI_OBSERVER_QUEUE_CAPACITY;
             client->observer_count--;
         }
-        if (client->observer_dropped != 0u
-            && observer_enqueue(client, KSI_OBSERVER_OVERFLOW,
-                ksi_linux_devices_generation(), 0u, NULL, 0u, client->observer_dropped))
-            client->observer_dropped = 0u;
+        (void)observer_report_lost(client, ksi_linux_devices_generation());
     }
 }

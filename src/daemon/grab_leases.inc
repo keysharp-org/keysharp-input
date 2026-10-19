@@ -47,6 +47,7 @@ static void send_hello_status(
 
 static void send_authorize_status(
     const ksi_client *client,
+    uint16_t opcode,
     uint64_t request_id,
     uint32_t status,
     uint32_t detail,
@@ -59,7 +60,7 @@ static void send_authorize_status(
         detail,
         granted_scopes);
 
-    (void)ipc_send_locked(client->fd, KSI_OPCODE_AUTHORIZE,
+    (void)ipc_send_locked(client->fd, opcode,
         KSI_FRAME_FLAG_RESPONSE, request_id, payload, payload_size);
 }
 
@@ -71,8 +72,8 @@ static void send_authorization_status(
     uint32_t detail,
     uint32_t granted_scopes)
 {
-    if (opcode == KSI_OPCODE_AUTHORIZE) {
-        send_authorize_status(client, request_id, status, detail,
+    if (opcode == KSI_OPCODE_AUTHORIZE || opcode == KSI_OPCODE_DEVICES_AUTHORIZE) {
+        send_authorize_status(client, opcode, request_id, status, detail,
             granted_scopes);
     } else {
         send_hello_status(client, request_id, status, detail,
@@ -99,13 +100,14 @@ static void finish_client_authorization(
     uint32_t granted)
 {
     bool complete = requested == 0u || (granted & requested) == requested;
+    bool authorize = opcode == KSI_OPCODE_AUTHORIZE || opcode == KSI_OPCODE_DEVICES_AUTHORIZE;
 
     if (client->authorization_lease != NULL) {
         client->authorization_lease->granted_scopes |= granted;
         (void)snprintf(client->authorization_lease->hash, sizeof(client->authorization_lease->hash), "%s", client->identity.hash);
     }
 
-    if (opcode != KSI_OPCODE_AUTHORIZE)
+    if (!authorize)
         send_authorization_status(client, opcode, request_id,
             complete ? KSI_STATUS_OK : KSI_STATUS_DENIED, KSI_DETAIL_NONE,
             complete ? client_grants(client) : 0u);
@@ -116,7 +118,7 @@ static void finish_client_authorization(
                 0u, notification, sizeof(notification)) != 1)
             hook_send_ref_invalidate(client->hook_send_ref);
     }
-    if (opcode == KSI_OPCODE_AUTHORIZE) {
+    if (authorize) {
         if (client->keyboard_state_subscribed) {
             publish_keyboard_states(state);
             send_keyboard_state(client, &state->keyboard_snapshot, true, state->keyboard_sequence);

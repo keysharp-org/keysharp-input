@@ -8,13 +8,15 @@ pkg-config --cflags --libs keysharp-input
 ```
 
 ```cmake
-find_package(KeysharpInput 1.0 CONFIG REQUIRED)
+find_package(KeysharpInput 1.1 CONFIG REQUIRED)
 target_link_libraries(my-client PRIVATE KeysharpInput::client)
 ```
 
-The public ABI is 1.0 and the library SONAME is `libkeysharp-input.so.1`.
+The public ABI is 1.1 and the library SONAME is `libkeysharp-input.so.1`.
 `ksi_client_abi_major()` and `ksi_client_abi_minor()` provide runtime
 introspection. The socket protocol is private to the matching client library.
+ABI 1.1 adds optional device-only authorization and notification functions;
+clients using them need those exports, while ABI 1.0 clients keep working.
 
 ## Connections
 
@@ -85,19 +87,50 @@ Read initialized `ksi_observer_message` values with `ksi_observer_next`:
 Observer events need no reply. Their bounded queues and nonblocking transport
 cannot hold physical input waiting for a reader. A full queue discards events
 and reports overflow; a partial socket write closes the stream, requiring a
-reconnect. Observation represents upstream device input, including input that
+reconnect. Delivery pauses while another user owns the seat or the service
+rechecks permissions; device notices missed then, and events already queued, are
+reported as one overflow when it resumes. Observation represents upstream device input, including input that
 an interceptor subsequently suppresses. It does not report the broker's own
 synthesis as physical input. Hotplug events are delivered while at least one
-keyboard or mouse observation subscription is active.
+keyboard, mouse or device-only observation subscription is active.
+
+For inventory without input capture, connect an authorization lease with no
+requested scopes, then call `ksi_devices_authorize(Lease, GrantedScopes, Error)`.
+It checks an existing Input Monitoring grant, never prompts, and does not prepare
+input forwarding. Bind an observer to that lease and call
+`ksi_devices_subscribe(Connection, Error)` before enumeration. This subscription
+emits device changes, overflow and revocation without keyboard, mouse or raw
+input events. It acquires no grabs or uinput devices. Closing the observer ends
+the subscription. An older service returns `UNSUPPORTED`; do not fall back to
+input capture when only inventory was requested.
+
+An existing callback stream can also subscribe to device changes. Install
+`ksi_set_device_change_handler(Connection, Handler, Context, Error)` first, then
+call `ksi_devices_subscribe` before subscribing to hooks. Metadata is sent on
+that stream before input from a newly discovered node can produce a hook;
+the library dispatches the handler before the following hook, including nested
+callbacks during a synchronous call. Notices missed while another user owns the
+seat or while permissions are rechecked arrive as one `KSI_OBSERVER_OVERFLOW`
+before the stream's next notice or hook; enumerate devices again outside the
+handler. The handler only updates local metadata:
+it must not call the connection's API or disconnect it. Setting the handler to
+`NULL` disables local delivery while the subscription remains active. A metadata
+write failure retires that callback stream, so a hook cannot overtake a missing
+identity notice.
 
 `ksi_devices_list(Connection, Visitor, Context, Generation, Error)` enumerates
 readable seat0 devices under Input Monitoring. `Generation` is an optional
 `uint64_t *` output. Subscribe before enumeration, then ignore queued device
 notifications with a generation at or before that snapshot. The visitor receives
 an initialized `ksi_device_info` containing a daemon-lifetime device ID, device
-name/node, physical/unique identifiers, USB-style vendor/product/version fields,
+name/node, physical/unique identifiers, native bus/vendor/product/version fields,
 and capability bits. IDs can change after unplug/restart; use the identifiers
 with normal duplicate/missing-identifier handling for saved device preferences.
+The `unique` field is the evdev `EVIOCGUNIQ` value, which may be a serial number
+or Bluetooth address and may be empty. The `physical` field is `EVIOCGPHYS`, a
+connection location that can change when a device moves ports. Missing name or
+identifier fields are empty. IDs are not reused within one daemon lifetime;
+removal ends that attachment even if the same hardware is plugged in again.
 `axes[0..axis_count)` lists available evdev absolute axis codes with their minimum,
 maximum, fuzz, flat, and resolution values. Resolution has the kernel's per-axis
 units; these are device coordinates, not desktop pixels.
@@ -108,7 +141,8 @@ and returns `CANCELLED`. Device capability bits describe supported paths, not
 whether another process currently owns an exclusive grab. The broker's own
 virtual output devices are excluded.
 
-See [the complete observer example](../examples/observe.c).
+See [the complete observer example](../examples/observe.c) and the
+[device-only inventory example](../examples/list-devices.c).
 
 ## Gamepads
 

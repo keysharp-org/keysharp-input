@@ -343,7 +343,7 @@ static int read_device_info(const char *path, ksi_linux_device_info *info)
     }
 
     if (ioctl(fd, EVIOCGNAME(sizeof(info->name)), info->name) < 0) {
-        (void)snprintf(info->name, sizeof(info->name), "unknown");
+        info->name[0] = '\0';
     }
 
     memset(&input_id, 0, sizeof(input_id));
@@ -1197,6 +1197,10 @@ static void track_device(const ksi_linux_device_info *info, const char *reason)
     target->forwarding_sink = is_sink_identity(info);
     bool newly_opened = target->fd < 0;
     /* A new or reopened node gets a new identity, like a replugged device. */
+    if (newly_opened && next_device_id == 0u) {
+        fprintf(stderr, "keysharp-input: device identities exhausted; cannot open %s\n", info->path);
+        return;
+    }
     if (newly_opened) target->device_id = next_device_id++;
     ksi_device_info public_info = info->public_info;
     public_info.device_id = target->device_id;

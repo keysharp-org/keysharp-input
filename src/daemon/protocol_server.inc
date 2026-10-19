@@ -562,6 +562,49 @@ static void handle_devices_list(ksi_daemon_state *state, ksi_client *client,
     send_device_page(client, message, KSI_OPCODE_DEVICES_LIST, ksi_linux_devices_list);
 }
 
+static void handle_devices_authorize(ksi_daemon_state *state, ksi_client *client,
+    const ksi_binary_message_view *message)
+{
+    if (client->connection_role != KSI_ROLE_AUTHORIZATION_LEASE) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_WRONG_ROLE);
+        return;
+    }
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    begin_authorization(state, client, KSI_OPCODE_DEVICES_AUTHORIZE, KSI_AUTH_CHECK,
+        KSI_SCOPE_INPUT_MONITORING, message->header->request_id);
+}
+
+static void handle_devices_subscribe(ksi_daemon_state *state, ksi_client *client,
+    const ksi_binary_message_view *message)
+{
+    if (client->connection_role != KSI_ROLE_OBSERVER_STREAM
+        && client->connection_role != KSI_ROLE_CALLBACK_STREAM) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_WRONG_ROLE);
+        return;
+    }
+    if (message->payload_size != 0u) {
+        send_status(client->fd, message->header, KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_PAYLOAD_SIZE);
+        return;
+    }
+    if (!input_owner_matches_uid(state, client->uid)
+        || !client_has_scope(client, KSP_SCOPE_INPUT_MONITORING)) {
+        send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE);
+        return;
+    }
+    if (client->connection_role == KSI_ROLE_OBSERVER_STREAM && client->observer_queue == NULL)
+        client->observer_queue = calloc(KSI_OBSERVER_QUEUE_CAPACITY, sizeof(*client->observer_queue));
+    if (client->connection_role == KSI_ROLE_OBSERVER_STREAM && client->observer_queue == NULL) {
+        send_status(client->fd, message->header, KSI_STATUS_RESOURCE_EXHAUSTED, KSI_DETAIL_NONE);
+        return;
+    }
+    client->observer_subscriptions |= KSI_OPERATION_QUERY_DEVICES;
+    update_observer_callbacks(state);
+    send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
+}
+
 /* Gamepads report no text and cannot be typed on, so discovery and state are
  * ungated like pointer position and idle time. Both replies describe gamepads
  * alone, and the listing drops the identifiers ksi_linux_gamepads_list scrubs. */
@@ -1169,6 +1212,12 @@ static bool handle_binary_message(
             return true;
         case KSI_OPCODE_DEVICES_LIST:
             handle_devices_list(state, client, message);
+            return true;
+        case KSI_OPCODE_DEVICES_AUTHORIZE:
+            handle_devices_authorize(state, client, message);
+            return true;
+        case KSI_OPCODE_DEVICES_SUBSCRIBE:
+            handle_devices_subscribe(state, client, message);
             return true;
         case KSI_OPCODE_GAMEPADS_LIST:
             handle_gamepads_list(state, client, message);

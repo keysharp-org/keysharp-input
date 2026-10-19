@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define KSI_CLIENT_ABI_MAJOR 1u
-#define KSI_CLIENT_ABI_MINOR 0u
+#define KSI_CLIENT_ABI_MINOR 1u
 #define KSI_DEFAULT_SOCKET_PATH "/run/keysharp-input/keysharp-input.sock"
 #define KSI_SOCKET_ENV "KEYSHARP_INPUT_SOCKET"
 
@@ -451,6 +451,25 @@ KSI_API void ksi_raw_input_event_init(ksi_raw_input_event *event);
 KSI_API void ksi_observer_message_init(ksi_observer_message *message);
 KSI_API ksi_status ksi_devices_list(ksi_connection *connection,
     ksi_device_visitor visitor, void *context, uint64_t *generation, ksi_error *error);
+/* Check an existing Input Monitoring grant on a lease without prompting or
+ * preparing input forwarding. As with ksi_authorize, the reply follows the
+ * grant event and, when subscribed, a replacement keyboard snapshot. Bind an
+ * observer to the resulting lease. */
+KSI_API ksi_status ksi_devices_authorize(ksi_connection *lease,
+    ksi_permission_scopes *granted_scopes, ksi_error *error);
+typedef void (*ksi_device_change_handler)(const ksi_observer_message *message,
+    void *context);
+/* Callback streams dispatch metadata before the next hook on that stream,
+ * including nested hooks. An overflow means notices were missed and devices
+ * must be enumerated again. The handler must not call this connection's API or
+ * disconnect it. The message is borrowed for the duration of the call. Passing
+ * NULL disables local delivery without ending the stream's subscription. */
+KSI_API ksi_status ksi_set_device_change_handler(ksi_connection *connection,
+    ksi_device_change_handler handler, void *context, ksi_error *error);
+/* Subscribe an observer or callback stream to device changes alone. Callback
+ * streams require a device-change handler. This neither observes input nor
+ * grabs devices. Disconnect to end the subscription. */
+KSI_API ksi_status ksi_devices_subscribe(ksi_connection *connection, ksi_error *error);
 /* Gamepads carry no text input, so discovering them and reading their sticks
  * and buttons needs no scope, as with pointer position and idle time. The
  * entries omit the device node path and the physical and unique identifiers;
