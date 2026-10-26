@@ -38,7 +38,7 @@ typedef struct forwarding_device {
     bool closing;
     bool keyboard;
     struct libevdev_uinput *output;
-    int source_fd;
+    int state_fd;
     bool failed;
     bool retiring;
     uint64_t retire_ms;
@@ -291,11 +291,11 @@ static bool has_codes(const struct libevdev *source, unsigned int type, unsigned
     return false;
 }
 
-uint64_t ksi_linux_forward_open(int source_fd, bool keyboard)
+uint64_t ksi_linux_forward_open(int state_fd, bool keyboard)
 {
     struct libevdev *source = NULL;
     struct libevdev_uinput *output = NULL;
-    forwarding_device created = { .open = true, .keyboard = keyboard, .source_fd = source_fd };
+    forwarding_device created = { .open = true, .keyboard = keyboard, .state_fd = state_fd };
     char phys[512];
     uint64_t target = 0u;
     int result = 0;
@@ -305,7 +305,7 @@ uint64_t ksi_linux_forward_open(int source_fd, bool keyboard)
     size_t slot = 0u;
     while (slot < KSI_MAX_FORWARDING_DEVICES && devices[slot].open) slot++;
     pthread_mutex_unlock(&devices_mutex);
-    if (slot == KSI_MAX_FORWARDING_DEVICES || libevdev_new_from_fd(source_fd, &source) < 0) return 0u;
+    if (slot == KSI_MAX_FORWARDING_DEVICES || libevdev_new_from_fd(state_fd, &source) < 0) return 0u;
 
     const char *original = libevdev_get_phys(source);
     (void)snprintf(phys, sizeof(phys), "%s%s", KSI_FORWARD_PHYS_PREFIX,
@@ -458,7 +458,7 @@ void ksi_linux_forward_sync_switches(uint64_t target)
     pthread_mutex_lock(&devices_mutex);
     forwarding_device *device = find_device_locked(target, KSI_FORWARD_ENQUEUED);
     if (device != NULL && device->output != NULL
-        && ioctl(device->source_fd, EVIOCGSW(sizeof(state)), state) >= 0) {
+        && ioctl(device->state_fd, EVIOCGSW(sizeof(state)), state) >= 0) {
         for (uint16_t code = 0u; code <= SW_MAX; code++)
             if (ksi_key_bit(device->switches, code))
                 events[count++] = (struct input_event){ .type = EV_SW, .code = code,
@@ -488,10 +488,17 @@ int ksi_linux_forward_write(const ksi_forward_packet *packet)
     const uint8_t *output = device != NULL ? device->views[KSI_FORWARD_APPLIED].output : NULL;
     const struct ksi_forward_event *key = packet->count != 0u ? &packet->events[packet->count - 1u] : NULL;
     if (key != NULL && (key->type != EV_KEY || key->code > KEY_MAX)) key = NULL;
-    if (device == NULL || (clone ? device->output == NULL : !device->keyboard)
-        || (key != NULL && key->value == 0
-            && !ksi_key_bit(output, key->code) && !ksi_key_bit(output, ksi_button_alias(key->code)))) {
+    if (device == NULL || (clone ? device->output == NULL : !device->keyboard)) {
         pthread_mutex_unlock(&devices_mutex);
+        return 0;
+    }
+    if (key != NULL && key->value == 0
+        && !ksi_key_bit(output, key->code) && !ksi_key_bit(output, ksi_button_alias(key->code))) {
+        /* Still a release for a sink left holding the key with no holder, as
+         * after a press of it was lost, rather than leaving it stuck down. */
+        int written = clone ? 0 : reconcile_locked(key->code);
+        pthread_mutex_unlock(&devices_mutex);
+        if (written > 0) ksi_linux_output_pace((size_t)written);
         return 0;
     }
     for (uint32_t i = 0u; i < packet->count; i++) {
@@ -521,9 +528,9 @@ int ksi_linux_forward_write(const ksi_forward_packet *packet)
         note_written_keys(device->views[KSI_FORWARD_APPLIED].output, events, count, result);
     } else {
         /* The sink changes when its first holder presses or its last releases,
-         * repeats only a key it holds, and retypes a key another holder has. */
-        bool repress = key != NULL && key->value == 1 && !ksi_key_bit(output, key->code)
-            && needs_repress_locked(key->code);
+         * repeats only a key it holds, and retypes a key it already holds. A
+         * source pressing a key it holds lost the release between, so it types. */
+        bool repress = key != NULL && key->value == 1 && needs_repress_locked(key->code);
         if (key != NULL && key->value != 2)
             ksi_set_key_bit(device->views[KSI_FORWARD_APPLIED].output, key->code, key->value != 0);
         if (!repress && key != NULL && (key->value == 2 ? !ksi_key_bit(sink.down, key->code)

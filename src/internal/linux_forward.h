@@ -64,8 +64,9 @@ typedef enum ksi_forward_view {
 
 /* The reader opens and closes sources and holds each one's ENQUEUED target. A
  * keyboard's keyboard keys go to the shared sink; whatever else a source reports
- * goes to its own clone, created only when there is some. */
-uint64_t ksi_linux_forward_open(int source_fd, bool keyboard);
+ * goes to its own clone, created only when there is some. state_fd is only ever
+ * queried, never read: state ioctls flush queued events from the descriptor. */
+uint64_t ksi_linux_forward_open(int state_fd, bool keyboard);
 bool ksi_linux_forward_has_clone(uint64_t target);
 /* Closing is queue-ordered like ending a grab: close forgets the source for
  * admitted output, and apply_close releases and retires its outputs where the

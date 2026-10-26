@@ -1184,6 +1184,52 @@ static bool test_new_holder_presses_again(void)
     return true;
 }
 
+/* A physical source cannot press a key twice, so a second press means the
+ * release between was lost upstream. The key still types, and its release
+ * ends it; a modifier only stays down. */
+static bool test_press_after_lost_release_types(void)
+{
+    uint64_t keyboard = ksi_linux_forward_open(PLAIN, true);
+    const uint16_t retype[] = { KEY_Q, KEY_Q };
+    const int32_t up_down[] = { 0, 1 };
+
+    CHECK(forward_key(keyboard, KEY_Q, 1) == 0 && read_events(generic[0]) == 2u);
+    CHECK(forward_key(keyboard, KEY_Q, 1) == 0 && sink_keys(2u, retype, up_down));
+    CHECK(forward_key(keyboard, KEY_Q, 0) == 0 && sink_keys(1u, (const uint16_t[]){ KEY_Q }, (const int32_t[]){ 0 }));
+    CHECK(!sink_down(KEY_Q));
+
+    CHECK(forward_key(keyboard, KEY_LEFTALT, 1) == 0 && read_events(generic[0]) == 2u);
+    CHECK(forward_key(keyboard, KEY_LEFTALT, 1) == 0 && read_events(generic[0]) == 0u);
+    CHECK(forward_key(keyboard, KEY_LEFTALT, 0) == 0 && !sink_down(KEY_LEFTALT));
+    (void)read_events(generic[0]);
+
+    close_source(keyboard);
+    release_everything();
+    return true;
+}
+
+/* A sink left holding a key no source or owner holds, as when the press that
+ * last cleared a source's hold was lost, is released by the next release of
+ * that key instead of staying stuck down. */
+static bool test_release_clears_stranded_sink_key(void)
+{
+    uint64_t keyboard = ksi_linux_forward_open(PLAIN, true);
+
+    CHECK(forward_key(keyboard, KEY_LEFTALT, 1) == 0 && read_events(generic[0]) == 2u);
+    pthread_mutex_lock(&devices_mutex);
+    ksi_set_key_bit(find_device_locked(keyboard, KSI_FORWARD_APPLIED)->views[KSI_FORWARD_APPLIED].output,
+        KEY_LEFTALT, false);
+    pthread_mutex_unlock(&devices_mutex);
+    CHECK(sink_down(KEY_LEFTALT));
+    CHECK(forward_key(keyboard, KEY_LEFTALT, 0) == 0
+        && sink_keys(1u, (const uint16_t[]){ KEY_LEFTALT }, (const int32_t[]){ 0 }));
+    CHECK(!sink_down(KEY_LEFTALT));
+
+    close_source(keyboard);
+    release_everything();
+    return true;
+}
+
 int main(void)
 {
     /* A broken sink is a pipe without a reader, as the daemon ignores. */
@@ -1214,6 +1260,8 @@ int main(void)
         || !test_dead_owner_mouse()
         || !test_tap_of_held_key()
         || !test_new_holder_presses_again()
+        || !test_press_after_lost_release_types()
+        || !test_release_clears_stranded_sink_key()
         || !test_sink_failure()) return 1;
     /* keyd skips devices with its vendor identifier, so a clone of its
      * output must keep it; fake_create checks the vendor. */

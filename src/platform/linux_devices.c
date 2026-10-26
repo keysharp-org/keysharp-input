@@ -66,6 +66,11 @@ typedef struct ksi_linux_tracked_device {
     char path[PATH_MAX];
     char name[KSI_DEVICE_NAME_LENGTH];
     int fd;
+    /* A second open, with every event masked, for state ioctls: EVIOCGKEY,
+     * EVIOCGLED and EVIOCGSW flush queued events of their type from the
+     * descriptor they are issued on, which on fd would lose them unread.
+     * Zero means none, as descriptor 0 is the service's stdin. */
+    int state_fd;
     struct libevdev *evdev;
     uint32_t device_id;
     bool grabbed;
@@ -641,18 +646,39 @@ static ssize_t find_tracked_device_by_fd(int fd)
     return -1;
 }
 
-static int read_leds(int fd)
+/* The reader's own descriptor only when the second open failed: the panic
+ * chord must still read key state, at the cost of the reader's queued keys. */
+static int state_query_fd(const ksi_linux_tracked_device *device)
+{
+    return device->state_fd > 0 ? device->state_fd : device->fd;
+}
+
+/* A type mask with no bits set filters every event, so the kernel queues
+ * nothing here and a state ioctl has nothing to flush. */
+static int open_state_fd(const char *path)
+{
+    struct input_mask mask = { .type = 0u, .codes_size = 0u, .codes_ptr = 0u };
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+
+    if (fd == 0) close(fd);
+    if (fd <= 0) return -1;
+    (void)ioctl(fd, EVIOCSMASK, &mask);
+    return fd;
+}
+
+static int read_leds(const ksi_linux_tracked_device *device)
 {
     unsigned char leds;
+    int fd = state_query_fd(device);
     return fd >= 0 && ioctl(fd, EVIOCGLED(sizeof(leds)), &leds) >= 0 ? leds : -1;
 }
 
 /* Releasing a grab lets the console keyboard handler set that device's LEDs
  * to the console's state, so the state it had is written back. */
-static void restore_leds(int fd, int saved)
+static void restore_leds(const ksi_linux_tracked_device *device, int saved)
 {
     struct input_event events[CHAR_BIT + 1];
-    int now = read_leds(fd);
+    int now = read_leds(device);
     size_t count = 0u;
 
     if (saved < 0 || now < 0 || now == saved) return;
@@ -661,16 +687,16 @@ static void restore_leds(int fd, int saved)
             events[count++] = (struct input_event){ .type = EV_LED, .code = code,
                 .value = saved >> code & 1 };
     events[count++] = (struct input_event){ .type = EV_SYN, .code = SYN_REPORT };
-    (void)ksi_linux_output_write(fd, events, count);
+    (void)ksi_linux_output_write(device->fd, events, count);
 }
 
-static int release_grab(int fd)
+static int release_grab(const ksi_linux_tracked_device *device)
 {
-    int saved = read_leds(fd);
-    int result = ioctl(fd, EVIOCGRAB, 0);
+    int saved = read_leds(device);
+    int result = ioctl(device->fd, EVIOCGRAB, 0);
     int error = errno;
 
-    restore_leds(fd, saved);
+    restore_leds(device, saved);
     errno = error;
     return result;
 }
@@ -709,7 +735,7 @@ static void close_tracked_device(ksi_linux_tracked_device *device)
                 &device->public_info, device_generation);
     }
     if (device->grabbed && device->fd >= 0) {
-        (void)release_grab(device->fd);
+        (void)release_grab(device);
         device->grabbed = false;
     }
 
@@ -717,6 +743,9 @@ static void close_tracked_device(ksi_linux_tracked_device *device)
         libevdev_free(device->evdev);
         device->evdev = NULL;
     }
+
+    if (device->state_fd > 0) close(device->state_fd);
+    device->state_fd = -1;
 
     if (device->fd >= 0) {
         close(device->fd);
@@ -781,6 +810,7 @@ static int open_tracked_device(ksi_linux_tracked_device *device)
     }
 
     device->fd = fd;
+    device->state_fd = open_state_fd(device->path);
     if (device->injected_source) read_leds_only(fd);
     return 0;
 }
@@ -857,7 +887,8 @@ static void ensure_forwarding(ksi_linux_tracked_device *device)
         || !ksi_linux_forward_failed(device->forwarding_target, KSI_FORWARD_ENQUEUED))
         return;
     close_forwarding_device(device);
-    device->forwarding_target = ksi_linux_forward_open(device->fd, device->keyboard_candidate);
+    device->forwarding_target = ksi_linux_forward_open(state_query_fd(device),
+        device->keyboard_candidate);
     device->forwarding_ready = device->forwarding_target != 0u
         && !ksi_linux_forward_has_clone(device->forwarding_target);
     if (device->forwarding_target == 0u)
@@ -914,7 +945,7 @@ static bool is_contact_code(unsigned int code)
  * on the source, so it waits until every key and button is released. */
 static bool defer_grab_while_held(ksi_linux_tracked_device *device)
 {
-    (void)ksi_read_key_bytes(device->fd, device->deferred_down_keys);
+    (void)ksi_read_key_bytes(state_query_fd(device), device->deferred_down_keys);
     for (uint16_t code = BTN_DIGI; code <= BTN_TOOL_QUADTAP; code++)
         if (is_contact_code(code)) ksi_set_key_bit(device->deferred_down_keys, code, false);
     device->grab_deferred = ksi_any_key_bit(device->deferred_down_keys);
@@ -942,7 +973,7 @@ static int set_device_grab(ksi_linux_tracked_device *device, bool enabled)
         device->grab_deferred = false;
 
         if (device->grabbed) {
-            if (release_grab(device->fd) != 0) {
+            if (release_grab(device) != 0) {
                 fprintf(stderr,
                     "keysharp-input: EVIOCGRAB(off) failed for injected source %s: %s; closing device\n",
                     device->path,
@@ -1006,7 +1037,7 @@ static int set_device_grab(ksi_linux_tracked_device *device, bool enabled)
             || ksi_any_key_bit(device->ungrab_held_keys)) return 0;
     }
 
-    if ((enabled ? ioctl(device->fd, EVIOCGRAB, 1) : release_grab(device->fd)) != 0) {
+    if ((enabled ? ioctl(device->fd, EVIOCGRAB, 1) : release_grab(device)) != 0) {
         int error = errno;
         bool foreign = enabled && error == EBUSY;
 
@@ -1086,11 +1117,11 @@ static ksi_linux_tracked_device *clone_source(const ksi_linux_tracked_device *cl
  * node's LEDs, which the tracked descriptor writes back. */
 static bool node_is_grabbed(const ksi_linux_tracked_device *output)
 {
-    int saved = read_leds(output->fd);
+    int saved = read_leds(output);
     int fd = open(output->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     bool grabbed = fd >= 0 && ksi_linux_output_probe_grabbed(fd) > 0;
 
-    restore_leds(output->fd, saved);
+    restore_leds(output, saved);
     if (fd >= 0) close(fd);
     return grabbed;
 }
@@ -1180,7 +1211,7 @@ static void track_device(const ksi_linux_device_info *info, const char *reason)
 
         target = &tracked_devices[tracked_device_count++];
         memset(target, 0, sizeof(*target));
-        target->fd = -1;
+        target->fd = target->state_fd = -1;
     }
 
     (void)snprintf(target->path, sizeof(target->path), "%s", info->path);
@@ -1469,7 +1500,7 @@ static void settle_ungrab_holds(ksi_linux_tracked_device *device)
     uint8_t keys[KSI_KEY_BITMAP_BYTES];
 
     if (device->grabbed || !ksi_any_key_bit(device->ungrab_held_keys)
-        || !ksi_read_key_bytes(device->fd, keys)) return;
+        || !ksi_read_key_bytes(state_query_fd(device), keys)) return;
     for (size_t byte = 0u; byte < KSI_KEY_BITMAP_BYTES; byte++) {
         for (unsigned int bits = device->ungrab_held_keys[byte] & (uint8_t)~keys[byte];
                 bits != 0u; bits &= bits - 1u) {
@@ -2202,7 +2233,7 @@ static bool panic_chord_down(void)
     for (size_t i = 0; i < tracked_device_count; i++) {
         uint8_t keys[KSI_KEY_BITMAP_BYTES];
         if (tracked_devices[i].injected_source || tracked_devices[i].fd < 0
-            || !ksi_read_key_bytes(tracked_devices[i].fd, keys)) continue;
+            || !ksi_read_key_bytes(state_query_fd(&tracked_devices[i]), keys)) continue;
         for (size_t c = 0u; c < sizeof(panic_chord) / sizeof(panic_chord[0]); c++)
             if (ksi_key_bit(keys, panic_chord[c])) down |= 1u << c;
     }
@@ -2406,7 +2437,7 @@ void ksi_linux_devices_refresh_indicator_state(void)
         unsigned char leds = 0u;
         if (tracked_devices[i].fd >= 0 && tracked_devices[i].keyboard_candidate
             && !tracked_devices[i].injected_source
-            && ioctl(tracked_devices[i].fd, EVIOCGLED(sizeof(leds)), &leds) >= 0)
+            && ioctl(state_query_fd(&tracked_devices[i]), EVIOCGLED(sizeof(leds)), &leds) >= 0)
             seat |= leds;
     }
     current_caps_lock = (seat & (1u << LED_CAPSL)) != 0u;
@@ -2448,7 +2479,7 @@ static bool collect_key_state(uint32_t device_id, ksi_key_state_payload *result)
         uint8_t logical[KSI_KEY_BITMAP_BYTES] = {0};
         bool selected = device_id == 0u || device_id == device->device_id;
 
-        if (device->injected_source || device->fd < 0 || !ksi_read_key_bytes(device->fd, keys))
+        if (device->injected_source || device->fd < 0 || !ksi_read_key_bytes(state_query_fd(device), keys))
             continue;
         found |= selected;
         /* The desktop saw keys held at ungrab on the outputs, not the source. */
@@ -2629,7 +2660,7 @@ bool ksi_linux_gamepad_state(uint32_t device_id, ksi_gamepad_state *state)
         /* The kernel holds the current position of every axis and button, so
          * one pair of ioctls answers a poll without replaying the event
          * stream, and a client that starts mid-press still sees it held. */
-        (void)ksi_read_key_bytes(device->fd, key_state);
+        (void)ksi_read_key_bytes(state_query_fd(device), key_state);
         for (uint32_t i = 0u; i < state->button_count; i++) {
             if (ksi_key_bit(key_state, device->public_info.button_codes[i])) {
                 state->buttons[i >> 3] |= (uint8_t)(1u << (i & 7u));

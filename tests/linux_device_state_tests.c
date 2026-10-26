@@ -111,6 +111,11 @@ static int console_leds = -1;
 #define FAKE_FDS 4
 static unsigned long held_keys[FAKE_FDS][KSI_BIT_ARRAY_LENGTH(KEY_MAX)];
 static unsigned char fake_leds[FAKE_FDS];
+/* EVIOCGKEY calls per fake fd: each one flushes that descriptor's queued keys. */
+static size_t key_state_reads[FAKE_FDS];
+/* The last EVIOCSMASK request, and the descriptor forwarding was opened on. */
+static int masked_fd = -1, last_forward_fd = -1;
+static struct input_mask last_mask;
 static size_t forwarded_events;
 /* Whether a source opened next gets a clone, and whether the sink works. */
 static bool clone_fake = true, sink_ready_fake = true;
@@ -122,7 +127,7 @@ static size_t delivery_count;
 
 static uint64_t fake_forward_open(int fd, bool keyboard)
 {
-    (void)fd;
+    last_forward_fd = fd;
     last_open_keyboard = keyboard;
     forward_opens++;
     return next_forward_target++;
@@ -217,8 +222,10 @@ static const struct input_absinfo *fake_get_abs_info(const struct libevdev *devi
     return NULL;
 }
 
-/* Paths under /fake/ open as one event node that fake_node describes. */
+/* Paths under /fake/ open as one event node that fake_node describes; a
+ * read-only open, as the state descriptor is, gets a descriptor of its own. */
 #define FAKE_NODE_FD 900
+#define FAKE_STATE_FD 901
 static struct {
     const char *name, *phys, *unique;
     struct input_id id;
@@ -231,13 +238,16 @@ static struct {
 static int fake_open(const char *path, int flags, ...)
 {
     if (strncmp(path, "/fake-slot/", 11u) == 0) return 10 + atoi(path + 11);
-    return strncmp(path, "/fake/", 6u) == 0 ? FAKE_NODE_FD : open(path, flags);
+    if (strncmp(path, "/fake/", 6u) == 0)
+        return (flags & O_ACCMODE) == O_RDONLY ? FAKE_STATE_FD : FAKE_NODE_FD;
+    return open(path, flags);
 }
 
 /* Fake descriptors were never opened. */
 static int fake_close(int fd)
 {
-    return fd == FAKE_NODE_FD || fd == 12345 || (fd >= 10 && fd < 10 + FAKE_FDS) ? 0 : close(fd);
+    return fd == FAKE_NODE_FD || fd == FAKE_STATE_FD || fd == 12345
+        || (fd >= 10 && fd < 10 + FAKE_FDS) ? 0 : close(fd);
 }
 
 static int fake_node_ioctl(unsigned long request, void *out)
@@ -291,7 +301,12 @@ static int fake_ioctl(int fd, unsigned long request, ...)
     va_start(args, request);
     out = va_arg(args, void *);
     va_end(args);
-    if (fd == FAKE_NODE_FD) return fake_node_ioctl(request, out);
+    if (request == EVIOCSMASK) {
+        masked_fd = fd;
+        last_mask = *(const struct input_mask *)out;
+        return 0;
+    }
+    if (fd == FAKE_NODE_FD || fd == FAKE_STATE_FD) return fake_node_ioctl(request, out);
     if (slot < 0 || slot >= FAKE_FDS) { errno = EBADF; return -1; }
     if (request == EVIOCGRAB && fd == 12345) {
         grab_calls++;
@@ -301,6 +316,7 @@ static int fake_ioctl(int fd, unsigned long request, ...)
         return 0;
     }
     if (request == EVIOCGKEY(sizeof(held_keys[0]))) {
+        key_state_reads[slot]++;
         memcpy(out, held_keys[slot], sizeof(held_keys[slot]));
         return 0;
     }
@@ -1599,6 +1615,52 @@ static bool test_poll_list_is_bounded(void)
     return true;
 }
 
+/* A state ioctl flushes queued events of its type from the descriptor it runs
+ * on, so key, LED and switch state is read on a second open that masks every
+ * event, never on the one the reader consumes. */
+static bool test_state_queries_spare_reader_queue(void)
+{
+    ksi_linux_device_info info;
+    ksi_key_state_payload state;
+
+    memset(&fake_node, 0, sizeof(fake_node));
+    fake_node.name = "Keyboard";
+    fake_node.phys = "usb-0000:00:14.0-1/input0";
+    set_long_bit(fake_node.ev, EV_KEY);
+    set_long_bit(fake_node.key, KEY_A);
+    CHECK(read_device_info("/fake/event1", &info) == 0);
+    forwarding_enabled = true;
+    tracked_device_count = 0u;
+    ksi_linux_devices_set_observer_callback(NULL, NULL, NULL);
+    masked_fd = last_forward_fd = -1;
+    track_device(&info, "test");
+    CHECK(tracked_device_count == 1u && tracked_devices[0].fd == FAKE_NODE_FD);
+    CHECK(tracked_devices[0].state_fd == FAKE_STATE_FD && masked_fd == FAKE_STATE_FD);
+    CHECK(last_mask.type == 0u && last_mask.codes_size == 0u);
+    CHECK(last_forward_fd == FAKE_STATE_FD);
+    untrack_device("/fake/event1");
+    CHECK(tracked_device_count == 0u);
+
+    tracked_device_count = 1u;
+    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 11, .state_fd = 13, .device_id = 41u,
+        .keyboard_candidate = true, .grabbed = true };
+    memset(held_keys, 0, sizeof(held_keys));
+    memset(key_state_reads, 0, sizeof(key_state_reads));
+    set_long_bit(held_keys[3], KEY_Q);
+    CHECK(ksi_linux_devices_get_device_key_state(41u, &state) && ksi_key_bit(state.physical_keys, KEY_Q));
+    CHECK(!panic_chord_down());
+    CHECK(key_state_reads[1] == 0u && key_state_reads[3] == 2u);
+    /* Without a second open the reader's own still answers, so the panic chord works. */
+    tracked_devices[0].state_fd = -1;
+    CHECK(ksi_linux_devices_get_device_key_state(41u, &state) && !ksi_key_bit(state.physical_keys, KEY_Q));
+    CHECK(key_state_reads[1] == 1u);
+
+    tracked_device_count = 0u;
+    memset(tracked_devices, 0, sizeof(tracked_devices[0]));
+    memset(held_keys, 0, sizeof(held_keys));
+    return true;
+}
+
 static bool test_independent_device_key_states(void)
 {
     tracked_device_count = 3u;
@@ -1688,6 +1750,7 @@ int main(void)
         || !test_probe_order()
         || !test_ungrab_owes_button_to_clone()
         || !test_poll_list_is_bounded()
+        || !test_state_queries_spare_reader_queue()
         || !test_independent_device_key_states()) return 1;
     puts("PASS device state synchronization, observation, forwarding, metadata and gamepads");
     return 0;
