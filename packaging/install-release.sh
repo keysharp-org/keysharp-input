@@ -5,7 +5,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=1.1.0
+expected_version=1.1.1
 expected_client_abi_major=1
 expected_client_abi_minor=1
 
