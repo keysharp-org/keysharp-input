@@ -144,7 +144,14 @@ selects one listed device and returns NOT_FOUND after its removal; broker-owned
 outputs are never selectable. Both key bitmaps hold every `EV_KEY` code a
 source reports. The modifier mask and toggle bytes always describe the seat.
 The query requires Input Monitoring, including when only modifiers or toggle
-keys are of interest.
+keys are of interest. Key, modifier, pointer-button, indicator and gamepad-button
+queries return UNAVAILABLE when a required physical snapshot cannot be read;
+failed reads are never reported as an all-up sample. KEY_STATE_SUBSCRIBE also
+requires a successful initial sample, and failed subsequent samples publish no
+delta. Synthesis already accepted still succeeds if its state sample fails: its
+reply includes current admitted forwarding and synthesis modifiers plus the best
+available ungrabbed source state, and a nonzero sequence, without publishing an
+incomplete keyboard snapshot.
 
 DEVICES_LIST succeeds with `{u64 generation,u32 next_offset,u32 count,device[count]}`
 after the status. Pages contain at most eight records. A zero request generation

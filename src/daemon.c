@@ -586,7 +586,7 @@ static void send_status(
     uint32_t status,
     uint32_t detail);
 static void remove_client(ksi_daemon_state *state, nfds_t index);
-static void publish_keyboard_states(ksi_daemon_state *state);
+static bool publish_keyboard_states(ksi_daemon_state *state, uint32_t *logical_modifiers);
 static void send_keyboard_state(ksi_client *client, const ksi_key_state_payload *state, bool snapshot, uint64_t sequence);
 static bool fence_permission_output(ksi_daemon_state *state);
 static void synth_completion_destroy(struct ksi_synth_completion *completion);

@@ -628,8 +628,9 @@ static void synth_completion_send_result(
         ksi_status_encode(payload, status, detail);
         if (status == KSI_STATUS_OK) {
             if (completion->state != NULL) {
-                publish_keyboard_states(completion->state);
-                ksi_wire_write_u32(payload + 8u, completion->state->keyboard_snapshot.modifiers_lr);
+                uint32_t logical_modifiers;
+                publish_keyboard_states(completion->state, &logical_modifiers);
+                ksi_wire_write_u32(payload + 8u, logical_modifiers);
                 ksi_wire_write_u64(payload + 16u, completion->state->keyboard_sequence);
             } else ksi_wire_write_u64(payload + 16u, 1u);
         }

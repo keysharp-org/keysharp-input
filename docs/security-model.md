@@ -15,6 +15,33 @@ without Input Monitoring, inject input without Input Control, or grab them from
 the service. The installed udev rule only gives forwarding devices their
 source's bus metadata for hardware database lookups.
 
+The libevdev reader owns the ordered event stream. Ordinary key, LED and switch
+state ioctls run on a separate read-only open, since those ioctls discard queued
+events of their type on the descriptor used. Checking that the reader's queue is
+empty cannot make such a query safe: input can arrive between the check and the
+ioctl. Libevdev's initialization and recovery after SYN_DROPPED are the reader's
+intentional state-query exceptions.
+
+Each physical source lazily retains at most one snapshot descriptor until that
+source closes or reopens. It filters ordinary input traffic with EVIOCSMASK, is never
+polled, and is also used to describe forwarding clones. If masking is unsupported,
+the independent descriptor still isolates queries from the reader. Keeping it open
+avoids repeated evdev close synchronization on the input thread. Broker-owned
+outputs have no retained snapshot descriptor; their existing temporary grab probe
+also saves and reads LEDs while the tracked descriptor restores them.
+
+Physical state snapshots remain current when another interceptor hides events.
+They drive public state queries, the panic chord, held-key grab admission, switch
+synchronization and releases owed to forwarding outputs. They never overwrite
+libevdev's event-relative cache. A failed snapshot prevents a new grab or an owed
+release from being inferred; deferred grabs retry on both release reports and the
+bounded maintenance timer. Public queries report unavailability and subscriptions
+retain their last successful sample. The panic escape path alone may fall back to
+consumed stream state when a snapshot fails, to preserve fail-open behavior.
+Evdev cannot atomically combine a physical snapshot with acquiring a grab, so a
+press arriving between the final admission sample and EVIOCGRAB remains a grab
+boundary limitation.
+
 The system socket is world-connectable so the active desktop user can reach it.
 The service authenticates each peer with `SO_PEERCRED`, admits only the active
 seat0 uid, records the process start time, and derives the application identity

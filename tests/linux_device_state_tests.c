@@ -117,6 +117,11 @@ static unsigned char fake_leds[FAKE_FDS];
 /* EVIOCGKEY and EVIOCGLED calls per fake fd: each flushes that descriptor's
  * queued events of its type. */
 static size_t key_state_reads[FAKE_FDS], led_state_reads[FAKE_FDS];
+static size_t reader_state_reads, snapshot_opens, snapshot_closes, snapshot_masks, pending_checks;
+static bool snapshot_open_failure, snapshot_query_failure, snapshot_mask_failure, dead_reader;
+static bool snapshot_as_zero;
+static unsigned long kernel_switches[KSI_BIT_ARRAY_LENGTH(SW_MAX)];
+static uint8_t last_switches[KSI_SWITCH_BITMAP_BYTES];
 /* The descriptor forwarding was opened on. */
 static int last_forward_fd = -1;
 /* Key, switch and LED state as libevdev tracks it from the events it hands out. */
@@ -171,7 +176,10 @@ static bool fake_sink_ready(void) { return sink_ready_fake; }
 static void fake_forward_sync_switches(uint64_t target, const uint8_t *state)
 {
     if (target != 0u) switch_syncs++;
-    if (target != 0u && state != NULL) switch_syncs_with_state++;
+    if (target != 0u && state != NULL) {
+        switch_syncs_with_state++;
+        memcpy(last_switches, state, sizeof(last_switches));
+    }
 }
 static void set_long_bit(unsigned long *bits, unsigned int bit);
 
@@ -194,7 +202,7 @@ static int fake_probe_grabbed(int fd)
     return probe_result;
 }
 
-static int fake_slot(int fd) { return fd == 12345 ? 0 : fd - 10; }
+static int fake_slot(int fd) { return fd == 0 && snapshot_as_zero ? 1 : fd == 12345 ? 0 : fd >= 100 && fd < 104 ? fd - 100 : fd - 10; }
 
 static int fake_output_write(int fd, const struct input_event *written, size_t count)
 {
@@ -219,6 +227,7 @@ static void fake_add_key_state(uint64_t target, uint8_t *keys, size_t size)
 static int fake_has_event_pending(struct libevdev *device)
 {
     (void)device;
+    pending_checks++;
     return step < step_count ? 1 : 0;
 }
 static int fake_libevdev_new(int fd, struct libevdev **device)
@@ -249,7 +258,11 @@ static struct {
 
 static int fake_open(const char *path, int flags, ...)
 {
-    if (strncmp(path, "/fake-slot/", 11u) == 0) return 10 + atoi(path + 11);
+    if (strncmp(path, "/fake-slot/", 11u) == 0) {
+        if (snapshot_open_failure) { errno = EMFILE; return -1; }
+        snapshot_opens++;
+        return snapshot_as_zero ? 0 : 100 + atoi(path + 11);
+    }
     if (strncmp(path, "/fake/", 6u) == 0)
         return (flags & O_ACCMODE) == O_RDONLY ? FAKE_METADATA_FD : FAKE_NODE_FD;
     return open(path, flags);
@@ -258,6 +271,10 @@ static int fake_open(const char *path, int flags, ...)
 /* Fake descriptors were never opened. */
 static int fake_close(int fd)
 {
+    if ((fd >= 100 && fd < 104) || (fd == 0 && snapshot_as_zero)) {
+        snapshot_closes++;
+        return 0;
+    }
     return fd == FAKE_NODE_FD || fd == FAKE_METADATA_FD || fd == 12345
         || (fd >= 10 && fd < 10 + FAKE_FDS) ? 0 : close(fd);
 }
@@ -313,7 +330,21 @@ static int fake_ioctl(int fd, unsigned long request, ...)
     va_start(args, request);
     out = va_arg(args, void *);
     va_end(args);
-    if (fd == FAKE_NODE_FD || fd == FAKE_METADATA_FD) return fake_node_ioctl(request, out);
+    if (request == EVIOCGVERSION) {
+        if (dead_reader) { errno = ENODEV; return -1; }
+        *(int *)out = EV_VERSION;
+        return 0;
+    }
+    if (request == EVIOCSMASK) {
+        const struct input_mask *mask = out;
+        if (mask->type == 0u && mask->codes_size == 0u) snapshot_masks++;
+        if (snapshot_mask_failure) { errno = EINVAL; return -1; }
+        return 0;
+    }
+    if (fd == FAKE_METADATA_FD && (request == EVIOCGKEY(sizeof(held_keys[0]))
+            || request == EVIOCGLED(sizeof(fake_leds[0])) || request == EVIOCGSW(KSI_SWITCH_BITMAP_BYTES)))
+        slot = 0;
+    else if (fd == FAKE_NODE_FD || fd == FAKE_METADATA_FD) return fake_node_ioctl(request, out);
     if (slot < 0 || slot >= FAKE_FDS) { errno = EBADF; return -1; }
     if (request == EVIOCGRAB && fd == 12345) {
         grab_calls++;
@@ -321,6 +352,24 @@ static int fake_ioctl(int fd, unsigned long request, ...)
         if (out == NULL && console_leds >= 0) fake_leds[0] = (unsigned char)console_leds;
         if (out == NULL && compositor_leds >= 0) fake_leds[2] = (unsigned char)compositor_leds;
         return 0;
+    }
+    if (request == EVIOCGKEY(sizeof(held_keys[0])) || request == EVIOCGLED(sizeof(fake_leds[0]))
+        || request == EVIOCGSW(KSI_SWITCH_BITMAP_BYTES)) {
+        if (fd == 12345 || (fd >= 10 && fd < 14)) {
+            unsigned int type = request == EVIOCGKEY(sizeof(held_keys[0])) ? EV_KEY
+                : request == EVIOCGLED(sizeof(fake_leds[0])) ? EV_LED : EV_SW;
+            reader_state_reads++;
+            for (size_t i = step; i < step_count;) {
+                if (events[i].type != type) { i++; continue; }
+                for (size_t j = i + 1u; j < step_count; j++) {
+                    events[j - 1u] = events[j];
+                    results[j - 1u] = results[j];
+                    expected_flags[j - 1u] = expected_flags[j];
+                }
+                step_count--;
+            }
+        }
+        if (snapshot_query_failure) { errno = EIO; return -1; }
     }
     if (request == EVIOCGKEY(sizeof(held_keys[0]))) {
         key_state_reads[slot]++;
@@ -333,7 +382,7 @@ static int fake_ioctl(int fd, unsigned long request, ...)
         return 0;
     }
     if (request == EVIOCGSW(KSI_SWITCH_BITMAP_BYTES)) {
-        memset(out, 0, KSI_SWITCH_BITMAP_BYTES);
+        memcpy(out, kernel_switches, KSI_SWITCH_BITMAP_BYTES);
         return 0;
     }
     errno = EINVAL;
@@ -403,7 +452,7 @@ static bool capture_forward(void *context, uint32_t hook_type, const ksi_forward
 
 static bool test_sync_repairs_lost_release(void)
 {
-    ksi_linux_tracked_device device = {
+    ksi_linux_tracked_device device = { .snapshot_fd = -1,
         .fd = -1, .evdev = (struct libevdev *)&step, .device_id = 4u,
         .grabbed = true, .keyboard_candidate = true,
         .has_pending_rel = true, .pending_rel_x = 17,
@@ -440,7 +489,7 @@ static bool test_sync_repairs_lost_release(void)
  * the first unsynced on the clone. */
 static bool test_keystroke_is_one_packet(void)
 {
-    ksi_linux_tracked_device device = { .fd = -1, .evdev = (struct libevdev *)&step,
+    ksi_linux_tracked_device device = { .snapshot_fd = -1, .fd = -1, .evdev = (struct libevdev *)&step,
         .device_id = 5u, .grabbed = true, .keyboard_candidate = true, .forwarding_target = 9u };
 
     memset(expected_flags, 0, sizeof(expected_flags));
@@ -469,7 +518,7 @@ static bool test_keystroke_is_one_packet(void)
 
 static bool test_observation_without_grab(void)
 {
-    ksi_linux_tracked_device device = { .keyboard_candidate = true, .device_id = 7u };
+    ksi_linux_tracked_device device = { .snapshot_fd = -1, .keyboard_candidate = true, .device_id = 7u };
     struct input_event key = { .type = EV_KEY, .code = KEY_A, .value = 1 };
     observations = hooks = 0u;
     ksi_linux_devices_set_observer_callback(capture, NULL, &observations);
@@ -484,7 +533,7 @@ static bool test_observation_without_grab(void)
 
 static bool test_high_resolution_wheel(void)
 {
-    ksi_linux_tracked_device device = { .high_resolution_wheel = true, .mouse_hook_candidate = true };
+    ksi_linux_tracked_device device = { .snapshot_fd = -1, .high_resolution_wheel = true, .mouse_hook_candidate = true };
     struct input_event wheel = { .type = EV_REL, .code = REL_WHEEL, .value = -1 };
     observations = 0u;
     dispatch_relative_event(&device, &wheel, 0u, false);
@@ -659,6 +708,10 @@ static bool test_gamepad_selection(void)
     ksi_gamepad_state state;
     CHECK(!ksi_linux_gamepad_state(3u, &state));
     CHECK(!ksi_linux_gamepad_state(99u, &state));
+    tracked_devices[1].snapshot_fd = -1;
+    CHECK(!ksi_linux_gamepad_state(4u, &state) && errno == EIO);
+    snprintf(tracked_devices[1].path, sizeof(tracked_devices[1].path), "/fake-slot/1");
+    memset(held_keys[1], 0, sizeof(held_keys[1]));
     CHECK(ksi_linux_gamepad_state(4u, &state));
     CHECK(state.device_id == 4u && state.button_count == 2u && state.axis_count == 0u);
     CHECK(state.buttons[0] == 0u && state.device_generation == ksi_linux_devices_generation());
@@ -671,7 +724,7 @@ static bool test_gamepad_selection(void)
 
 static bool test_raw_touchpad_observation(void)
 {
-    ksi_linux_tracked_device device = {
+    ksi_linux_tracked_device device = { .snapshot_fd = -1,
         .device_id = 33u, .raw_observation_candidate = true, .event_clock_monotonic = true,
     };
     struct input_event event = { .type = EV_ABS, .code = ABS_MT_POSITION_X, .value = 1920 };
@@ -698,7 +751,7 @@ static bool test_raw_touchpad_observation(void)
 
 static bool test_forwarding_preserves_raw_input(void)
 {
-    ksi_linux_tracked_device device = {
+    ksi_linux_tracked_device device = { .snapshot_fd = -1,
         .device_id = 55u, .forwarding_target = 91u, .grabbed = true,
         .keyboard_candidate = true, .mouse_candidate = true,
         .mouse_hook_candidate = true, .mouse_block_candidate = true,
@@ -812,7 +865,7 @@ static bool test_forwarding_preserves_raw_input(void)
     block_input_mask = 0u;
     /* A keyboard-only grab forwards wheels raw; the clone rebuilds the legacy
      * step from the high-resolution value, so the source's own is dropped. */
-    ksi_linux_tracked_device keyboard = {
+    ksi_linux_tracked_device keyboard = { .snapshot_fd = -1,
         .forwarding_target = 92u, .grabbed = true, .keyboard_candidate = true,
         .high_resolution_horizontal_wheel = true,
     };
@@ -825,7 +878,7 @@ static bool test_forwarding_preserves_raw_input(void)
     CHECK(forwarded_events == before_block + 1u && forwarded_replay.events[0].code == REL_HWHEEL_HI_RES);
 
     /* A plain mouse keeps its whole report, scan codes included, on one lane. */
-    ksi_linux_tracked_device mouse = {
+    ksi_linux_tracked_device mouse = { .snapshot_fd = -1,
         .forwarding_target = 93u, .grabbed = true, .mouse_candidate = true,
         .mouse_hook_candidate = true, .mouse_block_candidate = true,
     };
@@ -840,15 +893,15 @@ static bool test_forwarding_preserves_raw_input(void)
  * the sink reach every grabbed keyboard; lock state is read back from them. */
 static bool test_forwarding_led_feedback(void)
 {
-    ksi_linux_tracked_device sink = { .fd = 13, .injected_source = true, .forwarding_sink = true };
+    ksi_linux_tracked_device sink = { .path = "/fake-slot/3", .snapshot_fd = -1, .fd = 13, .injected_source = true, .forwarding_sink = true };
     struct input_event led = { .type = EV_LED, .code = LED_CAPSL, .value = 1 };
     uint64_t fallback = 0u;
 
     tracked_device_count = 4u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 11, .keyboard_candidate = true, .grabbed = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 12, .keyboard_candidate = true };
-    tracked_devices[2] = (ksi_linux_tracked_device){ .fd = 13, .keyboard_candidate = true, .grabbed = true };
-    tracked_devices[3] = (ksi_linux_tracked_device){ .fd = 12345, .mouse_candidate = true, .grabbed = true };
+    tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/1", .snapshot_fd = -1, .fd = 11, .keyboard_candidate = true, .grabbed = true };
+    tracked_devices[1] = (ksi_linux_tracked_device){ .path = "/fake-slot/2", .snapshot_fd = -1, .fd = 12, .keyboard_candidate = true };
+    tracked_devices[2] = (ksi_linux_tracked_device){ .path = "/fake-slot/3", .snapshot_fd = -1, .fd = 13, .keyboard_candidate = true, .grabbed = true };
+    tracked_devices[3] = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .mouse_candidate = true, .grabbed = true };
     memset(fake_leds, 0, sizeof(fake_leds));
     handle_input_event(&sink, &led, &fallback);
     CHECK(fake_leds[1] == 1u << LED_CAPSL && fake_leds[3] == 1u << LED_CAPSL);
@@ -867,7 +920,7 @@ static bool test_forwarding_led_feedback(void)
 
 static bool test_forwarding_grab_lifecycle(void)
 {
-    ksi_linux_tracked_device device = {
+    ksi_linux_tracked_device device = { .path = "/fake-slot/0", .snapshot_fd = -1,
         .fd = 12345, .forwarding_target = 1u,
         .mouse_hook_candidate = true, .mouse_block_candidate = true,
     };
@@ -942,9 +995,9 @@ static bool test_forwarding_grab_lifecycle(void)
 static bool test_forwarding_clone_admission(void)
 {
     tracked_device_count = 2u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = -1, .forwarding_target = 88u,
+    tracked_devices[0] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .forwarding_target = 88u,
         .keyboard_candidate = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 11, .injected_source = true,
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 11, .injected_source = true,
         .forwarding_clone = true, .path = "/dev/null" };
     grab_state_incomplete = false;
     last_grab_retry_ms = 1u;
@@ -974,7 +1027,7 @@ static bool test_ungrab_keeps_clone_holds(void)
     uint64_t fallback = 0u;
 
     tracked_device_count = 1u;
-    *device = (ksi_linux_tracked_device){ .fd = 12345, .device_id = 41u, .forwarding_target = 7u,
+    *device = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .device_id = 41u, .forwarding_target = 7u,
         .forwarding_ready = true, .grabbed = true, .keyboard_candidate = true };
     memset(held_keys, 0, sizeof(held_keys));
     set_long_bit(held_keys[0], KEY_LEFTSHIFT);
@@ -1039,7 +1092,7 @@ static bool test_deferred_grab_keeps_observers(void)
     size_t panics = 0u;
 
     tracked_device_count = 1u;
-    *device = (ksi_linux_tracked_device){ .fd = 12345, .forwarding_target = 5u,
+    *device = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 5u,
         .forwarding_ready = true, .keyboard_candidate = true };
     memset(held_keys, 0, sizeof(held_keys));
     set_long_bit(held_keys[0], KEY_A);
@@ -1062,7 +1115,7 @@ static bool test_deferred_grab_keeps_observers(void)
 
     ksi_linux_devices_set_panic_callback(count_panic, &panics);
     tracked_device_count = 2u;
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 11, .keyboard_candidate = true };
+    tracked_devices[1] = (ksi_linux_tracked_device){ .path = "/fake-slot/1", .snapshot_fd = -1, .fd = 11, .keyboard_candidate = true };
     set_long_bit(held_keys[1], KEY_BACKSPACE);
     set_long_bit(held_keys[0], KEY_ESC);
     set_long_bit(held_keys[0], KEY_ENTER);
@@ -1100,9 +1153,9 @@ static bool test_deferred_grab_keeps_observers(void)
  * ungrabbed source to its clone, which logind also reads. */
 static bool test_forwarding_roles(void)
 {
-    ksi_linux_tracked_device touch = { .forwarding_target = 94u, .grabbed = true,
+    ksi_linux_tracked_device touch = { .snapshot_fd = -1, .forwarding_target = 94u, .grabbed = true,
         .mouse_block_candidate = true };
-    ksi_linux_tracked_device keyboard = { .forwarding_target = 95u, .grabbed = true,
+    ksi_linux_tracked_device keyboard = { .fd = 11, .path = "/fake-slot/1", .snapshot_fd = -1, .forwarding_target = 95u, .grabbed = true,
         .keyboard_candidate = true, .evdev = (struct libevdev *)&step };
     struct input_event raw = { .type = EV_MSC, .code = MSC_TIMESTAMP, .value = 1 };
     uint64_t fallback = 0u;
@@ -1133,11 +1186,11 @@ static bool test_grab_retry_policy(void)
     ksi_linux_tracked_device *source = &tracked_devices[0];
 
     tracked_device_count = 3u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 12345, .forwarding_target = 3u,
+    tracked_devices[0] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 12345, .forwarding_target = 3u,
         .keyboard_candidate = true, .path = "/fake/event9" };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = -1, .keyboard_candidate = true,
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .keyboard_candidate = true,
         .path = "/dev/input/event-gone" };
-    tracked_devices[2] = (ksi_linux_tracked_device){ .fd = -1, .injected_source = true,
+    tracked_devices[2] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .injected_source = true,
         .path = "/dev/null" };
     memset(held_keys, 0, sizeof(held_keys));
     grab_hook_mask = block_input_mask = 0u;
@@ -1158,7 +1211,7 @@ static bool test_grab_retry_policy(void)
     set_long_bit(held_keys[0], KEY_A);
     probes = 0u;
     CHECK(set_grab_masks(KSI_OPERATION_HOOK_KEYBOARD, 0u) == 0);
-    CHECK(source->grab_deferred && probes == 0u && !grab_state_incomplete);
+    CHECK(source->grab_deferred && probes == 0u && grab_state_incomplete);
     memset(held_keys[0], 0, sizeof(held_keys[0]));
     probe_result = 1;
     const struct input_event up = { .type = EV_KEY, .code = KEY_A, .value = 0 };
@@ -1215,9 +1268,9 @@ static bool test_own_clone_grabbed_downstream(void)
     ksi_linux_tracked_device *source = &tracked_devices[0];
 
     tracked_device_count = 2u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 12345, .forwarding_target = 88u,
+    tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 88u,
         .forwarding_ready = true, .keyboard_candidate = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = -1, .injected_source = true,
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .injected_source = true,
         .forwarding_clone = true, .path = "/dev/null" };
     memset(held_keys, 0, sizeof(held_keys));
     grab_hook_mask = block_input_mask = 0u;
@@ -1241,9 +1294,9 @@ static bool test_own_clone_grabbed_downstream(void)
 static bool test_grab_release_keeps_leds(void)
 {
     tracked_device_count = 2u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 12345, .keyboard_candidate = true,
+    tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .keyboard_candidate = true,
         .grabbed = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 11, .injected_source = true,
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 11, .injected_source = true,
         .forwarding_sink = true, .path = "/fake-slot/1" };
     fake_leds[0] = 1u << LED_CAPSL;
     fake_leds[1] = 1u << LED_SCROLLL;
@@ -1254,6 +1307,7 @@ static bool test_grab_release_keeps_leds(void)
     CHECK(fake_leds[0] == 1u << LED_CAPSL && fake_leds[1] == 1u << LED_SCROLLL);
     CHECK(fake_leds[2] == 1u << LED_CAPSL);
     CHECK(!node_is_grabbed(&tracked_devices[1]));
+    CHECK(tracked_devices[1].snapshot_fd == -1);
     CHECK(fake_leds[0] == 1u << LED_CAPSL && fake_leds[1] == 1u << LED_SCROLLL);
 
     console_leds = compositor_leds = -1;
@@ -1272,9 +1326,9 @@ static bool test_grab_change_drains_queue(void)
     const struct input_event report_end = { .type = EV_SYN, .code = SYN_REPORT };
 
     tracked_device_count = 2u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 12345, .evdev = (struct libevdev *)&step,
+    tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .evdev = (struct libevdev *)&step,
         .forwarding_target = 5u, .forwarding_ready = true, .keyboard_candidate = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = -1, .injected_source = true, .path = "/dev/null" };
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .injected_source = true, .path = "/dev/null" };
     memset(held_keys, 0, sizeof(held_keys));
     memset(stream_keys, 0, sizeof(stream_keys));
     memset(results, 0, sizeof(results));
@@ -1320,7 +1374,7 @@ static bool test_grab_waits_for_owed_release(void)
     ksi_linux_tracked_device *device = &tracked_devices[0];
 
     tracked_device_count = 1u;
-    *device = (ksi_linux_tracked_device){ .fd = 12345, .forwarding_target = 7u,
+    *device = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 7u,
         .forwarding_ready = true, .keyboard_candidate = true };
     ksi_set_key_bit(device->ungrab_held_keys, KEY_LEFTALT, true);
     memset(held_keys, 0, sizeof(held_keys));
@@ -1345,10 +1399,10 @@ static bool test_grab_waits_for_owed_release(void)
  * release, and a blocked key's scan code does not reach the next report. */
 static bool test_raw_report_packets(void)
 {
-    ksi_linux_tracked_device mouse = { .fd = -1, .evdev = (struct libevdev *)&step, .grabbed = true,
+    ksi_linux_tracked_device mouse = { .snapshot_fd = -1, .fd = -1, .evdev = (struct libevdev *)&step, .grabbed = true,
         .forwarding_target = 96u, .mouse_candidate = true, .mouse_hook_candidate = true,
         .mouse_block_candidate = true };
-    ksi_linux_tracked_device combined = { .fd = -1, .evdev = (struct libevdev *)&step, .grabbed = true,
+    ksi_linux_tracked_device combined = { .snapshot_fd = -1, .fd = -1, .evdev = (struct libevdev *)&step, .grabbed = true,
         .forwarding_target = 97u, .keyboard_candidate = true, .mouse_candidate = true,
         .mouse_block_candidate = true };
 
@@ -1407,7 +1461,7 @@ static bool test_read_error_closes_after_event(void)
     ksi_linux_tracked_device *device = &tracked_devices[0];
 
     tracked_device_count = 1u;
-    *device = (ksi_linux_tracked_device){ .fd = 12345, .evdev = (struct libevdev *)&step, .grabbed = true,
+    *device = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .evdev = (struct libevdev *)&step, .grabbed = true,
         .keyboard_candidate = true, .forwarding_target = 8u };
     memset(results, 0, sizeof(results));
     events[0] = (struct input_event){ .type = EV_KEY, .code = KEY_A, .value = 1 };
@@ -1481,7 +1535,7 @@ static bool test_device_classification(void)
     track_device(&info, "test");
     CHECK(tracked_device_count == 4u && forward_opens == 1u && tracked_devices[3].forwarding_sink);
     CHECK(tracked_devices[3].injected_source && sink_admitted && grab_state_incomplete && last_grab_retry_ms == 0u);
-    const ksi_linux_tracked_device keyboard = { .fd = 12345, .forwarding_target = 7u,
+    const ksi_linux_tracked_device keyboard = { .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 7u,
         .forwarding_ready = true, .keyboard_candidate = true };
     CHECK(forwarding_usable(&keyboard));
 
@@ -1522,12 +1576,12 @@ static bool test_device_classification(void)
 static bool test_keyboard_grab_waits_for_sink(void)
 {
     ksi_linux_tracked_device *keyboard = &tracked_devices[0];
-    ksi_linux_tracked_device mouse = { .fd = 12345, .forwarding_target = 8u, .forwarding_ready = true,
+    ksi_linux_tracked_device mouse = { .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 8u, .forwarding_ready = true,
         .mouse_hook_candidate = true, .mouse_block_candidate = true };
     size_t closes = forward_closes;
 
     tracked_device_count = 1u;
-    *keyboard = (ksi_linux_tracked_device){ .fd = 12345, .forwarding_target = 7u,
+    *keyboard = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 7u,
         .forwarding_ready = true, .keyboard_candidate = true };
     memset(held_keys, 0, sizeof(held_keys));
     outputs_grabbed = -1;
@@ -1560,7 +1614,7 @@ static bool test_keyboard_grab_waits_for_sink(void)
  * them as keyboard input. */
 static bool test_keyboard_extras_block_as_keyboard(void)
 {
-    ksi_linux_tracked_device keyboard = { .forwarding_target = 96u, .grabbed = true,
+    ksi_linux_tracked_device keyboard = { .snapshot_fd = -1, .forwarding_target = 96u, .grabbed = true,
         .keyboard_candidate = true };
     struct input_event button = { .type = EV_KEY, .code = BTN_0, .value = 1 };
     uint64_t fallback = 0u;
@@ -1584,9 +1638,9 @@ static bool test_keyboard_extras_block_as_keyboard(void)
 static bool test_probe_order(void)
 {
     tracked_device_count = 2u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 11, .device_id = 41u,
+    tracked_devices[0] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 11, .device_id = 41u,
         .injected_source = true, .path = "/fake-slot/1" };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 12, .device_id = 42u,
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 12, .device_id = 42u,
         .injected_source = true, .path = "/fake-slot/2" };
     probe_grabbed_slots = 1u << 2;
     probe_result = 0;
@@ -1610,7 +1664,7 @@ static bool test_ungrab_owes_button_to_clone(void)
     uint64_t fallback = 0u;
 
     tracked_device_count = 1u;
-    *mouse = (ksi_linux_tracked_device){ .fd = 12345, .forwarding_target = 9u, .forwarding_ready = true,
+    *mouse = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 9u, .forwarding_ready = true,
         .grabbed = true, .mouse_candidate = true, .mouse_block_candidate = true };
     memset(held_keys, 0, sizeof(held_keys));
     set_long_bit(held_keys[0], BTN_LEFT);
@@ -1643,11 +1697,9 @@ static bool test_poll_list_is_bounded(void)
     return true;
 }
 
-/* EVIOCGKEY, EVIOCGSW and EVIOCGLED flush queued events of their type from the
- * descriptor they run on, so key, switch and LED state comes from the stream the
- * reader already consumes. The kernel answers only under another program's grab, and only
- * while nothing is queued for the reader to lose. */
-static bool test_state_comes_from_the_stream(void)
+/* Physical samples must use independent clients even when reader events are
+ * pending or an unknown foreign grab has silently changed kernel state. */
+static bool test_state_comes_from_snapshots(void)
 {
     ksi_linux_device_info info;
     ksi_key_state_payload state;
@@ -1664,14 +1716,15 @@ static bool test_state_comes_from_the_stream(void)
     ksi_linux_devices_set_observer_callback(NULL, NULL, NULL);
     last_forward_fd = -1;
     track_device(&info, "test");
-    /* The clone is described from an open of its own. */
-    CHECK(tracked_device_count == 1u && device->fd == FAKE_NODE_FD && last_forward_fd == FAKE_METADATA_FD);
+    CHECK(tracked_device_count == 1u && device->fd == FAKE_NODE_FD);
+    CHECK(last_forward_fd == FAKE_METADATA_FD && device->snapshot_fd == last_forward_fd);
     untrack_device("/fake/event1");
     CHECK(tracked_device_count == 0u);
 
     tracked_device_count = 1u;
-    *device = (ksi_linux_tracked_device){ .fd = 11, .evdev = (struct libevdev *)&step,
-        .device_id = 41u, .keyboard_candidate = true, .grabbed = true, .forwarding_target = 9u };
+    *device = (ksi_linux_tracked_device){ .snapshot_fd = -1, .path = "/fake-slot/1",
+        .fd = 11, .evdev = (struct libevdev *)&step, .device_id = 41u,
+        .keyboard_candidate = true, .grabbed = true, .forwarding_target = 9u };
     memset(held_keys, 0, sizeof(held_keys));
     memset(stream_keys, 0, sizeof(stream_keys));
     memset(key_state_reads, 0, sizeof(key_state_reads));
@@ -1679,32 +1732,31 @@ static bool test_state_comes_from_the_stream(void)
     set_long_bit(stream_keys, KEY_W);
     step = step_count = 0u;
     CHECK(ksi_linux_devices_get_device_key_state(41u, &state));
-    CHECK(ksi_key_bit(state.physical_keys, KEY_W) && !ksi_key_bit(state.physical_keys, KEY_Q));
-    CHECK(!panic_chord_down() && key_state_reads[1] == 0u);
-
-    /* Another program's grab stops the stream: a silent one asks the kernel,
-     * one still holding events keeps to what it has seen. */
+    CHECK(ksi_key_bit(state.physical_keys, KEY_Q) && !ksi_key_bit(state.physical_keys, KEY_W));
+    CHECK(device->snapshot_fd == 101 && !panic_chord_down());
     device->grabbed = false;
-    device->foreign_grab = true;
-    CHECK(ksi_linux_devices_get_device_key_state(41u, &state) && ksi_key_bit(state.physical_keys, KEY_Q));
-    CHECK(key_state_reads[1] == 1u);
+    for (unsigned int foreign = 0u; foreign <= 1u; foreign++) {
+        device->foreign_grab = foreign != 0u;
+        CHECK(ksi_linux_devices_get_device_key_state(41u, &state));
+        CHECK(ksi_key_bit(state.physical_keys, KEY_Q));
+    }
     events[0] = (struct input_event){ .type = EV_KEY, .code = KEY_E, .value = 1 };
+    results[0] = LIBEVDEV_READ_STATUS_SUCCESS;
+    expected_flags[0] = LIBEVDEV_READ_FLAG_NORMAL;
     step_count = 1u;
-    CHECK(ksi_linux_devices_get_device_key_state(41u, &state) && ksi_key_bit(state.physical_keys, KEY_W));
-    CHECK(key_state_reads[1] == 1u);
-
-    /* A clone's switches and the seat's lock LEDs follow the stream too. */
+    CHECK(ksi_linux_devices_get_device_key_state(41u, &state) && ksi_key_bit(state.physical_keys, KEY_Q));
+    CHECK(step == 0u && fake_get_event_value(device->evdev, EV_KEY, KEY_W) == 1);
+    struct input_event event;
+    CHECK(fake_next_event(device->evdev, LIBEVDEV_READ_FLAG_NORMAL, &event) == 0 && event.code == KEY_E);
     switch_syncs_with_state = 0u;
     sync_clone_switches(device);
     CHECK(switch_syncs_with_state == 1u);
-    memset(led_state_reads, 0, sizeof(led_state_reads));
+    fake_leds[1] = 1u << LED_CAPSL;
     memset(stream_leds, 0, sizeof(stream_leds));
-    set_long_bit(stream_leds, LED_CAPSL);
-    ksi_linux_devices_refresh_indicator_state();
-    CHECK(current_caps_lock && !current_num_lock && led_state_reads[1] == 0u);
-    memset(stream_leds, 0, sizeof(stream_leds));
-    ksi_linux_devices_refresh_indicator_state();
-    CHECK(!current_caps_lock);
+    CHECK(ksi_linux_devices_refresh_indicator_state());
+    CHECK(current_caps_lock && !current_num_lock);
+    fake_leds[1] = 0u;
+    CHECK(ksi_linux_devices_refresh_indicator_state() && !current_caps_lock);
 
     step = step_count = 0u;
     tracked_device_count = 0u;
@@ -1714,12 +1766,199 @@ static bool test_state_comes_from_the_stream(void)
     return true;
 }
 
+/* Lazy clients survive repeated samples, are never polled, and do not fall
+ * back to the reader when allocation, validation or querying fails. */
+static bool test_snapshot_lifecycle_and_failures(void)
+{
+    ksi_linux_tracked_device *device = &tracked_devices[0];
+    ksi_key_state_payload state;
+    struct pollfd fds[2];
+
+    tracked_device_count = 1u;
+    *device = (ksi_linux_tracked_device){ .fd = 11, .snapshot_fd = -1,
+        .path = "/fake-slot/1", .device_id = 91u, .keyboard_candidate = true,
+        .evdev = (struct libevdev *)&step };
+    step = step_count = 0u;
+    memset(held_keys, 0, sizeof(held_keys));
+    snapshot_opens = snapshot_closes = snapshot_masks = reader_state_reads = 0u;
+    CHECK(device->snapshot_fd == -1 && snapshot_opens == 0u);
+    snapshot_open_failure = true;
+    CHECK(!ksi_linux_devices_get_device_key_state(91u, &state) && errno == EIO);
+    CHECK(device->snapshot_fd == -1 && reader_state_reads == 0u);
+    snapshot_open_failure = false;
+    dead_reader = true;
+    CHECK(!ksi_linux_devices_get_device_key_state(91u, &state) && errno == EIO);
+    CHECK(device->snapshot_fd == -1 && snapshot_closes == 1u);
+    dead_reader = false;
+    snapshot_mask_failure = true;
+    snapshot_as_zero = true;
+    set_long_bit(held_keys[1], KEY_LEFTCTRL);
+    CHECK(ksi_linux_devices_get_device_key_state(91u, &state));
+    CHECK(device->snapshot_fd == 0 && snapshot_opens == 2u && snapshot_masks == 1u);
+    CHECK(ksi_key_bit(state.physical_keys, KEY_LEFTCTRL));
+    CHECK(ksi_linux_devices_get_device_key_state(91u, &state) && snapshot_opens == 2u);
+    CHECK(ksi_linux_devices_poll_fds(fds, 2u) == 1u && fds[0].fd == 11);
+    current_caps_lock = true;
+    snapshot_query_failure = true;
+    CHECK(!ksi_linux_devices_refresh_indicator_state() && current_caps_lock);
+    CHECK(!ksi_linux_devices_get_device_key_state(999u, &state) && errno == ENODEV);
+    CHECK(!ksi_linux_devices_get_device_key_state(91u, &state) && errno == EIO);
+    CHECK(reader_state_reads == 0u && device->snapshot_fd == 0);
+    set_long_bit(stream_keys, KEY_BACKSPACE);
+    set_long_bit(stream_keys, KEY_ESC);
+    set_long_bit(stream_keys, KEY_ENTER);
+    CHECK(panic_chord_down() && reader_state_reads == 0u);
+    device->injected_source = true;
+    CHECK(!panic_chord_down());
+    device->injected_source = false;
+    memset(stream_keys, 0, sizeof(stream_keys));
+    snapshot_query_failure = snapshot_mask_failure = false;
+    close_tracked_device(device);
+    CHECK(device->snapshot_fd == -1 && snapshot_closes == 2u);
+    snapshot_as_zero = false;
+    tracked_device_count = 0u;
+    memset(held_keys, 0, sizeof(held_keys));
+    return true;
+}
+
+/* A foreign grab may hide the release forever. The bounded timer must trust
+ * kernel state even while libevdev retains the press, with no new events. */
+static bool test_snapshot_recovers_deferred_grab(void)
+{
+    ksi_linux_tracked_device *device = &tracked_devices[0];
+
+    tracked_device_count = 1u;
+    *device = (ksi_linux_tracked_device){ .fd = 12345, .snapshot_fd = -1,
+        .path = "/fake-slot/0", .device_id = 92u, .keyboard_candidate = true,
+        .evdev = (struct libevdev *)&step };
+    step = step_count = 0u;
+    memset(held_keys, 0, sizeof(held_keys));
+    memset(stream_keys, 0, sizeof(stream_keys));
+    set_long_bit(held_keys[0], KEY_LEFTCTRL);
+    set_long_bit(stream_keys, KEY_LEFTCTRL);
+    grab_hook_mask = block_input_mask = 0u;
+    grab_state_incomplete = false;
+    forwarding_enabled = false;
+    outputs_grabbed = -1;
+    CHECK(set_grab_masks(0u, KSI_BLOCK_KEYBOARD) == 0);
+    CHECK(device->grab_deferred && grab_state_incomplete && !device->grabbed);
+    clear_long_bit(held_keys[0], KEY_LEFTCTRL);
+    snapshot_query_failure = true;
+    ksi_set_key_bit(device->ungrab_held_keys, KEY_LEFTCTRL, true);
+    forwarded_events = 0u;
+    ksi_linux_devices_set_forward_event_callback(capture_forward, NULL, NULL, NULL);
+    settle_ungrab_holds(device);
+    CHECK(ksi_key_bit(device->ungrab_held_keys, KEY_LEFTCTRL) && forwarded_events == 0u);
+    last_grab_retry_ms = 0u;
+    ksi_linux_devices_retry_incomplete_grabs();
+    CHECK(!device->grabbed && grab_state_incomplete && !device->grab_deferred);
+    last_grab_retry_ms = 123u;
+    const struct input_event unrelated_report = { .type = EV_SYN, .code = SYN_REPORT };
+    process_deferred_grab_event(device, &unrelated_report);
+    CHECK(last_grab_retry_ms == 123u);
+    snapshot_query_failure = false;
+    memset(device->ungrab_held_keys, 0, sizeof(device->ungrab_held_keys));
+    last_grab_retry_ms = 0u;
+    ksi_linux_devices_retry_incomplete_grabs();
+    CHECK(device->grabbed && !device->grab_deferred && !grab_state_incomplete);
+    CHECK(fake_get_event_value(device->evdev, EV_KEY, KEY_LEFTCTRL) == 1);
+    CHECK(set_grab_masks(0u, 0u) == 0);
+    close_tracked_device(device);
+    ksi_linux_devices_set_forward_event_callback(NULL, NULL, NULL, NULL);
+    tracked_device_count = 0u;
+    memset(stream_keys, 0, sizeof(stream_keys));
+    return true;
+}
+
+/* Queries and LED restoration leave all reader event classes in order. Full
+ * switch synchronization must not reintroduce stale cached switches. */
+static bool test_snapshots_preserve_reader_queue(void)
+{
+    ksi_linux_tracked_device *device = &tracked_devices[0];
+    ksi_key_state_payload state;
+    struct input_event event;
+
+    tracked_device_count = 1u;
+    *device = (ksi_linux_tracked_device){ .fd = 12345, .snapshot_fd = -1,
+        .path = "/fake-slot/0", .device_id = 93u, .keyboard_candidate = true,
+        .evdev = (struct libevdev *)&step, .forwarding_target = 77u, .grabbed = true };
+    memset(held_keys, 0, sizeof(held_keys));
+    memset(stream_switches, 0, sizeof(stream_switches));
+    memset(kernel_switches, 0, sizeof(kernel_switches));
+    set_long_bit(stream_switches, SW_LID);
+    set_long_bit(kernel_switches, SW_DOCK);
+    step = 0u; step_count = 3u; reader_state_reads = pending_checks = 0u;
+    events[0] = (struct input_event){ .type = EV_KEY, .code = KEY_E, .value = 1 };
+    events[1] = (struct input_event){ .type = EV_LED, .code = LED_CAPSL, .value = 1 };
+    events[2] = (struct input_event){ .type = EV_SW, .code = SW_DOCK, .value = 1 };
+    memset(results, 0, sizeof(results));
+    memset(expected_flags, 0, sizeof(expected_flags));
+    CHECK(ksi_linux_devices_get_device_key_state(93u, &state));
+    sync_clone_switches(device);
+    CHECK(ksi_key_bit(last_switches, SW_DOCK) && !ksi_key_bit(last_switches, SW_LID));
+    fake_leds[0] = 1u << LED_CAPSL;
+    console_leds = 1 << LED_NUML;
+    CHECK(release_grab(device) == 0 && fake_leds[0] == 1u << LED_CAPSL);
+    CHECK(step == 0u && step_count == 3u && reader_state_reads == 0u && pending_checks == 0u);
+    for (size_t i = 0u; i < 3u; i++) {
+        CHECK(fake_next_event(device->evdev, LIBEVDEV_READ_FLAG_NORMAL, &event) == 0);
+        CHECK(event.type == (i == 0u ? EV_KEY : i == 1u ? EV_LED : EV_SW));
+    }
+    device->grabbed = false;
+    console_leds = -1;
+    close_tracked_device(device);
+    tracked_device_count = 0u;
+    step = step_count = 0u;
+    memset(fake_leds, 0, sizeof(fake_leds));
+    memset(kernel_switches, 0, sizeof(kernel_switches));
+    memset(stream_switches, 0, sizeof(stream_switches));
+    return true;
+}
+
+/* A failed source cannot hide later sources' forwarded holds or admitted
+ * synthesis from ACK metadata; physical snapshot callers still see failure. */
+static bool test_failed_snapshot_keeps_admitted_modifiers(void)
+{
+    ksi_key_state_payload state;
+    ksi_input shift = { .type = KSI_INPUT_KEYBOARD,
+        .data.keyboard = { .scan = KEY_LEFTSHIFT, .flags = KSI_KEY_SCANCODE } };
+    const ksi_synth_owner owner = { .connection_id = 99u };
+
+    tracked_device_count = 3u;
+    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 10, .snapshot_fd = -1,
+        .path = "/fake-slot/0", .device_id = 94u };
+    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 11, .snapshot_fd = -1,
+        .path = "/fake-slot/1", .device_id = 95u, .grabbed = true, .forwarding_target = 77u };
+    tracked_devices[2] = (ksi_linux_tracked_device){ .fd = 12, .snapshot_fd = -1,
+        .path = "/fake-slot/2", .device_id = 96u, .evdev = (struct libevdev *)&step };
+    memset(fake_clone_output, 0, sizeof(fake_clone_output));
+    memset(stream_keys, 0, sizeof(stream_keys));
+    ksi_set_key_bit(fake_clone_output, KEY_LEFTCTRL, true);
+    set_long_bit(stream_keys, KEY_LEFTALT);
+    ksi_linux_synth_reset_enqueued_synth();
+    snapshot_query_failure = true;
+    for (unsigned int release = 0u; release < 2u; release++) {
+        shift.data.keyboard.flags = KSI_KEY_SCANCODE | (release != 0u ? KSI_KEY_UP : 0u);
+        ksi_linux_synth_note_enqueued_synth(&shift, 1u, &owner);
+        CHECK(!ksi_linux_devices_get_device_key_state(0u, &state) && errno == EIO);
+        CHECK(state.modifiers_lr == (0x01u | 0x04u | (release == 0u ? 0x10u : 0u)));
+        CHECK(!ksi_any_key_bit(state.physical_keys));
+    }
+    snapshot_query_failure = false;
+    for (size_t i = 0u; i < tracked_device_count; i++) close_tracked_device(&tracked_devices[i]);
+    tracked_device_count = 0u;
+    memset(fake_clone_output, 0, sizeof(fake_clone_output));
+    memset(stream_keys, 0, sizeof(stream_keys));
+    ksi_linux_synth_reset_enqueued_synth();
+    return true;
+}
+
 static bool test_independent_device_key_states(void)
 {
     tracked_device_count = 3u;
-    tracked_devices[0] = (ksi_linux_tracked_device){ .fd = 11, .device_id = 31u, .keyboard_candidate = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .fd = 12, .device_id = 32u, .keyboard_candidate = true };
-    tracked_devices[2] = (ksi_linux_tracked_device){ .fd = 13, .device_id = 33u, .mouse_candidate = true };
+    tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/1", .snapshot_fd = -1, .fd = 11, .device_id = 31u, .keyboard_candidate = true };
+    tracked_devices[1] = (ksi_linux_tracked_device){ .path = "/fake-slot/2", .snapshot_fd = -1, .fd = 12, .device_id = 32u, .keyboard_candidate = true };
+    tracked_devices[2] = (ksi_linux_tracked_device){ .path = "/fake-slot/3", .snapshot_fd = -1, .fd = 13, .device_id = 33u, .mouse_candidate = true };
     memset(held_keys, 0, sizeof(held_keys));
     memset(fake_leds, 0, sizeof(fake_leds));
     set_long_bit(held_keys[2], KEY_A);
@@ -1803,7 +2042,11 @@ int main(void)
         || !test_probe_order()
         || !test_ungrab_owes_button_to_clone()
         || !test_poll_list_is_bounded()
-        || !test_state_comes_from_the_stream()
+        || !test_state_comes_from_snapshots()
+        || !test_snapshot_lifecycle_and_failures()
+        || !test_snapshot_recovers_deferred_grab()
+        || !test_snapshots_preserve_reader_queue()
+        || !test_failed_snapshot_keeps_admitted_modifiers()
         || !test_independent_device_key_states()) return 1;
     puts("PASS device state synchronization, observation, forwarding, metadata and gamepads");
     return 0;

@@ -120,7 +120,7 @@ static void finish_client_authorization(
     }
     if (authorize) {
         if (client->keyboard_state_subscribed) {
-            publish_keyboard_states(state);
+            publish_keyboard_states(state, NULL);
             send_keyboard_state(client, &state->keyboard_snapshot, true, state->keyboard_sequence);
         }
         /* The reply is a barrier for the grant and keyboard visibility snapshot. */

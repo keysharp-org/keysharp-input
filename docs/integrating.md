@@ -219,7 +219,9 @@ Physical state is read from the kernel for every source, so it also covers
 sources another remapper has grabbed. The bitmaps hold every `EV_KEY` code a
 source reports, including touch and tool codes, and the seat is their union:
 releasing a key on one keyboard leaves another keyboard's hold intact.
-Broker-owned outputs never count as sources.
+Broker-owned outputs never count as sources. State queries return
+`KSI_STATUS_UNAVAILABLE` when a required physical snapshot cannot be read,
+so a failed read is never reported as every key being released.
 
 Logical state is what the desktop receives: an ungrabbed source's keys, what
 a grabbed source holds downstream, and synthesis. A key the source held when its
@@ -361,7 +363,9 @@ It returns a replacement snapshot followed by state changes with sequence
 numbers. Resubscribe after a sequence gap and obtain a new snapshot after
 reconnecting. Modifier and toggle state is ungated; key bitmaps require Input
 Monitoring and are zeroed without it. A replacement snapshot at the same
-sequence can change bitmap visibility after authorization.
+sequence can change bitmap visibility after authorization. The initial
+subscription returns `KSI_STATUS_UNAVAILABLE` if sampling fails; later sampling
+failures retain the last successful snapshot and publish no update.
 
 Permission administration is typed. `ksi_permissions_list` calls a visitor for
 each record; returning false drains the response and returns `CANCELLED`.

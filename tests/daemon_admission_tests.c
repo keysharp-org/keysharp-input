@@ -12,6 +12,14 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "keysharp_permissions/permissions.h"
+#include "internal/linux_devices.h"
+
+static bool snapshot_failure;
+static size_t snapshot_samples;
+static bool sampled_device_key_state(uint32_t device_id, ksi_key_state_payload *result);
+void recorded_set_observer_callback(ksi_hook_event_callback callback,
+    ksi_device_change_callback device_callback, void *context);
+void recorded_set_raw_observer_callback(ksi_raw_device_callback callback, void *context);
 
 static int delayed_permission_check(const ksp_store *store, uid_t uid,
     const char *hash, uint32_t scopes, uint32_t *allowed, uint64_t *generation);
@@ -25,11 +33,21 @@ void recorded_apply_end_grab(uint64_t next, const uint8_t *held);
 #define ksi_linux_forward_apply_end_grab recorded_apply_end_grab
 #define ksi_linux_devices_set_observer_callback recorded_set_observer_callback
 #define ksi_linux_devices_set_raw_observer_callback recorded_set_raw_observer_callback
+#define ksi_linux_devices_get_device_key_state sampled_device_key_state
 #include "../src/daemon.c"
+#undef ksi_linux_devices_get_device_key_state
 #undef ksp_store_check_at_generation
 #undef ksi_linux_forward_apply_end_grab
 #undef ksi_linux_devices_set_observer_callback
 #undef ksi_linux_devices_set_raw_observer_callback
+
+static bool sampled_device_key_state(uint32_t device_id, ksi_key_state_payload *result)
+{
+    snapshot_samples++;
+    bool sampled = ksi_linux_devices_get_device_key_state(device_id, result);
+    if (snapshot_failure) { errno = EIO; return false; }
+    return sampled;
+}
 
 void ksi_linux_forward_apply_end_grab(uint64_t next, const uint8_t *held);
 static uint64_t applied_end_grab;
@@ -1434,6 +1452,90 @@ static bool read_service_event(int fd, uint16_t opcode, uint8_t *payload, size_t
     return true;
 }
 
+/* Both ACK routes use actual queue admission, including releases, while a
+ * failed physical sample leaves subscriber snapshots and sequence unchanged. */
+static bool test_synthesis_ack_survives_snapshot_failure(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    int sockets[2];
+    ksi_input shift = { .type = KSI_INPUT_KEYBOARD,
+        .data.keyboard = { .scan = KEY_LEFTSHIFT, .flags = KSI_KEY_SCANCODE } };
+
+    CHECK(state != NULL && output_queue_init(&state->output_queue, state) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    state->client_count = 1u;
+    ksi_client *client = &state->clients[0];
+    client->fd = sockets[0];
+    client->connection_id = 7u;
+    client->hook_send_ref = hook_send_ref_create(sockets[0]);
+    CHECK(client->hook_send_ref != NULL);
+    atomic_store(&state->active_input_generation, 1u);
+    output_queue_sync_owners(state);
+    state->keyboard_snapshot_valid = true;
+    state->keyboard_sequence = 17u;
+    state->keyboard_snapshot.modifiers_lr = 0x40u;
+    ksi_key_state_payload saved = state->keyboard_snapshot;
+    ksi_linux_synth_reset_enqueued_synth();
+    snapshot_failure = true;
+    for (unsigned int route = 0u; route < 2u; route++) {
+        for (unsigned int release = 0u; release < 2u; release++) {
+            shift.data.keyboard.flags = KSI_KEY_SCANCODE | (release != 0u ? KSI_KEY_UP : 0u);
+            CHECK(output_queue_push_synth(&state->output_queue, &shift, 1u, 0u, 1u, 7u));
+            ksi_message_header request = { .opcode = KSI_OPCODE_SYNTHESIZE_INPUT,
+                .request_id = 80u + route * 2u + release };
+            size_t before = snapshot_samples;
+            if (route == 0u) {
+                send_synthesize_result(state, client, &request);
+            } else {
+                ksi_synth_completion *completion = synth_completion_create(state, client->hook_send_ref, &request);
+                CHECK(completion != NULL);
+                completion->admitted = true;
+                synth_completion_send_result(completion, KSI_STATUS_OK, KSI_DETAIL_NONE);
+                synth_completion_destroy(completion);
+            }
+            uint8_t ack[KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE];
+            CHECK(read_status_response(sockets[1], KSI_OPCODE_SYNTHESIZE_INPUT, request.request_id,
+                sizeof(ack), KSI_STATUS_OK, KSI_DETAIL_NONE, ack));
+            CHECK(ksi_wire_read_u32(ack + 8u) == (release == 0u ? 0x10u : 0u));
+            CHECK(ksi_wire_read_u64(ack + 16u) == 17u && snapshot_samples == before + 1u);
+            CHECK(memcmp(&saved, &state->keyboard_snapshot, sizeof(saved)) == 0);
+        }
+    }
+    snapshot_failure = false;
+    hook_send_ref_invalidate(client->hook_send_ref);
+    hook_send_ref_release(client->hook_send_ref);
+    close(sockets[1]);
+    output_queue_close(&state->output_queue);
+    ksi_linux_synth_reset_enqueued_synth();
+    free(state);
+    return true;
+}
+
+static bool test_keyboard_sampling_requires_current_owner(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    CHECK(state != NULL);
+    state->input_owner_enforced = true;
+    atomic_store(&state->active_input_uid_valid, true);
+    atomic_store(&state->active_input_uid, getuid());
+    state->client_count = 3u;
+    state->clients[0] = (ksi_client){ .uid = getuid() + 1u, .keyboard_state_subscribed = true };
+    state->clients[1].uid = getuid();
+    state->clients[2] = state->clients[0];
+    ksi_linux_synth_reset_enqueued_synth();
+    size_t before = snapshot_samples;
+    publish_subscribed_keyboard_states(state);
+    CHECK(snapshot_samples == before && !state->keyboard_snapshot_valid);
+    state->clients[1].keyboard_state_subscribed = true;
+    publish_subscribed_keyboard_states(state);
+    CHECK(snapshot_samples == before + 1u && state->keyboard_snapshot_valid);
+    state->clients[2].uid = getuid();
+    publish_subscribed_keyboard_states(state);
+    CHECK(snapshot_samples == before + 2u);
+    free(state);
+    return true;
+}
+
 static bool test_lease_state_and_synthesis_order(void)
 {
     ksi_daemon_state *state = calloc(1u, sizeof(*state));
@@ -1481,6 +1583,21 @@ static bool test_lease_state_and_synthesis_order(void)
     ksi_linux_synth_reset_enqueued_synth();
     publish_subscribed_keyboard_states(state);
     CHECK(!state->keyboard_snapshot_valid && state->keyboard_sequence == 0u);
+    snapshot_failure = true;
+    CHECK(dispatch_request(state, owner, KSI_OPCODE_KEY_STATE_SUBSCRIBE, 70u, NULL, 0u));
+    CHECK(read_status_response(sockets[0][1], KSI_OPCODE_KEY_STATE_SUBSCRIBE, 70u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_UNAVAILABLE, 0u, NULL));
+    CHECK(!owner->keyboard_state_subscribed && !state->keyboard_snapshot_valid);
+    CHECK(dispatch_request(state, rpc, KSI_OPCODE_GET_KEY_STATE, 71u, NULL, 0u));
+    CHECK(read_status_response(sockets[2][1], KSI_OPCODE_GET_KEY_STATE, 71u,
+        KSI_STATUS_PAYLOAD_SIZE, KSI_STATUS_UNAVAILABLE, 0u, NULL));
+    uint8_t unavailable_ack[KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE];
+    ksi_message_header unavailable_request = { .opcode = KSI_OPCODE_SYNTHESIZE_INPUT, .request_id = 72u };
+    send_synthesize_result(state, rpc, &unavailable_request);
+    CHECK(read_status_response(sockets[2][1], KSI_OPCODE_SYNTHESIZE_INPUT, 72u,
+        sizeof(unavailable_ack), KSI_STATUS_OK, 0u, unavailable_ack));
+    CHECK(ksi_wire_read_u64(unavailable_ack + 16u) != 0u && !state->keyboard_snapshot_valid);
+    snapshot_failure = false;
     CHECK(dispatch_request(state, owner, KSI_OPCODE_KEY_STATE_SUBSCRIBE, 7u, NULL, 0u));
     CHECK(read_service_event(sockets[0][1], KSI_OPCODE_KEY_STATE_EVENT, event, sizeof(event)));
     CHECK(ksi_wire_read_u32(event) == 3u && ksi_wire_read_u64(event + 8u) == 1u);
@@ -1498,6 +1615,14 @@ static bool test_lease_state_and_synthesis_order(void)
     uint8_t ack[KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE];
     CHECK(read_status_response(sockets[2][1], KSI_OPCODE_SYNTHESIZE_INPUT, 8u, sizeof(ack), KSI_STATUS_OK, 0u, ack));
     CHECK(ksi_wire_read_u32(ack + 8u) == 0x10u && ksi_wire_read_u64(ack + 16u) == 2u);
+    ksi_key_state_payload saved_snapshot = state->keyboard_snapshot;
+    uint64_t saved_sequence = state->keyboard_sequence;
+    snapshot_failure = true;
+    CHECK(!publish_keyboard_states(state, NULL));
+    CHECK(state->keyboard_snapshot_valid && state->keyboard_sequence == saved_sequence);
+    CHECK(memcmp(&saved_snapshot, &state->keyboard_snapshot, sizeof(saved_snapshot)) == 0);
+    CHECK(poll(&(struct pollfd){ .fd = sockets[0][1], .events = POLLIN }, 1u, 0) == 0);
+    snapshot_failure = false;
     CHECK(dispatch_request(state, owner, KSI_OPCODE_KEY_STATE_SUBSCRIBE, 9u, NULL, 0u));
     CHECK(read_service_event(sockets[0][1], KSI_OPCODE_KEY_STATE_EVENT, event, sizeof(event)));
     CHECK(ksi_wire_read_u32(event) == 3u && ksi_wire_read_u64(event + 8u) == 2u);
@@ -1955,6 +2080,8 @@ int main(void)
         || !test_inventory_authorization_and_notifications()
         || !test_callback_notice_waits_for_lane_frame()
         || !test_paused_observers_report_one_overflow()
+        || !test_synthesis_ack_survives_snapshot_failure()
+        || !test_keyboard_sampling_requires_current_owner()
         || !test_lease_state_and_synthesis_order()
         || !test_daemon_admission_and_operation_gates()
         || !test_observer_admission_and_backpressure()

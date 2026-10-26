@@ -54,14 +54,19 @@ size_t ksi_linux_devices_list(uint32_t offset, ksi_device_info *entries,
     size_t capacity, uint32_t *next_offset);
 size_t ksi_linux_gamepads_list(uint32_t offset, ksi_device_info *entries,
     size_t capacity, uint32_t *next_offset);
+/* Gamepad samples use errno EIO for unavailable keys, ENODEV for absent
+ * gamepads and EINVAL for a NULL output. */
 bool ksi_linux_gamepad_state(uint32_t device_id, ksi_gamepad_state *state);
 void ksi_linux_devices_set_panic_callback(ksi_panic_callback callback, void *context);
 void ksi_linux_devices_get_indicator_state(bool *caps_lock, bool *num_lock, bool *scroll_lock);
-void ksi_linux_devices_refresh_indicator_state(void);
+bool ksi_linux_devices_refresh_indicator_state(void);
 bool ksi_linux_devices_get_pointer_position(ksi_pointer_position_payload *position);
 bool ksi_linux_devices_get_pointer_buttons(ksi_pointer_buttons_payload *result);
-/* Device queries fill logical_keys and physical_keys for that source only; the
- * modifier mask and lock state always describe the seat. */
+/* An empty seat is a successful key/modifier snapshot. Device queries fill
+ * logical_keys and physical_keys for that source only; the modifier mask
+ * and lock state always describe the seat. EIO reports an incomplete sample;
+ * modifiers_lr still includes admitted output for synthesis ACKs. ENODEV means
+ * an absent source and EINVAL a NULL output. */
 bool ksi_linux_devices_get_device_key_state(uint32_t device_id, ksi_key_state_payload *result);
 bool ksi_linux_devices_get_modifier_state(ksi_modifier_state_payload *result);
 bool ksi_linux_devices_get_idle_time(ksi_idle_time_payload *result);

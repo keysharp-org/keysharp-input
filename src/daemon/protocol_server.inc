@@ -218,7 +218,10 @@ static void handle_get_indicator_state(
         return;
     }
 
-    ksi_linux_devices_refresh_indicator_state();
+    if (!ksi_linux_devices_refresh_indicator_state()) {
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE);
+        return;
+    }
     send_indicator_state_result(client->fd, message->header);
 }
 
@@ -637,7 +640,8 @@ static void handle_get_gamepad_state(ksi_daemon_state *state, ksi_client *client
     }
     ksi_gamepad_state gamepad;
     if (!ksi_linux_gamepad_state(ksi_wire_read_u32(message->payload), &gamepad)) {
-        send_status(client->fd, message->header, KSI_STATUS_NOT_FOUND, KSI_DETAIL_NONE);
+        send_status(client->fd, message->header,
+            errno == ENODEV ? KSI_STATUS_NOT_FOUND : KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE);
         return;
     }
     uint8_t response[KSI_GAMEPAD_STATE_MAX_PAYLOAD_SIZE];
@@ -1078,13 +1082,17 @@ static void send_keyboard_state(ksi_client *client, const ksi_key_state_payload 
             0u, payload, sizeof(payload)) != 1) hook_send_ref_invalidate(client->hook_send_ref);
 }
 
-static void publish_keyboard_states(ksi_daemon_state *state)
+static bool publish_keyboard_states(ksi_daemon_state *state, uint32_t *logical_modifiers)
 {
     ksi_key_state_payload keys;
-    (void)ksi_linux_devices_get_device_key_state(0u, &keys);
+    /* Accepted synthesis still needs admitted modifier state and a valid sequence
+     * when physical sampling fails, without publishing an incomplete snapshot. */
+    if (state->keyboard_sequence == 0u) state->keyboard_sequence = 1u;
+    bool sampled = ksi_linux_devices_get_device_key_state(0u, &keys);
+    if (logical_modifiers != NULL) *logical_modifiers = keys.modifiers_lr;
+    if (!sampled) return false;
     bool changed = state->keyboard_snapshot_valid
         && memcmp(&keys, &state->keyboard_snapshot, sizeof(keys)) != 0;
-    if (state->keyboard_sequence == 0u) state->keyboard_sequence = 1u;
     if (changed) state->keyboard_sequence++;
     state->keyboard_snapshot = keys;
     state->keyboard_snapshot_valid = true;
@@ -1099,13 +1107,15 @@ static void publish_keyboard_states(ksi_daemon_state *state)
         bool replacement = !changed && memcmp(&visible, &client->keyboard_snapshot, sizeof(visible)) != 0;
         if (changed || replacement) send_keyboard_state(client, &keys, replacement, state->keyboard_sequence);
     }
+    return true;
 }
 
 static void publish_subscribed_keyboard_states(ksi_daemon_state *state)
 {
     for (nfds_t i = 0u; i < state->client_count; i++) {
-        if (!state->clients[i].keyboard_state_subscribed) continue;
-        publish_keyboard_states(state);
+        if (!state->clients[i].keyboard_state_subscribed
+            || !input_owner_matches_uid(state, state->clients[i].uid)) continue;
+        publish_keyboard_states(state, NULL);
         return;
     }
 }
@@ -1119,7 +1129,9 @@ static void handle_keyboard_state_subscribe(ksi_daemon_state *state, ksi_client 
     if (!input_owner_matches_uid(state, client->uid)) {
         send_status(client->fd, message->header, KSI_STATUS_DENIED, KSI_DETAIL_NONE); return;
     }
-    publish_keyboard_states(state);
+    if (!publish_keyboard_states(state, NULL)) {
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE); return;
+    }
     client->keyboard_state_subscribed = true;
     send_keyboard_state(client, &state->keyboard_snapshot, true, state->keyboard_sequence);
     send_status(client->fd, message->header, KSI_STATUS_OK, KSI_DETAIL_NONE);
@@ -1129,9 +1141,10 @@ static void send_synthesize_result(ksi_daemon_state *state, ksi_client *client,
     const ksi_message_header *request)
 {
     uint8_t response[KSI_SYNTHESIZE_RESULT_PAYLOAD_SIZE] = { 0 };
-    publish_keyboard_states(state);
+    uint32_t logical_modifiers;
+    publish_keyboard_states(state, &logical_modifiers);
     ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
-    ksi_wire_write_u32(response + 8u, state->keyboard_snapshot.modifiers_lr);
+    ksi_wire_write_u32(response + 8u, logical_modifiers);
     ksi_wire_write_u64(response + 16u, state->keyboard_sequence);
     (void)ipc_send_locked(client->fd, request->opcode, KSI_FRAME_FLAG_RESPONSE,
         request->request_id, response, sizeof(response));
@@ -1388,8 +1401,9 @@ static void handle_get_key_state(
 
     uint32_t device_id = message->payload_size == KSI_KEY_STATE_REQUEST_SIZE
         ? ksi_wire_read_u32(message->payload) : 0u;
-    if (!ksi_linux_devices_get_device_key_state(device_id, &result) && device_id != 0u) {
-        send_status(client->fd, message->header, KSI_STATUS_NOT_FOUND, KSI_DETAIL_NONE);
+    if (!ksi_linux_devices_get_device_key_state(device_id, &result)) {
+        send_status(client->fd, message->header,
+            errno == ENODEV ? KSI_STATUS_NOT_FOUND : KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE);
         return;
     }
 
@@ -1421,7 +1435,10 @@ static void handle_get_modifier_state(
     }
 
     memset(&result, 0, sizeof(result));
-    (void)ksi_linux_devices_get_modifier_state(&result);
+    if (!ksi_linux_devices_get_modifier_state(&result)) {
+        send_status(client->fd, message->header, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE);
+        return;
+    }
     ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
     (void)ksi_protocol_encode_modifier_state(
         response + KSI_STATUS_PAYLOAD_SIZE, &result);
@@ -1452,7 +1469,11 @@ static void send_pointer_buttons_result(int client_fd, const ksi_message_header 
     uint8_t response[KSI_STATUS_PAYLOAD_SIZE + KSI_POINTER_BUTTONS_PAYLOAD_SIZE];
 
     memset(&result, 0, sizeof(result));
-    (void)ksi_linux_devices_get_pointer_buttons(&result);
+    errno = 0;
+    if (!ksi_linux_devices_get_pointer_buttons(&result) && errno == EIO) {
+        send_status(client_fd, request, KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE);
+        return;
+    }
 
     ksi_status_encode(response, KSI_STATUS_OK, KSI_DETAIL_NONE);
     (void)ksi_protocol_encode_pointer_buttons(
