@@ -19,7 +19,6 @@
 /* Downstream readers get this long to consume releases before removal can
  * discard them. */
 #define KSI_FORWARD_DRAIN_MS 100u
-#define KSI_SWITCH_BITMAP_BYTES ((SW_MAX + 8u) / 8u)
 
 _Static_assert(KSI_MAX_FORWARDING_DEVICES < 256u, "targets encode the slot in their low byte");
 
@@ -38,7 +37,6 @@ typedef struct forwarding_device {
     bool closing;
     bool keyboard;
     struct libevdev_uinput *output;
-    int state_fd;
     bool failed;
     bool retiring;
     uint64_t retire_ms;
@@ -291,11 +289,12 @@ static bool has_codes(const struct libevdev *source, unsigned int type, unsigned
     return false;
 }
 
-uint64_t ksi_linux_forward_open(int state_fd, bool keyboard)
+uint64_t ksi_linux_forward_open(int metadata_fd, bool keyboard)
 {
     struct libevdev *source = NULL;
     struct libevdev_uinput *output = NULL;
-    forwarding_device created = { .open = true, .keyboard = keyboard, .state_fd = state_fd };
+    forwarding_device created = { .open = true, .keyboard = keyboard };
+    uint8_t switch_state[KSI_SWITCH_BITMAP_BYTES] = {0};
     char phys[512];
     uint64_t target = 0u;
     int result = 0;
@@ -305,7 +304,7 @@ uint64_t ksi_linux_forward_open(int state_fd, bool keyboard)
     size_t slot = 0u;
     while (slot < KSI_MAX_FORWARDING_DEVICES && devices[slot].open) slot++;
     pthread_mutex_unlock(&devices_mutex);
-    if (slot == KSI_MAX_FORWARDING_DEVICES || libevdev_new_from_fd(state_fd, &source) < 0) return 0u;
+    if (slot == KSI_MAX_FORWARDING_DEVICES || libevdev_new_from_fd(metadata_fd, &source) < 0) return 0u;
 
     const char *original = libevdev_get_phys(source);
     (void)snprintf(phys, sizeof(phys), "%s%s", KSI_FORWARD_PHYS_PREFIX,
@@ -325,8 +324,10 @@ uint64_t ksi_linux_forward_open(int state_fd, bool keyboard)
             (void)libevdev_disable_event_code(source, EV_KEY, code);
     created.wheel = libevdev_has_event_code(source, EV_REL, REL_WHEEL) != 0;
     created.horizontal_wheel = libevdev_has_event_code(source, EV_REL, REL_HWHEEL) != 0;
-    for (uint16_t code = 0u; code <= SW_MAX; code++)
+    for (uint16_t code = 0u; code <= SW_MAX; code++) {
         ksi_set_key_bit(created.switches, code, libevdev_has_event_code(source, EV_SW, code) != 0);
+        ksi_set_key_bit(switch_state, code, libevdev_get_event_value(source, EV_SW, code) > 0);
+    }
 
     if (has_codes(source, EV_KEY, KEY_MAX) || has_codes(source, EV_REL, REL_MAX)
         || has_codes(source, EV_ABS, ABS_MAX) || has_codes(source, EV_SW, SW_MAX)) {
@@ -345,7 +346,7 @@ uint64_t ksi_linux_forward_open(int state_fd, bool keyboard)
     if (slot_limit <= slot) slot_limit = slot + 1u;
     pthread_mutex_unlock(&devices_mutex);
     /* uinput cannot preset switch state. */
-    ksi_linux_forward_sync_switches(target);
+    ksi_linux_forward_sync_switches(target, switch_state);
     return target;
 }
 
@@ -449,16 +450,14 @@ uint64_t ksi_linux_forward_target_for_path(const char *path)
     return target;
 }
 
-void ksi_linux_forward_sync_switches(uint64_t target)
+void ksi_linux_forward_sync_switches(uint64_t target, const uint8_t *state)
 {
-    uint8_t state[KSI_SWITCH_BITMAP_BYTES] = {0};
     struct input_event events[SW_CNT + 1u];
     size_t count = 0u;
 
     pthread_mutex_lock(&devices_mutex);
     forwarding_device *device = find_device_locked(target, KSI_FORWARD_ENQUEUED);
-    if (device != NULL && device->output != NULL
-        && ioctl(device->state_fd, EVIOCGSW(sizeof(state)), state) >= 0) {
+    if (device != NULL && device->output != NULL && state != NULL) {
         for (uint16_t code = 0u; code <= SW_MAX; code++)
             if (ksi_key_bit(device->switches, code))
                 events[count++] = (struct input_event){ .type = EV_SW, .code = code,

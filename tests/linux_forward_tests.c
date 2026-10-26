@@ -19,7 +19,6 @@ static size_t output_count;
 static size_t destroyed;
 static char issued_phys[128];
 static bool metadata_ok = true;
-static uint8_t source_switches;
 static int last_source;
 bool g_verbose = false;
 
@@ -90,11 +89,6 @@ static int fake_ioctl(int fd, unsigned long request, ...)
     (void)fd;
     if (request == UI_SET_PHYS) {
         snprintf(issued_phys, sizeof(issued_phys), "%s", (const char *)argument);
-        return 0;
-    }
-    if (request == EVIOCGSW((SW_MAX + 8u) / 8u)) {
-        memset(argument, 0, (SW_MAX + 8u) / 8u);
-        *(uint8_t *)argument = source_switches;
         return 0;
     }
     errno = EINVAL;
@@ -920,14 +914,14 @@ static bool test_release_all_includes_sources(void)
 static bool test_switch_state(void)
 {
     size_t output = output_count;
+    const uint8_t open_lid[KSI_SWITCH_BITMAP_BYTES] = {0};
 
-    source_switches = 1u << SW_TABLET_MODE;
+    /* The clone starts from the switch state its source's description carries. */
     uint64_t hotkeys = ksi_linux_forward_open(SWITCHES, true);
     CHECK(hotkeys != 0u && metadata_ok);
     CHECK(read_events(outputs[output].fds[0]) == 2u && events[0].type == EV_SW
         && events[0].code == SW_TABLET_MODE && events[0].value == 1);
-    source_switches = 0u;
-    ksi_linux_forward_sync_switches(hotkeys);
+    ksi_linux_forward_sync_switches(hotkeys, open_lid);
     CHECK(read_events(outputs[output].fds[0]) == 2u && events[0].code == SW_TABLET_MODE
         && events[0].value == 0);
     close_source(hotkeys);

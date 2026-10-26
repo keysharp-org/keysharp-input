@@ -64,9 +64,10 @@ typedef enum ksi_forward_view {
 
 /* The reader opens and closes sources and holds each one's ENQUEUED target. A
  * keyboard's keyboard keys go to the shared sink; whatever else a source reports
- * goes to its own clone, created only when there is some. state_fd is only ever
- * queried, never read: state ioctls flush queued events from the descriptor. */
-uint64_t ksi_linux_forward_open(int state_fd, bool keyboard);
+ * goes to its own clone, created only when there is some. metadata_fd describes
+ * the source and is not kept: libevdev's setup reads state, which flushes queued
+ * events, so it must not be the descriptor the reader consumes. */
+uint64_t ksi_linux_forward_open(int metadata_fd, bool keyboard);
 bool ksi_linux_forward_has_clone(uint64_t target);
 /* Closing is queue-ordered like ending a grab: close forgets the source for
  * admitted output, and apply_close releases and retires its outputs where the
@@ -82,7 +83,10 @@ void ksi_linux_forward_apply_end_grab(uint64_t next, const uint8_t *held);
 bool ksi_linux_forward_failed(uint64_t target, ksi_forward_view view);
 bool ksi_linux_forward_take_failure(void);
 uint64_t ksi_linux_forward_target_for_path(const char *path);
-void ksi_linux_forward_sync_switches(uint64_t target);
+#define KSI_SWITCH_BITMAP_BYTES ((SW_MAX + 8u) / 8u)
+/* Sets the clone's switches to state, a SW_* bitmap. uinput cannot preset
+ * switch state, and logind reads switches from clones too. */
+void ksi_linux_forward_sync_switches(uint64_t target, const uint8_t *state);
 
 /* Output sequencer: returns -1 on a write failure and 0 otherwise, including
  * for a packet whose grab has ended. */
