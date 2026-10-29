@@ -709,8 +709,10 @@ static bool test_gamepad_selection(void)
     CHECK(!ksi_linux_gamepad_state(3u, &state));
     CHECK(!ksi_linux_gamepad_state(99u, &state));
     tracked_devices[1].snapshot_fd = -1;
-    CHECK(!ksi_linux_gamepad_state(4u, &state) && errno == EIO);
     snprintf(tracked_devices[1].path, sizeof(tracked_devices[1].path), "/fake-slot/1");
+    snapshot_open_failure = true;
+    CHECK(!ksi_linux_gamepad_state(4u, &state) && errno == EIO);
+    snapshot_open_failure = false;
     memset(held_keys[1], 0, sizeof(held_keys[1]));
     CHECK(ksi_linux_gamepad_state(4u, &state));
     CHECK(state.device_id == 4u && state.button_count == 2u && state.axis_count == 0u);
