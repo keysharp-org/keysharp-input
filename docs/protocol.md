@@ -30,6 +30,10 @@ and has no result body. Status values are OK=0, DENIED=1, UNSUPPORTED=2,
 INVALID_REQUEST=3, UNAVAILABLE=4, BUSY=5, NOT_FOUND=6,
 RESOURCE_EXHAUSTED=7, TIMEOUT=8, CANCELLED=9, REVOKED=10, INTERNAL=255.
 
+An interactive HELLO or AUTHORIZE that cannot find a polkit authentication agent
+returns UNAVAILABLE with detail `0x00010000` and an agent setup diagnostic.
+A failed AUTHORIZE leaves the connection usable for a later retry.
+
 HELLO must be the first request and may appear exactly once.
 
 ## Common operations

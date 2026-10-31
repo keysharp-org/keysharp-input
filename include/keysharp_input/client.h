@@ -119,7 +119,9 @@ KSI_API int ksi_connection_fd(const ksi_connection *connection);
 /* Last successful synthesis acknowledgement in the lease keyboard sequence. */
 KSI_API uint64_t ksi_connection_sequence(const ksi_connection *connection);
 /* Authorization changes belong to the lease alone. Its reply follows the grant
- * event and replacement keyboard snapshot, when subscribed. */
+ * event and replacement keyboard snapshot, when subscribed. An interactive request
+ * without an available polkit agent returns UNAVAILABLE with error detail
+ * KSI_ERROR_DETAIL_NO_AUTHENTICATION_AGENT and a setup diagnostic. */
 KSI_API ksi_status ksi_authorize(
     ksi_connection *connection,
     ksi_authorization_mode authorization_mode,

@@ -53,6 +53,14 @@ if(cmake_source MATCHES "keysharp-input-protocol-[0-9]")
     message(FATAL_ERROR "CMake packaging exposes the private service protocol")
 endif()
 
+file(READ "${SOURCE_DIR}/packaging/debian/control" debian_control)
+string(FIND "${debian_control}" "Recommends: mate-polkit | polkit-1-auth-agent" agent_recommendation)
+string(FIND "${cmake_source}"
+    "CPACK_DEBIAN_PACKAGE_RECOMMENDS \"mate-polkit | polkit-1-auth-agent\"" cpack_agent_recommendation)
+if(agent_recommendation EQUAL -1 OR cpack_agent_recommendation EQUAL -1)
+    message(FATAL_ERROR "both Debian build paths must recommend a compatible authentication agent")
+endif()
+
 file(READ "${SOURCE_DIR}/packaging/install-release.sh" installer)
 foreach(required
     "expected_version=${project_version}"

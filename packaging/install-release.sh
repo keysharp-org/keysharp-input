@@ -5,7 +5,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=1.1.1
+expected_version=1.1.2
 expected_client_abi_major=1
 expected_client_abi_minor=1
 
@@ -400,7 +400,7 @@ for required in \
     systemd/keysharp-input.socket \
     tmpfiles/keysharp-input-permissions.conf \
     polkit/org.keysharp.input.policy \
-    configure-library-path.sh uninstall.sh LICENSE README.md; do
+    check-runtime.sh configure-library-path.sh uninstall.sh LICENSE README.md; do
     if [ ! -s "$archive_dir/$required" ]; then
         echo "Portable archive is incomplete: $required is missing." >&2
         exit 1
@@ -496,3 +496,4 @@ systemctl daemon-reload
 # The binary owns the /etc udev rule and preserves local edits.
 /usr/local/bin/keysharp-input daemon --install-input-access
 echo "Installed keysharp-input $expected_version."
+echo "Graphical permission prompts need a polkit authentication agent running in your user session; configure its autostart if needed. See $archive_dir/docs/install.md."

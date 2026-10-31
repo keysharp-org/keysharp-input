@@ -438,6 +438,76 @@ static bool test_observer_admission_and_backpressure(void)
     return true;
 }
 
+static bool test_missing_authentication_agent(void)
+{
+    static const char diagnostic[] =
+        "No polkit authentication agent is available for this session. "
+        "Install and start your desktop authentication agent, then retry.";
+    const uint16_t opcodes[] = { KSI_OPCODE_HELLO, KSI_OPCODE_AUTHORIZE };
+    const struct {
+        ksp_polkit_result decision;
+        bool stale_permission;
+        bool stale_input;
+        bool wrong_owner;
+    } cases[] = {
+        { KSP_POLKIT_NO_AGENT, false, false, false },
+        { KSP_POLKIT_NO_AGENT, true, false, false },
+        { KSP_POLKIT_NO_AGENT, false, true, false },
+        { KSP_POLKIT_NO_AGENT, false, false, true },
+        { KSP_POLKIT_DENIED, false, false, false },
+        { KSP_POLKIT_CANCELLED, false, false, false },
+        { KSP_POLKIT_IDENTITY_CHANGED, false, false, false },
+        { KSP_POLKIT_UNAVAILABLE, false, false, false },
+    };
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    int sockets[2];
+    CHECK(state != NULL && socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    state->client_count = 1u;
+    state->input_owner_enforced = true;
+    atomic_store(&state->active_input_uid_valid, true);
+    atomic_store(&state->active_input_uid, (unsigned int)getuid());
+    ksi_client *client = &state->clients[0];
+    client->fd = sockets[0];
+    client->connection_id = 1u;
+    client->hook_send_ref = hook_send_ref_create(sockets[0]);
+    CHECK(client->hook_send_ref != NULL);
+    for (size_t opcode = 0u; opcode < sizeof(opcodes) / sizeof(opcodes[0]); opcode++) {
+        for (size_t index = 0u; index < sizeof(cases) / sizeof(cases[0]); index++) {
+            client->uid = cases[index].wrong_owner ? (uid_t)-1 : getuid();
+            client->pending_authorization = true;
+            client->pending_authorization_opcode = opcodes[opcode];
+            client->pending_request_id = index + 1u;
+            ksi_daemon_command completion = {
+                .client_fd = client->fd, .connection_id = client->connection_id,
+                .data.prompt_done = {
+                    .decision = cases[index].decision,
+                    .permission_generation = cases[index].stale_permission ? 1u : 0u,
+                    .input_generation = cases[index].stale_input ? 1u : 0u,
+                },
+            };
+            process_client_prompt_done(state, &completion);
+            bool missing_agent = index == 0u;
+            uint8_t payload[KSI_STATUS_PAYLOAD_SIZE + 4u + sizeof(diagnostic) - 1u];
+            CHECK(read_status_response(sockets[1], opcodes[opcode], index + 1u,
+                missing_agent ? sizeof(payload) : KSI_STATUS_PAYLOAD_SIZE,
+                missing_agent ? KSI_STATUS_UNAVAILABLE : KSI_STATUS_DENIED,
+                missing_agent ? KSI_ERROR_DETAIL_NO_AUTHENTICATION_AGENT : KSI_DETAIL_NONE,
+                payload));
+            if (missing_agent) {
+                CHECK(ksi_wire_read_u32(payload + KSI_STATUS_PAYLOAD_SIZE) == sizeof(diagnostic) - 1u);
+                CHECK(memcmp(payload + KSI_STATUS_PAYLOAD_SIZE + 4u,
+                    diagnostic, sizeof(diagnostic) - 1u) == 0);
+            }
+            CHECK(!client->pending_authorization && client->state == KSI_CLIENT_STATE_READY);
+        }
+    }
+    hook_send_ref_invalidate(client->hook_send_ref);
+    hook_send_ref_release(client->hook_send_ref);
+    close(sockets[1]);
+    free(state);
+    return true;
+}
+
 static bool test_nonblocking_observer_transport(void)
 {
     int sockets[2];
@@ -2085,6 +2155,7 @@ int main(void)
         || !test_lease_state_and_synthesis_order()
         || !test_daemon_admission_and_operation_gates()
         || !test_observer_admission_and_backpressure()
+        || !test_missing_authentication_agent()
         || !test_nonblocking_observer_transport()
         || !test_permission_fence_preserves_key_release()
         || !test_permission_io_does_not_block_input_admission()

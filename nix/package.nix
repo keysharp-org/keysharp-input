@@ -10,7 +10,7 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "keysharp-input";
-  version = "1.1.1";
+  version = "1.1.2";
 
   src = lib.cleanSource ../.;
 

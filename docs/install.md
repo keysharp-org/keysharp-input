@@ -46,6 +46,22 @@ applications on distributions that do not search `/usr/local/lib` by default.
 An edited file at that path is preserved; remove it and rerun the installer to
 restore the generated configuration.
 
+## Authentication prompts
+
+Graphical permission prompts need a polkit authentication agent running in the
+requesting user's session; installing polkit alone does not provide a dialog.
+Debian and PPA packages recommend `mate-polkit | polkit-1-auth-agent`, allowing
+an existing desktop provider to satisfy the recommendation.
+
+For source/archive installs or packages installed with `--no-install-recommends`,
+use your desktop's agent or install one through your distribution's package manager.
+Configure it to start as your normal user with the graphical session. If your
+desktop manages autostart, log out and back in after installation. Source and
+archive installers only print a reminder; agent selection and startup belong to
+the session. Existing grants can be used without an agent. If a new request needs
+authentication and no agent is available, the service returns an error explaining
+that an agent must be installed and started before retrying.
+
 ## Check and repair
 
 ```sh
@@ -55,8 +71,10 @@ keysharp-input probe
 ```
 
 `info` reports the local library version and ABI without connecting to the service.
-Run `probe` as your graphical user to check the service connection. The installer
-keeps the resident service enabled and active so it can register input devices
+Run `probe` as your graphical user to check the service connection. It requests no
+grants, so it does not test authentication prompts. If a grant request fails without
+a dialog, check the [authentication agent](#authentication-prompts) in that session.
+The installer keeps the resident service enabled and active so it can register input devices
 before a client connects. To repair disabled units:
 
 ```sh

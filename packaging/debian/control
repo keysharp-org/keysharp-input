@@ -19,6 +19,7 @@ Depends: ${misc:Depends},
          udev,
          kmod,
          systemd
+Recommends: mate-polkit | polkit-1-auth-agent
 Provides: ${client-abi:Provides}
 Description: Privileged Linux input broker
  A Linux service and C library for global keyboard and mouse hooks, input

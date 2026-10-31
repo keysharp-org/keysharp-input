@@ -488,8 +488,24 @@ static void process_client_prompt_done(ksi_daemon_state *state, ksi_daemon_comma
         || command->data.prompt_done.input_generation != current_input_generation(state)
         || command->data.prompt_done.permission_generation != atomic_load(&state->permission_generation)
         || client->pending_permission_generation != atomic_load(&state->permission_generation)
-        || state->permission_monitor_failed || state->permission_refresh_inflight
-        || command->data.prompt_done.decision != KSP_POLKIT_GRANTED) {
+        || state->permission_monitor_failed || state->permission_refresh_inflight) {
+        send_pending_authorization_status(client, KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
+        return;
+    }
+    if (command->data.prompt_done.decision == KSP_POLKIT_NO_AGENT) {
+        static const char diagnostic[] =
+            "No polkit authentication agent is available for this session. "
+            "Install and start your desktop authentication agent, then retry.";
+        uint8_t payload[KSI_STATUS_PAYLOAD_SIZE + 4u + sizeof(diagnostic) - 1u];
+        ksi_protocol_encode_status(payload, KSI_STATUS_UNAVAILABLE,
+            KSI_DETAIL_NO_AUTHENTICATION_AGENT);
+        ksi_wire_write_u32(payload + KSI_STATUS_PAYLOAD_SIZE, sizeof(diagnostic) - 1u);
+        memcpy(payload + KSI_STATUS_PAYLOAD_SIZE + 4u, diagnostic, sizeof(diagnostic) - 1u);
+        (void)ipc_send_locked(client->fd, client->pending_authorization_opcode,
+            KSI_FRAME_FLAG_RESPONSE, client->pending_request_id, payload, sizeof(payload));
+        return;
+    }
+    if (command->data.prompt_done.decision != KSP_POLKIT_GRANTED) {
         send_pending_authorization_status(client, KSI_STATUS_DENIED, KSI_DETAIL_NONE, 0u);
         return;
     }

@@ -387,6 +387,15 @@ Every fallible function returns `ksi_status`: `OK`, `DENIED`, `UNSUPPORTED`,
 Initialize an optional `ksi_error` for a stable detail code, system error, and
 short diagnostic. Do not parse the message for program logic.
 
+An interactive authorization request returns `KSI_STATUS_UNAVAILABLE` with an
+`error.detail` of `KSI_ERROR_DETAIL_NO_AUTHENTICATION_AGENT` (`0x00010000`) when
+polkit reports that no authentication agent is available for the session. Display
+`error.message` so the user can install or start an agent and retry. An existing
+lease connection remains usable; this detail distinguishes agent setup from a
+transport failure. A failed `ksi_connect` must be retried to obtain a connection.
+This additive diagnostic uses the existing error structure and status values.
+Policy denial and dismissed requests return `KSI_STATUS_DENIED`.
+
 Treat a missing service, authorization denial, revocation, and a closed callback
 stream as normal runtime conditions. Applications should keep non-privileged
 features usable when the broker is unavailable.

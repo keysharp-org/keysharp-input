@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keysharp-input
-    VERSION 1.1.1
+    VERSION 1.1.2
     DESCRIPTION "Standalone privileged Linux input broker"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-input"
     LANGUAGES C)
@@ -286,6 +286,7 @@ if(KEYSHARP_INPUT_SETUP_ON_INSTALL)
             if(NOT _service_setup_result EQUAL 0)
                 message(WARNING \"keysharp-input service setup was not completed; run as root: \${_bin} daemon --install-input-access\")
             endif()
+            message(STATUS \"Graphical permission prompts need a polkit authentication agent running in your user session; configure its autostart if needed. See ${CMAKE_CURRENT_SOURCE_DIR}/docs/install.md.\")
         endif()
     ")
 endif()
@@ -577,6 +578,7 @@ set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "polkitd, udev, kmod, systemd")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "mate-polkit | polkit-1-auth-agent")
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_input/client.h"
     KEYSHARP_INPUT_ABI_MINOR_LINE REGEX "^#define KSI_CLIENT_ABI_MINOR ")
 string(REGEX MATCH "[0-9]+" KEYSHARP_INPUT_ABI_MINOR "${KEYSHARP_INPUT_ABI_MINOR_LINE}")

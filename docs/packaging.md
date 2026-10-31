@@ -26,6 +26,10 @@ derived from the public header, independent of the product release. Consumers ca
 require an additive API with a versioned dependency. Applications depend on
 the client ABI; the daemon protocol is private to the matching client library.
 
+Both Debian package build paths recommend `mate-polkit | polkit-1-auth-agent`.
+The virtual alternative allows an existing desktop provider to satisfy it.
+Agent startup belongs to the user session; see [authentication prompts](install.md#authentication-prompts).
+
 After a staged package install, run:
 
 ```bash
@@ -129,3 +133,5 @@ keysharp-input.nixosModules.default
 The module loads uinput, enables polkit, installs the device rule, and starts
 `keysharp-input.service` with its socket. It selects the flake's package for the host
 architecture; override `services.keysharp-input.package` to use a custom build.
+The module leaves authentication-agent selection and autostart to the graphical
+session; enabling polkit alone does not start an agent.

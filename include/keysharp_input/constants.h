@@ -9,6 +9,9 @@
 #define KSI_MAX_HOOK_REPLACEMENTS 1024u
 #define KSI_MOUSE_COORD_UNSPECIFIED INT32_MIN
 
+/* Authorization can be retried on the existing connection after an agent starts. */
+#define KSI_ERROR_DETAIL_NO_AUTHENTICATION_AGENT 0x00010000u
+
 typedef uint32_t ksi_status;
 enum {
     KSI_STATUS_OK = 0u,

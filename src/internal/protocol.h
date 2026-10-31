@@ -250,6 +250,7 @@ typedef enum ksi_status_detail {
     KSI_DETAIL_STALE_CALLBACK = 8u,
     KSI_DETAIL_RECURSION_LIMIT = 9u,
     KSI_DETAIL_EXPANDED_INPUT_LIMIT = 10u,
+    KSI_DETAIL_NO_AUTHENTICATION_AGENT = KSI_ERROR_DETAIL_NO_AUTHENTICATION_AGENT,
 } ksi_status_detail;
 
 typedef struct ksi_client_hello_payload {
