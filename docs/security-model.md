@@ -78,7 +78,8 @@ Input Control; its returned operation mask reports what the backend implements,
 not what is ready right now. These masks are intentionally separate.
 
 - Input Monitoring permits global hooks and arbitrary key/button state.
-- Input Control permits synthesis, input blocking, and hook suppression.
+- Input Control permits synthesis, input blocking, hook suppression, and
+  same-user local virtual-console byte input.
 - A hook that can observe and suppress needs both.
 - Modifier, lock, pointer-position, and idle-time queries need neither.
 - Gamepad discovery and state need neither: a gamepad reports no text and
@@ -91,6 +92,26 @@ per-application prompt lock and runs `pkcheck` for
 and requested scopes come from authenticated service state. The identity is
 revalidated after polkit succeeds and before a generation-fenced grant is
 written.
+
+Targeted terminal input runs on a separate bounded FIFO worker, with at most
+1024 bytes per request and a five-second deadline. The service constructs only
+`/dev/tty1` through `/dev/tty63`, opens once with `O_NOCTTY`, `O_NOFOLLOW` and
+`O_NONBLOCK`, and verifies a character device with major 4 and the exact requested
+minor. Before each byte it checks that the same logind session is a same-user,
+local, nonclosing text session on seat0, that the caller still owns the active
+seat, that the descriptor is still owned by that uid, and that the console and
+line discipline accept text. Connection, seat and permission fences are checked
+under the output execution lock after target validation, immediately before `TIOCSTI`. A failure ends the
+batch without reopening the device or replaying bytes. These userspace checks
+cannot atomically lock logind and terminal ownership against logout; a byte already
+in the kernel may complete during a transition.
+
+The root service's device policy allows the tty character-device class, while
+the operation accepts only the exact numbered console devices above. Existing
+root capabilities supply `CAP_SYS_ADMIN` for `TIOCSTI`; the service does not
+enable unprivileged legacy TTY injection or change the target's settings. Submitted
+text can execute shell commands through its normal terminal semantics and is
+covered by the existing Input Control grant.
 
 Grants are root-owned records in `/var/lib/keysharp-permissions/v1`. The
 canonical shared implementation is vendored from `keysharp-permissions`; this

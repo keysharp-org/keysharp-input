@@ -12,11 +12,14 @@ find_package(KeysharpInput 1.1 CONFIG REQUIRED)
 target_link_libraries(my-client PRIVATE KeysharpInput::client)
 ```
 
-The public ABI is 1.1 and the library SONAME is `libkeysharp-input.so.1`.
+The public ABI is 1.2 and the library SONAME is `libkeysharp-input.so.1`.
 `ksi_client_abi_major()` and `ksi_client_abi_minor()` provide runtime
 introspection. The socket protocol is private to the matching client library.
 ABI 1.1 adds optional device-only authorization and notification functions;
 clients using them need those exports, while ABI 1.0 clients keep working.
+ABI 1.2 adds optional targeted terminal input, shipped from release 1.2.0. Resolve its
+exports or `find_package(KeysharpInput 1.2)`, then check `KSI_OPERATION_TERMINAL_INPUT`
+on the connection; older services and libraries remain usable for their existing operations.
 
 ## Connections
 
@@ -172,6 +175,52 @@ rather than a replayed event stream, so a consumer that starts mid-press still
 sees the button held.
 
 See [the complete gamepad example](../examples/read-gamepad.c).
+
+## Targeted terminal input
+
+`ksi_terminal_input` submits a bounded byte sequence to a local Linux virtual
+console, including one that is inactive. Initialize `ksi_terminal_input_options`
+and `ksi_terminal_input_result`; set `target_kind` to
+`KSI_TERMINAL_TARGET_LINUX_VT` and `target_id` to 1 through 63. There is no path
+argument: `/dev/tty0`, `/dev/console`, pseudoterminals and arbitrary devices are
+outside this operation. Use an RPC or authorization-lease connection with
+Input Control. The caller must be the active user on seat0, and the target must
+be a logged-in, nonclosing, same-user `tty` session on seat0. Graphical sessions,
+raw keyboard modes, and line disciplines other than `N_TTY` are rejected.
+
+The maximum request is `KSI_MAX_TERMINAL_INPUT_BYTES` (1024 bytes), validated
+before any input is submitted. Flags are independent:
+
+- `KSI_TERMINAL_INPUT_REQUIRE_UTF8` validates the entire byte sequence as UTF-8
+  and requires the console's Unicode keyboard mode and `IUTF8` input flag.
+- `KSI_TERMINAL_INPUT_TEXT` maps byte 8 (backspace) to the terminal's configured
+  `VERASE` byte. A disabled erase character rejects text containing backspace.
+- Zero flags submits bytes verbatim to a translated or Unicode text console,
+  allowing a consumer to supply terminal escape sequences in future integrations.
+
+All other control bytes, including CR, LF and Tab, retain the target terminal's
+line-discipline semantics. The broker parses no application-specific send syntax
+and does not modify terminal settings. Consumers that treat a newline as Enter
+should normalize CRLF and LF to CR before encoding. See the complete
+[terminal text example](../examples/type-terminal.c).
+
+`bytes_accepted` counts successful `TIOCSTI` submissions, including a prefix when
+an operation fails. It is not an application-consumption acknowledgement: Linux
+can silently discard input when the line-discipline buffer is full, and canonical
+lines are limited to 4095 bytes. A batch stays contiguous relative to other broker
+terminal batches, processed in admission order, but physical typing and the target application remain concurrent.
+Each byte rechecks the target login, device ownership, modes, caller connection,
+seat generation and permission generation. Queued work expires after five seconds;
+requests stop on revocation, logout, hangup, unsupported modes or an ioctl error.
+The service retries a busy response socket for up to one second without repeating
+any input, including when reporting a submitted prefix after cancellation.
+
+Never automatically replay a failed request. A transport failure or response
+timeout has an unknown completion count; a received error acknowledgement reports
+the successfully submitted prefix. The kernel must implement `TIOCSTI`, and the
+service needs `CAP_SYS_ADMIN` to inject into another controlling terminal. The
+provided root service retains that capability and permits console access; no
+change to `dev.tty.legacy_tiocsti` is required.
 
 ## Linux input semantics
 

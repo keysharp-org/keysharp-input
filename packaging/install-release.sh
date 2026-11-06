@@ -5,9 +5,9 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_version=1.1.2
+expected_version=1.2.0
 expected_client_abi_major=1
-expected_client_abi_minor=1
+expected_client_abi_minor=2
 
 usage() {
     echo "Usage: sudo ./install.sh [--skip-if-compatible]"
@@ -170,9 +170,10 @@ service_device_allow_matches() {
             sub(/[[:space:]]*$/, "", value)
             if (value == "char-input rw") input++
             else if (value == "/dev/uinput rw") uinput++
+            else if (value == "char-tty rw") tty++
             else invalid = 1
         }
-        END { if (invalid || input != 1 || uinput != 1) exit 1 }
+        END { if (invalid || input != 1 || uinput != 1 || tty != 1) exit 1 }
     ' "$1"
 }
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keysharp-input
-    VERSION 1.1.2
+    VERSION 1.2.0
     DESCRIPTION "Standalone privileged Linux input broker"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-input"
     LANGUAGES C)
@@ -111,6 +111,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/platform/linux_synth.c
         src/platform/linux_forward.c
         src/platform/linux_output.c
+        src/platform/linux_terminal.c
         src/platform/platform_linux.c
         src/platform/vk_evdev.c)
     target_compile_definitions(keysharp-input-service PRIVATE KSI_PLATFORM_LINUX=1)
@@ -325,6 +326,22 @@ if(BUILD_TESTING)
     add_test(NAME keysharp-input-client-nested-tests
         COMMAND keysharp-input-client-nested-tests)
 
+    add_executable(keysharp-input-client-terminal-tests tests/client_terminal_tests.c)
+    target_include_directories(keysharp-input-client-terminal-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(keysharp-input-client-terminal-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(keysharp-input-client-terminal-tests PRIVATE
+        keysharp-input-client Threads::Threads)
+    add_test(NAME keysharp-input-client-terminal-tests COMMAND keysharp-input-client-terminal-tests)
+
+    add_executable(keysharp-input-linux-terminal-tests tests/linux_terminal_tests.c)
+    target_include_directories(keysharp-input-linux-terminal-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(keysharp-input-linux-terminal-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    add_test(NAME keysharp-input-linux-terminal-tests COMMAND keysharp-input-linux-terminal-tests)
+
     add_executable(keysharp-input-client-stream-tests
         tests/client_stream_tests.c
         src/client.c)
@@ -351,6 +368,7 @@ if(BUILD_TESTING)
         src/worker_pool.c
         src/platform/linux_devices.c
         src/platform/linux_output.c
+        src/platform/linux_terminal.c
         src/platform/platform_linux.c
         src/platform/vk_evdev.c)
     target_include_directories(keysharp-input-daemon-admission-tests PRIVATE
@@ -375,6 +393,10 @@ if(BUILD_TESTING)
         target_compile_options(keysharp-input-protocol-tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
         target_compile_options(keysharp-input-client-nested-tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+        target_compile_options(keysharp-input-client-terminal-tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+        target_compile_options(keysharp-input-linux-terminal-tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
         target_compile_options(keysharp-input-client-stream-tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -515,6 +537,16 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME keysharp-input-linux-forward-tests COMMAND keysharp-input-linux-forward-tests)
+
+    add_executable(keysharp-input-linux-output-tests tests/linux_output_tests.c)
+    target_include_directories(keysharp-input-linux-output-tests PRIVATE src)
+    target_compile_definitions(keysharp-input-linux-output-tests PRIVATE _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(keysharp-input-linux-output-tests PRIVATE Threads::Threads)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(keysharp-input-linux-output-tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME keysharp-input-linux-output-tests COMMAND keysharp-input-linux-output-tests)
 
     add_executable(keysharp-input-owned-text-file-tests
         tests/owned_text_file_tests.c

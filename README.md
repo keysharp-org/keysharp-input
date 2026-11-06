@@ -53,7 +53,7 @@ See the [integration guide](docs/integrating.md) for the full API and callback r
 | Capability | Permission |
 | --- | --- |
 | Passive observer streams, synchronous hooks, arbitrary key/button state | Input Monitoring |
-| Synthesis, blocking, suppressing or replacing events | Input Control |
+| Synthesis, blocking, suppressing or replacing events, same-user virtual-console text input | Input Control |
 | Modifier/lock state, cursor position, idle time | None |
 
 Passive observers receive events without the grab/replay overhead of suppressible hooks.

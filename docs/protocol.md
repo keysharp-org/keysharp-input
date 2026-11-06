@@ -29,6 +29,8 @@ result body follows. On failure it may append `{u32 utf8_length,byte text[]}`
 and has no result body. Status values are OK=0, DENIED=1, UNSUPPORTED=2,
 INVALID_REQUEST=3, UNAVAILABLE=4, BUSY=5, NOT_FOUND=6,
 RESOURCE_EXHAUSTED=7, TIMEOUT=8, CANCELLED=9, REVOKED=10, INTERNAL=255.
+TERMINAL_INPUT is an exception: its worker result carries a submitted-byte count
+and errno on both success and failure, as specified below.
 
 An interactive HELLO or AUTHORIZE that cannot find a polkit authentication agent
 returns UNAVAILABLE with detail `0x00010000` and an agent setup diagnostic.
@@ -74,6 +76,23 @@ The terminal RESPONSE is status-only. REVOKE is
 ALL=3. Unused pid/hash fields are zero. Scope zero is invalid. The service
 lists and revokes only its two managed scopes.
 
+TERMINAL_INPUT accepts only RPC and AUTHORIZATION_LEASE roles with Input Control.
+Kind 1 selects Linux virtual console `target` in 1..63; no pathname crosses the
+protocol. `count` is at most 1024 and must exactly match the remaining payload.
+Flags 1 and 2 are REQUIRE_UTF8 and TEXT respectively; other bits are rejected.
+REQUIRE_UTF8 validates the whole payload before submission and requires a Unicode
+console with IUTF8. TEXT maps backspace to VERASE. Zero flags permits literal
+terminal bytes; all forms still require a same-user logged-in text console.
+
+Admission failures use the ordinary 8-byte status response. A worker completion
+always has 16 bytes: `{u32 status,u32 detail=0,u32 bytes_accepted,u32 errno}`,
+including on failure. Success requires the full requested count and errno zero.
+The count measures successful TIOCSTI submissions, not terminal/application
+consumption. Workers retain one descriptor and never retry failed injections.
+Clients must not replay requests after transport failure or an uncertain timeout.
+The optional opcode leaves protocol 3.0 unchanged and is discovered through the
+new operation bit; older clients ignore unknown operation bits.
+
 ## Available operations
 
 | Bit | Operation | Permission |
@@ -93,6 +112,7 @@ lists and revokes only its two managed scopes.
 | `0x1000` | passive mouse observation | Input Monitoring |
 | `0x2000` | device enumeration | Input Monitoring |
 | `0x4000` | gamepad enumeration and state | none |
+| `0x8000` | targeted terminal byte input | Input Control |
 
 Operation availability and granted permission scopes are separate masks.
 
@@ -106,6 +126,7 @@ Operation availability and granted permission scopes are separate masks.
 | `0x1003` | HOOK_QUARANTINED | server EVENT, 32 bytes | none |
 | `0x1010` | SYNTHESIZE_INPUT | `{u32 count,u32 flags,input[count]}` | `{u32 logical_modifiers,u32 reserved=0,u64 sequence}` |
 | `0x1012` | SET_BLOCK_INPUT | `{u32 mask,u32 reserved=0}` | `{u32 effective,u32 reserved=0}` |
+| `0x1013` | TERMINAL_INPUT | `{u32 kind,u32 target,u32 flags,u32 count,byte[count]}` | `{u32 bytes_accepted,u32 errno=0}` |
 | `0x1020` | GET_INDICATOR_STATE | empty | 4 bytes |
 | `0x1021` | GET_POINTER_POSITION | empty | 28 bytes |
 | `0x1022` | GET_KEY_STATE | empty or `{u32 device_id}` | 200 bytes |

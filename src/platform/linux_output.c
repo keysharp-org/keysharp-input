@@ -65,7 +65,7 @@ int ksi_linux_output_probe_grabbed(int fd)
 {
     pthread_mutex_lock(&output_mutex);
     int result = ioctl(fd, EVIOCGRAB, 1) == 0 ? 0 : errno == EBUSY ? 1 : -1;
-    if (result == 0) (void)ioctl(fd, EVIOCGRAB, 0);
+    if (result == 0 && ioctl(fd, EVIOCGRAB, 0) != 0) result = -1;
     pthread_mutex_unlock(&output_mutex);
     return result;
 }

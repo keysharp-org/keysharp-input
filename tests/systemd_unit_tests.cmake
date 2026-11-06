@@ -40,4 +40,8 @@ if(NOT service_unit MATCHES "\\[Install\\]"
         "keysharp-input.service must be the sole multi-user boot entry point")
 endif()
 
+if(NOT service_unit MATCHES "DeviceAllow[ \t]*=[ \t]*char-tty rw")
+    message(FATAL_ERROR "the service must allow opening Linux virtual consoles")
+endif()
+
 message(STATUS "keysharp-input systemd unit topology passed")

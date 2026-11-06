@@ -96,11 +96,12 @@ static void *worker_thread_main(void *context)
     }
 }
 
-int ksi_worker_pool_init(ksi_worker_pool *pool)
+int ksi_worker_pool_init(ksi_worker_pool *pool, size_t thread_count)
 {
     ksi_worker_pool_implementation *implementation;
 
-    if (pool == NULL || pool->implementation != NULL) {
+    if (pool == NULL || pool->implementation != NULL
+        || thread_count == 0u || thread_count > KSI_WORKER_POOL_MAX_THREADS) {
         return -1;
     }
 
@@ -121,7 +122,7 @@ int ksi_worker_pool_init(ksi_worker_pool *pool)
         return -1;
     }
 
-    for (size_t i = 0; i < KSI_WORKER_POOL_MAX_THREADS; i++) {
+    for (size_t i = 0; i < thread_count; i++) {
         if (pthread_create(
                 &implementation->threads[i], NULL, worker_thread_main, implementation) != 0) {
             pthread_mutex_lock(&implementation->mutex);

@@ -100,7 +100,8 @@ service_configuration_matches \
     '@CMAKE_INSTALL_FULL_BINDIR@/keysharp-input' \
     '@KEYSHARP_INPUT_TMPFILES_CONFIG@'
 for weakening in 's/NoNewPrivileges=yes/NoNewPrivileges=no/' \
-    's/DeviceAllow=char-input rw/DeviceAllow=char-input r/'; do
+    's/DeviceAllow=char-input rw/DeviceAllow=char-input r/' \
+    '/DeviceAllow=char-tty rw/d'; do
     sed "$weakening" "$source_dir/systemd/keysharp-input.service.in" \
         > "$temporary/weakened.service"
     if service_configuration_matches "$temporary/weakened.service" \

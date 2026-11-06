@@ -643,11 +643,11 @@ static ssize_t find_tracked_device_by_fd(int fd)
     return -1;
 }
 
-/* An independent open keeps destructive state ioctls away from libevdev's
- * ordered queue. Retain it to avoid evdev_close's RCU wait on each sample. */
+/* Independent state queries and grab probes must not consume reader events.
+ * Retain the descriptor to avoid evdev_close's RCU wait on each use. */
 static int snapshot_fd(ksi_linux_tracked_device *device)
 {
-    if (device->fd < 0 || device->injected_source) return -1;
+    if (device->fd < 0) return -1;
     if (device->snapshot_fd < 0) {
         struct input_mask mask = { .type = 0u, .codes_size = 0u };
         int fd = open(device->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -669,6 +669,7 @@ static int snapshot_fd(ksi_linux_tracked_device *device)
 static bool read_snapshot(ksi_linux_tracked_device *device, unsigned int type,
     uint8_t *bits, size_t size)
 {
+    if (device->injected_source) return false;
     int fd = snapshot_fd(device);
 
     if (fd < 0) return false;
@@ -1148,18 +1149,20 @@ static ksi_linux_tracked_device *clone_source(const ksi_linux_tracked_device *cl
     return NULL;
 }
 
-/* evdev has no query for a grab, so the node is probed on a fresh descriptor;
- * one that cannot be opened is gone. The probe's own release resets the
- * node's LEDs, which the tracked descriptor writes back. */
-static bool node_is_grabbed(const ksi_linux_tracked_device *output)
+/* The independent descriptor never holds a grab between probes. Closing an
+ * inconclusive probe also releases a grab whose explicit release failed. */
+static bool node_is_grabbed(ksi_linux_tracked_device *output)
 {
-    int fd = open(output->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    int fd = snapshot_fd(output);
     int saved = read_leds_fd(fd);
-    bool grabbed = fd >= 0 && ksi_linux_output_probe_grabbed(fd) > 0;
+    int result = fd >= 0 ? ksi_linux_output_probe_grabbed(fd) : -1;
 
     restore_leds(output, fd, saved);
-    if (fd >= 0) close(fd);
-    return grabbed;
+    if (result < 0 && fd >= 0) {
+        close(fd);
+        output->snapshot_fd = -1;
+    }
+    return result > 0;
 }
 
 /* Whether another process holds an output carrying our traffic. Remappers

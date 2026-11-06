@@ -18,7 +18,7 @@ typedef struct ksi_worker_pool {
     void *implementation;
 } ksi_worker_pool;
 
-int ksi_worker_pool_init(ksi_worker_pool *pool);
+int ksi_worker_pool_init(ksi_worker_pool *pool, size_t thread_count);
 bool ksi_worker_pool_submit(
     ksi_worker_pool *pool,
     void *(*run)(void *),

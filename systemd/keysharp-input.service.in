@@ -23,6 +23,7 @@ UMask=0077
 DevicePolicy=closed
 DeviceAllow=char-input rw
 DeviceAllow=/dev/uinput rw
+DeviceAllow=char-tty rw
 
 [Install]
 WantedBy=multi-user.target

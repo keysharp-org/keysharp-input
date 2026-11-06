@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define KSI_CLIENT_ABI_MAJOR 1u
-#define KSI_CLIENT_ABI_MINOR 1u
+#define KSI_CLIENT_ABI_MINOR 2u
 #define KSI_DEFAULT_SOCKET_PATH "/run/keysharp-input/keysharp-input.sock"
 #define KSI_SOCKET_ENV "KEYSHARP_INPUT_SOCKET"
 
@@ -294,6 +294,35 @@ KSI_API ksi_status ksi_set_block_input(
     ksi_connection *connection,
     uint32_t block_mask,
     uint32_t *effective_mask,
+    ksi_error *error);
+
+typedef struct ksi_terminal_input_options {
+    uint32_t struct_size;
+    uint32_t target_kind;
+    uint32_t target_id;
+    uint32_t flags;
+    KSI_ALIGN64 uint64_t reserved[4];
+} ksi_terminal_input_options;
+
+typedef struct ksi_terminal_input_result {
+    uint32_t struct_size;
+    uint32_t bytes_accepted;
+    KSI_ALIGN64 uint64_t reserved[4];
+} ksi_terminal_input_result;
+
+KSI_API void ksi_terminal_input_options_init(ksi_terminal_input_options *options);
+KSI_API void ksi_terminal_input_result_init(ksi_terminal_input_result *result);
+/* Submits at most KSI_MAX_TERMINAL_INPUT_BYTES to a same-user Linux text VT.
+ * TEXT maps backspace to VERASE; all other bytes retain terminal line-discipline
+ * semantics. Acknowledged bytes may still be discarded by a full terminal queue.
+ * Errors may report a submitted prefix. Transport failures have unknown outcome;
+ * never replay a failed request automatically. */
+KSI_API ksi_status ksi_terminal_input(
+    ksi_connection *connection,
+    const ksi_terminal_input_options *options,
+    const void *bytes,
+    uint32_t byte_count,
+    ksi_terminal_input_result *result,
     ksi_error *error);
 
 typedef struct ksi_indicator_state {

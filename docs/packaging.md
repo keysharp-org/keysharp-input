@@ -135,3 +135,11 @@ The module loads uinput, enables polkit, installs the device rule, and starts
 architecture; override `services.keysharp-input.package` to use a custom build.
 The module leaves authentication-agent selection and autostart to the graphical
 session; enabling polkit alone does not start an agent.
+
+The systemd unit and NixOS module allow `char-tty rw` for targeted virtual-console
+input. The broker constructs and verifies only numbered consoles 1 through 63;
+it does not accept arbitrary device paths. The root service must retain
+`CAP_SYS_ADMIN` and the kernel must implement `TIOCSTI`. A custom capability or
+device-policy override can make this operation unavailable. No package changes
+`dev.tty.legacy_tiocsti`; its disabled default is compatible with the privileged
+service. Archive upgrades compare this device policy and replace stale units.

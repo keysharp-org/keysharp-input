@@ -116,6 +116,7 @@ static inline void wake_pipe_write(int fd)
 static ksi_worker_pool g_worker_pool;
 static ksi_worker_pool g_identify_worker_pool;
 static ksi_worker_pool g_permission_worker_pool;
+static ksi_worker_pool g_terminal_worker_pool;
 typedef struct ksi_permission_task ksi_permission_task;
 static void free_permission_task(void *context);
 static uint64_t monotonic_ms(void);
@@ -704,6 +705,7 @@ static uint64_t current_input_generation(const ksi_daemon_state *state)
 #include "daemon/client_lifecycle.inc"
 #include "daemon/hook_lanes.inc"
 #include "daemon/grab_leases.inc"
+#include "daemon/terminal_input.inc"
 #include "daemon/permission_completions.inc"
 #include "daemon/observers.inc"
 #include "daemon/hook_dispatch.inc"
@@ -1046,19 +1048,23 @@ int ksi_daemon_run(const ksi_daemon_options *options)
 
     ksi_linux_devices_set_panic_callback(daemon_handle_panic, daemon_state);
 
-    if (ksi_worker_pool_init(&g_worker_pool) != 0
-        || ksi_worker_pool_init(&g_identify_worker_pool) != 0
-        || ksi_worker_pool_init(&g_permission_worker_pool) != 0) {
+    if (ksi_worker_pool_init(&g_worker_pool, KSI_WORKER_POOL_MAX_THREADS) != 0
+        || ksi_worker_pool_init(&g_identify_worker_pool, KSI_WORKER_POOL_MAX_THREADS) != 0
+        || ksi_worker_pool_init(&g_permission_worker_pool, KSI_WORKER_POOL_MAX_THREADS) != 0
+        || ksi_worker_pool_init(&g_terminal_worker_pool, 1u) != 0) {
         fprintf(stderr, "keysharp-input: failed to start worker pool\n");
         ksi_worker_pool_request_stop(&g_worker_pool);
         ksi_worker_pool_request_stop(&g_identify_worker_pool);
         ksi_worker_pool_request_stop(&g_permission_worker_pool);
+        ksi_worker_pool_request_stop(&g_terminal_worker_pool);
         (void)ksi_worker_pool_join_before(&g_worker_pool, 0u);
         (void)ksi_worker_pool_join_before(&g_identify_worker_pool, 0u);
         (void)ksi_worker_pool_join_before(&g_permission_worker_pool, 0u);
+        (void)ksi_worker_pool_join_before(&g_terminal_worker_pool, 0u);
         ksi_worker_pool_destroy(&g_worker_pool);
         ksi_worker_pool_destroy(&g_identify_worker_pool);
         ksi_worker_pool_destroy(&g_permission_worker_pool);
+        ksi_worker_pool_destroy(&g_terminal_worker_pool);
 
         ksi_linux_devices_set_hook_event_callback(NULL, NULL);
         ksi_linux_devices_set_forward_event_callback(NULL, NULL, NULL, NULL);
@@ -1266,13 +1272,15 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     ksi_worker_pool_request_stop(&g_worker_pool);
     ksi_worker_pool_request_stop(&g_identify_worker_pool);
     ksi_worker_pool_request_stop(&g_permission_worker_pool);
+    ksi_worker_pool_request_stop(&g_terminal_worker_pool);
 
     /* Wake the main loop so it observes keep_running=0. */
     ksi_pipe_ring_wake(&command_queue.ring);
 
     if (!ksi_worker_pool_join_before(&g_worker_pool, shutdown_deadline_ms)
         || !ksi_worker_pool_join_before(&g_identify_worker_pool, shutdown_deadline_ms)
-        || !ksi_worker_pool_join_before(&g_permission_worker_pool, shutdown_deadline_ms)) {
+        || !ksi_worker_pool_join_before(&g_permission_worker_pool, shutdown_deadline_ms)
+        || !ksi_worker_pool_join_before(&g_terminal_worker_pool, shutdown_deadline_ms)) {
         fprintf(stderr, "keysharp-input: shutdown deadline exceeded waiting for worker pool; terminating\n");
         fflush(NULL);
         _exit(EXIT_FAILURE);
@@ -1281,6 +1289,7 @@ int ksi_daemon_run(const ksi_daemon_options *options)
     ksi_worker_pool_destroy(&g_worker_pool);
     ksi_worker_pool_destroy(&g_identify_worker_pool);
     ksi_worker_pool_destroy(&g_permission_worker_pool);
+    ksi_worker_pool_destroy(&g_terminal_worker_pool);
 
     while (daemon_state->client_count > 0u) {
         remove_client(daemon_state, daemon_state->client_count - 1u);

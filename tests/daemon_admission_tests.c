@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include "keysharp_permissions/permissions.h"
 #include "internal/linux_devices.h"
+#include "connection_ref.h"
 
 static bool snapshot_failure;
 static size_t snapshot_samples;
@@ -23,6 +24,9 @@ void recorded_set_raw_observer_callback(ksi_raw_device_callback callback, void *
 
 static int delayed_permission_check(const ksp_store *store, uid_t uid,
     const char *hash, uint32_t scopes, uint32_t *allowed, uint64_t *generation);
+static int delayed_terminal_response(ksi_hook_send_ref *ref, uint16_t opcode,
+    uint16_t flags, uint64_t request_id, const void *payload, size_t payload_size);
+static atomic_uint terminal_response_busy, terminal_response_attempts;
 
 bool g_verbose = false;
 
@@ -34,12 +38,27 @@ void recorded_apply_end_grab(uint64_t next, const uint8_t *held);
 #define ksi_linux_devices_set_observer_callback recorded_set_observer_callback
 #define ksi_linux_devices_set_raw_observer_callback recorded_set_raw_observer_callback
 #define ksi_linux_devices_get_device_key_state sampled_device_key_state
+#define hook_send_ref_try_send delayed_terminal_response
 #include "../src/daemon.c"
+#undef hook_send_ref_try_send
 #undef ksi_linux_devices_get_device_key_state
 #undef ksp_store_check_at_generation
 #undef ksi_linux_forward_apply_end_grab
 #undef ksi_linux_devices_set_observer_callback
 #undef ksi_linux_devices_set_raw_observer_callback
+
+static int delayed_terminal_response(ksi_hook_send_ref *ref, uint16_t opcode,
+    uint16_t flags, uint64_t request_id, const void *payload, size_t payload_size)
+{
+    if (opcode == KSI_OPCODE_TERMINAL_INPUT) {
+        atomic_fetch_add(&terminal_response_attempts, 1u);
+        if (atomic_load(&terminal_response_busy) != 0u) {
+            atomic_fetch_sub(&terminal_response_busy, 1u);
+            return 0;
+        }
+    }
+    return hook_send_ref_try_send(ref, opcode, flags, request_id, payload, payload_size);
+}
 
 static bool sampled_device_key_state(uint32_t device_id, ksi_key_state_payload *result)
 {
@@ -558,7 +577,7 @@ static bool test_permission_io_does_not_block_input_admission(void)
     CHECK(output_queue_init(&state->output_queue, state) == 0);
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, rpc) == 0);
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, observer) == 0);
-    CHECK(ksi_worker_pool_init(&g_permission_worker_pool) == 0);
+    CHECK(ksi_worker_pool_init(&g_permission_worker_pool, KSI_WORKER_POOL_MAX_THREADS) == 0);
     state->commands = &commands;
     state->permissions = (ksp_store *)&commands;
     state->client_count = 2u;
@@ -1818,7 +1837,7 @@ static bool test_inventory_authorization_and_notifications(void)
     const ksi_platform_backend backend = { .prepare_scopes = record_inventory_preparation };
     CHECK(state != NULL && command_queue_init(&commands) == 0);
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    CHECK(ksi_worker_pool_init(&g_permission_worker_pool) == 0);
+    CHECK(ksi_worker_pool_init(&g_permission_worker_pool, KSI_WORKER_POOL_MAX_THREADS) == 0);
     state->backend = &backend;
     state->commands = &commands;
     state->permissions = (ksp_store *)&store_fixture;
@@ -2142,11 +2161,126 @@ static bool test_paused_observers_report_one_overflow(void)
     return true;
 }
 
+static bool test_terminal_admission_and_fences(void)
+{
+    ksi_daemon_state *state = calloc(1u, sizeof(*state));
+    int sockets[2];
+    CHECK(state != NULL && output_queue_init(&state->output_queue, state) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    state->available_operations = KSI_OPERATION_ALL;
+    state->client_count = 1u;
+    state->input_owner_enforced = true;
+    atomic_store(&state->active_input_uid_valid, true);
+    atomic_store(&state->active_input_uid, (unsigned int)getuid());
+    atomic_store(&state->active_input_generation, 7u);
+    atomic_store(&state->permission_generation, 8u);
+    ksi_client *client = &state->clients[0];
+    *client = (ksi_client){ .fd = sockets[0], .uid = getuid(), .connection_id = 9u,
+        .hello_complete = true, .connection_role = KSI_ROLE_RPC,
+        .authorization_lease = test_lease(KSI_SCOPE_INPUT_CONTROL),
+        .rx_buffer = calloc(1u, KSI_MAX_MESSAGE_SIZE),
+        .hook_send_ref = hook_send_ref_create(sockets[0]) };
+    CHECK(client->rx_buffer != NULL && client->hook_send_ref != NULL);
+    output_queue_sync_owners(state);
+    uint8_t payload[KSI_TERMINAL_INPUT_PREFIX_SIZE + 1u] = { 0 };
+    ksi_wire_write_u32(payload, KSI_TERMINAL_TARGET_LINUX_VT);
+    ksi_wire_write_u32(payload + 4u, 3u);
+    ksi_wire_write_u32(payload + 8u, 3u);
+    ksi_wire_write_u32(payload + 12u, 1u);
+    payload[KSI_TERMINAL_INPUT_PREFIX_SIZE] = 'a';
+    client->authorization_lease->granted_scopes = KSI_SCOPE_INPUT_MONITORING;
+    CHECK(dispatch_request(state, client, KSI_OPCODE_TERMINAL_INPUT, 1u, payload, sizeof(payload)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_TERMINAL_INPUT, 1u, 8u,
+        KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
+    client->authorization_lease->granted_scopes = KSI_SCOPE_INPUT_CONTROL;
+    client->connection_role = KSI_ROLE_CALLBACK_STREAM;
+    CHECK(dispatch_request(state, client, KSI_OPCODE_TERMINAL_INPUT, 2u, payload, sizeof(payload)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_TERMINAL_INPUT, 2u, 8u,
+        KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_WRONG_ROLE, NULL));
+    client->connection_role = KSI_ROLE_RPC;
+    atomic_store(&state->active_input_uid_valid, false);
+    CHECK(dispatch_request(state, client, KSI_OPCODE_TERMINAL_INPUT, 3u, payload, sizeof(payload)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_TERMINAL_INPUT, 3u, 8u,
+        KSI_STATUS_DENIED, KSI_DETAIL_NONE, NULL));
+    atomic_store(&state->active_input_uid_valid, true);
+    for (unsigned int i = 0u; i < 4u; i++) {
+        uint8_t invalid[sizeof(payload)];
+        memcpy(invalid, payload, sizeof(invalid));
+        if (i == 0u) ksi_wire_write_u32(invalid + 4u, 0u);
+        if (i == 1u) ksi_wire_write_u32(invalid + 8u, 4u);
+        if (i == 2u) ksi_wire_write_u32(invalid + 12u, 1025u);
+        if (i == 3u) invalid[KSI_TERMINAL_INPUT_PREFIX_SIZE] = 0x80u;
+        CHECK(dispatch_request(state, client, KSI_OPCODE_TERMINAL_INPUT, 4u + i, invalid, sizeof(invalid)));
+        CHECK(read_status_response(sockets[1], KSI_OPCODE_TERMINAL_INPUT, 4u + i, 8u,
+            KSI_STATUS_INVALID_REQUEST, KSI_DETAIL_VALUE_RANGE, NULL));
+    }
+    state->available_operations &= ~(uint64_t)KSI_OPERATION_TERMINAL_INPUT;
+    CHECK(dispatch_request(state, client, KSI_OPCODE_TERMINAL_INPUT, 8u, payload, sizeof(payload)));
+    CHECK(read_status_response(sockets[1], KSI_OPCODE_TERMINAL_INPUT, 8u, 8u,
+        KSI_STATUS_UNAVAILABLE, KSI_DETAIL_NONE, NULL));
+
+    ksi_terminal_task snapshot = { .state = state, .send_ref = client->hook_send_ref,
+        .connection_id = client->connection_id, .input_generation = 7u,
+        .permission_generation = 8u, .deadline_ms = monotonic_ms() + 1000u, .uid = getuid() };
+    CHECK(terminal_gate_begin(&snapshot));
+    terminal_gate_end(&snapshot);
+    atomic_store(&state->active_input_generation, 9u);
+    CHECK(!terminal_gate_begin(&snapshot));
+    atomic_store(&state->active_input_generation, 7u);
+    atomic_store(&state->permission_generation, 9u);
+    CHECK(!terminal_gate_begin(&snapshot));
+    atomic_store(&state->permission_generation, 8u);
+    state->client_count = 0u;
+    output_queue_sync_owners(state);
+    CHECK(!terminal_gate_begin(&snapshot));
+    state->client_count = 1u;
+    output_queue_sync_owners(state);
+    CHECK(terminal_gate_begin(&snapshot));
+    terminal_gate_end(&snapshot);
+
+    CHECK(ksi_worker_pool_init(&g_terminal_worker_pool, 0u) != 0);
+    CHECK(ksi_worker_pool_init(&g_terminal_worker_pool, KSI_WORKER_POOL_MAX_THREADS + 1u) != 0);
+    CHECK(ksi_worker_pool_init(&g_terminal_worker_pool, 1u) == 0);
+    atomic_store(&terminal_response_busy, 2u);
+    atomic_store(&terminal_response_attempts, 0u);
+    for (unsigned int i = 0u; i < 2u; i++) {
+        ksi_terminal_task *task = malloc(sizeof(*task));
+        CHECK(task != NULL && hook_send_ref_acquire(client->hook_send_ref));
+        *task = snapshot;
+        task->request_id = 10u + i;
+        if (i == 0u) task->input_generation++;
+        else task->deadline_ms = 0u;
+        CHECK(ksi_worker_pool_submit(&g_terminal_worker_pool, terminal_worker, free_terminal_task, task));
+    }
+    for (unsigned int i = 0u; i < 2u; i++) {
+        uint8_t result[KSI_TERMINAL_INPUT_RESULT_SIZE];
+        CHECK(read_status_response(sockets[1], KSI_OPCODE_TERMINAL_INPUT, 10u + i,
+            sizeof(result), i == 0u ? KSI_STATUS_REVOKED : KSI_STATUS_TIMEOUT, KSI_DETAIL_NONE, result));
+        CHECK(ksi_wire_read_u32(result + 8u) == 0u);
+        CHECK(ksi_wire_read_u32(result + 12u) == (uint32_t)(i == 0u ? ECANCELED : ETIMEDOUT));
+    }
+    CHECK(atomic_load(&terminal_response_attempts) == 4u);
+    CHECK(hook_send_ref_is_valid(client->hook_send_ref));
+    ksi_worker_pool_request_stop(&g_terminal_worker_pool);
+    CHECK(ksi_worker_pool_join_before(&g_terminal_worker_pool, monotonic_ms() + 1000u));
+    ksi_worker_pool_destroy(&g_terminal_worker_pool);
+    hook_send_ref_invalidate(client->hook_send_ref);
+    CHECK(!terminal_gate_begin(&snapshot));
+    hook_send_ref_release(client->hook_send_ref);
+    free(client->authorization_lease);
+    free(client->rx_buffer);
+    close(sockets[1]);
+    output_queue_close(&state->output_queue);
+    free(state);
+    return true;
+}
+
 int main(void)
 {
     /* A closed peer or a sink without a reader raises SIGPIPE, which the daemon ignores. */
     signal(SIGPIPE, SIG_IGN);
     if (!test_identity_accept_guard()
+        || !test_terminal_admission_and_fences()
         || !test_inventory_authorization_and_notifications()
         || !test_callback_notice_waits_for_lane_frame()
         || !test_paused_observers_report_one_overflow()

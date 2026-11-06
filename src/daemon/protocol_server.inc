@@ -1251,6 +1251,9 @@ static bool handle_binary_message(
         case KSI_OPCODE_SYNTHESIZE_INPUT:
             handle_synthesize_input(state, client, message);
             return true;
+        case KSI_OPCODE_TERMINAL_INPUT:
+            handle_terminal_input(state, client, message);
+            return true;
         default:
             send_status(client->fd, message->header, KSI_STATUS_UNSUPPORTED,
                 KSI_DETAIL_UNKNOWN_OPERATION);

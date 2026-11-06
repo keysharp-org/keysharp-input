@@ -1,6 +1,7 @@
 #include "keysharp_input/client.h"
 #include "internal/protocol_contract.h"
 #include "device_codec.h"
+#include "terminal_contract.h"
 
 #include <keysharp_permissions/permissions.h>
 
@@ -1167,6 +1168,17 @@ void ksi_modifier_state_init(ksi_modifier_state *state)
     init_sized(state, sizeof(*state));
 }
 
+void ksi_terminal_input_options_init(ksi_terminal_input_options *options)
+{
+    init_sized(options, sizeof(*options));
+    if (options != NULL) options->target_kind = KSI_TERMINAL_TARGET_LINUX_VT;
+}
+
+void ksi_terminal_input_result_init(ksi_terminal_input_result *result)
+{
+    init_sized(result, sizeof(*result));
+}
+
 ksi_status ksi_connect(
     const ksi_connect_options *options,
     ksi_connection **connection,
@@ -1933,6 +1945,69 @@ ksi_status ksi_synthesize(
         if (connection->sequence == 0u) return invalid_result(connection, error, "synthesis sequence");
         if (logical_modifiers_lr != NULL) *logical_modifiers_lr = read_u32(connection->rx + 8u);
     }
+    return status;
+}
+
+ksi_status ksi_terminal_input(ksi_connection *connection,
+    const ksi_terminal_input_options *options, const void *bytes,
+    uint32_t byte_count, ksi_terminal_input_result *result, ksi_error *error)
+{
+    if (!sized_output_is_valid(result, sizeof(*result)))
+        return invalid_output(error, "terminal-input");
+    ksi_terminal_input_result_init(result);
+    if (connection == NULL || options == NULL || options->struct_size < sizeof(*options)
+        || !bytes_are_zero(options->reserved, sizeof(options->reserved))
+        || !ksi_terminal_request_valid(options->target_kind, options->target_id,
+            options->flags, bytes, byte_count)) {
+        set_error(error, 0u, EINVAL, "invalid terminal-input request");
+        return KSI_STATUS_INVALID_REQUEST;
+    }
+    if ((connection->available_operations & KSI_OPERATION_TERMINAL_INPUT) == 0u) {
+        set_error(error, 0u, ENOTSUP, "service does not support targeted terminal input");
+        return KSI_STATUS_UNSUPPORTED;
+    }
+    write_u32(connection->tx, options->target_kind);
+    write_u32(connection->tx + 4u, options->target_id);
+    write_u32(connection->tx + 8u, options->flags);
+    write_u32(connection->tx + 12u, byte_count);
+    if (byte_count != 0u) memcpy(connection->tx + KSI_TERMINAL_INPUT_PREFIX_SIZE, bytes, byte_count);
+    ksi_wire_header response;
+    ksi_status status = request(connection, KSI_OPCODE_TERMINAL_INPUT,
+        connection->tx, KSI_TERMINAL_INPUT_PREFIX_SIZE + byte_count,
+        connection->default_timeout_ms, &response, error);
+    if (status != KSI_STATUS_OK) {
+        size_t error_size = writable_error_size(error);
+        if (error_size > offsetof(ksi_error, message)) {
+            char cause[sizeof(error->message)];
+            size_t capacity = error_size - offsetof(ksi_error, message);
+            if (capacity > sizeof(cause)) capacity = sizeof(cause);
+            memcpy(cause, error->message, capacity);
+            cause[capacity - 1u] = '\0';
+            set_error(error, error->detail, error->system_error,
+                "terminal-input completion is unknown; do not retry automatically: %s", cause);
+        }
+        return status;
+    }
+    if (response.flags != KSI_FRAME_FLAG_RESPONSE)
+        return invalid_result(connection, error, "terminal-input response flags");
+    if (response.payload_size == KSI_STATUS_PAYLOAD_SIZE)
+        return decode_status(connection, connection->rx, response.payload_size,
+            KSI_TERMINAL_INPUT_RESULT_SIZE, error);
+    if (response.payload_size != KSI_TERMINAL_INPUT_RESULT_SIZE)
+        return invalid_result(connection, error, "terminal-input response size");
+    status = read_u32(connection->rx);
+    uint32_t count = read_u32(connection->rx + 8u);
+    uint32_t system_error = read_u32(connection->rx + 12u);
+    if ((status > KSI_STATUS_REVOKED && status != KSI_STATUS_INTERNAL)
+        || read_u32(connection->rx + 4u) != 0u || count > byte_count
+        || system_error > INT_MAX
+        || (status == KSI_STATUS_OK && (count != byte_count || system_error != 0u)))
+        return invalid_result(connection, error, "terminal-input acknowledgement");
+    result->bytes_accepted = count;
+    if (status == KSI_STATUS_OK) clear_error(error);
+    else set_error(error, 0u, (int)system_error,
+        "terminal input %s after %u of %u bytes: %s", ksi_status_name(status),
+        count, byte_count, system_error == 0u ? "operation interrupted" : strerror((int)system_error));
     return status;
 }
 

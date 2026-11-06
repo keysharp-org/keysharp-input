@@ -1192,7 +1192,7 @@ static bool test_grab_retry_policy(void)
         .keyboard_candidate = true, .path = "/fake/event9" };
     tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .keyboard_candidate = true,
         .path = "/dev/input/event-gone" };
-    tracked_devices[2] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .injected_source = true,
+    tracked_devices[2] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 11, .injected_source = true,
         .path = "/dev/null" };
     memset(held_keys, 0, sizeof(held_keys));
     grab_hook_mask = block_input_mask = 0u;
@@ -1272,7 +1272,7 @@ static bool test_own_clone_grabbed_downstream(void)
     tracked_device_count = 2u;
     tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .forwarding_target = 88u,
         .forwarding_ready = true, .keyboard_candidate = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .injected_source = true,
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 11, .injected_source = true,
         .forwarding_clone = true, .path = "/dev/null" };
     memset(held_keys, 0, sizeof(held_keys));
     grab_hook_mask = block_input_mask = 0u;
@@ -1309,7 +1309,7 @@ static bool test_grab_release_keeps_leds(void)
     CHECK(fake_leds[0] == 1u << LED_CAPSL && fake_leds[1] == 1u << LED_SCROLLL);
     CHECK(fake_leds[2] == 1u << LED_CAPSL);
     CHECK(!node_is_grabbed(&tracked_devices[1]));
-    CHECK(tracked_devices[1].snapshot_fd == -1);
+    CHECK(tracked_devices[1].snapshot_fd >= 0);
     CHECK(fake_leds[0] == 1u << LED_CAPSL && fake_leds[1] == 1u << LED_SCROLLL);
 
     console_leds = compositor_leds = -1;
@@ -1330,7 +1330,7 @@ static bool test_grab_change_drains_queue(void)
     tracked_device_count = 2u;
     tracked_devices[0] = (ksi_linux_tracked_device){ .path = "/fake-slot/0", .snapshot_fd = -1, .fd = 12345, .evdev = (struct libevdev *)&step,
         .forwarding_target = 5u, .forwarding_ready = true, .keyboard_candidate = true };
-    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = -1, .injected_source = true, .path = "/dev/null" };
+    tracked_devices[1] = (ksi_linux_tracked_device){ .snapshot_fd = -1, .fd = 11, .injected_source = true, .path = "/dev/null" };
     memset(held_keys, 0, sizeof(held_keys));
     memset(stream_keys, 0, sizeof(stream_keys));
     memset(results, 0, sizeof(results));
@@ -1647,11 +1647,24 @@ static bool test_probe_order(void)
     probe_grabbed_slots = 1u << 2;
     probe_result = 0;
     probes = 0u;
+    snapshot_opens = snapshot_closes = 0u;
     CHECK(our_output_is_grabbed() && probes == 2u);
+    CHECK(snapshot_opens == 2u && snapshot_closes == 0u);
     probes = 0u;
     CHECK(our_output_is_grabbed() && probes == 1u);
+    CHECK(snapshot_opens == 2u && snapshot_closes == 0u);
     probe_grabbed_slots = 0u;
     CHECK(!our_output_is_grabbed());
+    CHECK(snapshot_opens == 2u && snapshot_closes == 0u);
+    probe_result = -1;
+    CHECK(!node_is_grabbed(&tracked_devices[0]));
+    CHECK(tracked_devices[0].snapshot_fd == -1 && snapshot_closes == 1u);
+    probe_result = 0;
+    CHECK(!node_is_grabbed(&tracked_devices[0]));
+    CHECK(snapshot_opens == 3u && tracked_devices[0].snapshot_fd >= 0);
+    close_tracked_device(&tracked_devices[0]);
+    close_tracked_device(&tracked_devices[1]);
+    CHECK(snapshot_closes == 3u);
     probe_result = 1;
     tracked_device_count = 0u;
     memset(tracked_devices, 0, sizeof(tracked_devices[0]) * 2u);
