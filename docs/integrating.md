@@ -442,7 +442,6 @@ polkit reports that no authentication agent is available for the session. Displa
 `error.message` so the user can install or start an agent and retry. An existing
 lease connection remains usable; this detail distinguishes agent setup from a
 transport failure. A failed `ksi_connect` must be retried to obtain a connection.
-This additive diagnostic uses the existing error structure and status values.
 Policy denial and dismissed requests return `KSI_STATUS_DENIED`.
 
 Treat a missing service, authorization denial, revocation, and a closed callback

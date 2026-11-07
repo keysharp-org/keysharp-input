@@ -497,4 +497,4 @@ systemctl daemon-reload
 # The binary owns the /etc udev rule and preserves local edits.
 /usr/local/bin/keysharp-input daemon --install-input-access
 echo "Installed keysharp-input $expected_version."
-echo "Graphical permission prompts need a polkit authentication agent running in your user session; configure its autostart if needed. See $archive_dir/docs/install.md."
+echo "Graphical permission prompts need a polkit authentication agent running in your user session; configure its autostart if needed. See https://github.com/keysharp-org/keysharp-input/blob/v$expected_version/docs/install.md#authentication-prompts"

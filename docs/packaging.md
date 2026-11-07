@@ -27,8 +27,6 @@ require an additive API with a versioned dependency. Applications depend on
 the client ABI; the daemon protocol is private to the matching client library.
 
 Both Debian package build paths recommend `mate-polkit | polkit-1-auth-agent`.
-The virtual alternative allows an existing desktop provider to satisfy it.
-Agent startup belongs to the user session; see [authentication prompts](install.md#authentication-prompts).
 
 After a staged package install, run:
 

@@ -10,7 +10,7 @@
 #define KSI_MAX_TERMINAL_INPUT_BYTES 1024u
 #define KSI_MOUSE_COORD_UNSPECIFIED INT32_MIN
 
-/* Authorization can be retried on the existing connection after an agent starts. */
+/* An interactive authorization needs a session agent; retry after starting it. */
 #define KSI_ERROR_DETAIL_NO_AUTHENTICATION_AGENT 0x00010000u
 
 typedef uint32_t ksi_status;

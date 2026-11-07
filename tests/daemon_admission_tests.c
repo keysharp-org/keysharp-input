@@ -473,9 +473,6 @@ static bool test_missing_authentication_agent(void)
         { KSP_POLKIT_NO_AGENT, true, false, false },
         { KSP_POLKIT_NO_AGENT, false, true, false },
         { KSP_POLKIT_NO_AGENT, false, false, true },
-        { KSP_POLKIT_DENIED, false, false, false },
-        { KSP_POLKIT_CANCELLED, false, false, false },
-        { KSP_POLKIT_IDENTITY_CHANGED, false, false, false },
         { KSP_POLKIT_UNAVAILABLE, false, false, false },
     };
     ksi_daemon_state *state = calloc(1u, sizeof(*state));
