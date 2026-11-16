@@ -6,7 +6,8 @@ Build-Depends: debhelper-compat (= 13),
                cmake,
                pkgconf | pkg-config,
                libudev-dev,
-               libevdev-dev
+               libevdev-dev,
+               libssl-dev
 Standards-Version: 4.7.0
 Homepage: https://github.com/keysharp-org/keysharp-input
 Rules-Requires-Root: no

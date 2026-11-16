@@ -3,6 +3,7 @@
 , cmake
 , pkg-config
 , libevdev
+, openssl
 , systemd
 , polkit
 , keysharpPermissionsSource
@@ -15,7 +16,7 @@ stdenv.mkDerivation (finalAttrs: {
   src = lib.cleanSource ../.;
 
   nativeBuildInputs = [ cmake pkg-config ];
-  buildInputs = [ libevdev systemd ];
+  buildInputs = [ libevdev openssl systemd ];
 
   cmakeFlags = [
     "-DKEYSHARP_PERMISSIONS_SOURCE_DIR=${keysharpPermissionsSource}"

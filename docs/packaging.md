@@ -50,6 +50,8 @@ SHA256SUMS
 
 Archives contain the executable, SONAME library, public headers, pkg-config and
 CMake metadata, service files, policy, installer, and standalone docs.
+Portable archives link OpenSSL's libcrypto statically and include its copyright
+and license notices. Source and Debian builds use the system library.
 The archive's `configure-library-path.sh` registers `/usr/local/lib` in
 `/etc/ld.so.conf.d/keysharp-input.conf` before `ldconfig` and service setup.
 Direct source installation registers its configured library directory through

@@ -480,6 +480,16 @@ install -D -m 0644 "$archive_dir/LICENSE" \
     /usr/local/share/doc/keysharp-input/LICENSE
 install -D -m 0644 "$archive_dir/README.md" \
     /usr/local/share/doc/keysharp-input/README.md
+if [ -f "$archive_dir/PROVENANCE.md" ]; then
+    install -D -m 0644 "$archive_dir/PROVENANCE.md" \
+        /usr/local/share/doc/keysharp-input/PROVENANCE.md
+fi
+if [ -f "$archive_dir/share/doc/keysharp-input/OpenSSL.copyright" ]; then
+    install -D -m 0644 "$archive_dir/share/doc/keysharp-input/OpenSSL.copyright" \
+        /usr/local/share/doc/keysharp-input/OpenSSL.copyright
+    install -m 0644 "$archive_dir/share/doc/keysharp-input/Apache-2.0" \
+        /usr/local/share/doc/keysharp-input/Apache-2.0
+fi
 install -D -m 0755 "$archive_dir/uninstall.sh" \
     /usr/local/share/doc/keysharp-input/uninstall.sh
 

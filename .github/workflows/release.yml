@@ -134,13 +134,14 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake pkg-config libudev-dev libevdev-dev dpkg-dev
+          sudo apt-get install --yes cmake pkg-config libudev-dev libevdev-dev libssl-dev dpkg-dev
 
       - name: Build and test portable layout
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DKEYSHARP_INPUT_SETUP_ON_INSTALL=OFF
           cmake --build build --parallel
           ctest --test-dir build --output-on-failure
@@ -179,6 +180,10 @@ jobs:
           install -m 0755 packaging/configure-library-path.sh "$root/configure-library-path.sh"
           install -m 0755 uninstall.sh "$root/uninstall.sh"
           install -m 0644 LICENSE README.md PROVENANCE.md "$root/"
+          install -D -m 0644 /usr/share/doc/libssl-dev/copyright \
+            "$root/share/doc/keysharp-input/OpenSSL.copyright"
+          install -m 0644 /usr/share/common-licenses/Apache-2.0 \
+            "$root/share/doc/keysharp-input/Apache-2.0"
           mkdir -p dist
           commit_epoch=$(git log -1 --format=%ct)
           tar -C "$RUNNER_TEMP" --sort=name --mtime="@$commit_epoch" \

@@ -64,8 +64,8 @@ carries in managed code. Both sides are covered by tests; a new mapping goes in 
 
 ## Build and test
 
-Needs CMake 3.16+, a C11 compiler, libudev and libevdev. Clone recursively for the
-`keysharp-permissions` submodule.
+Needs CMake 3.16+, a C11 compiler, libudev, libevdev and OpenSSL development files.
+Clone recursively for the `keysharp-permissions` submodule.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

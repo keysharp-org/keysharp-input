@@ -108,7 +108,7 @@ Revoke unwanted grants with `keysharp-input permissions revoke` before removal.
 ```sh
 git clone --recurse-submodules https://github.com/keysharp-org/keysharp-input
 cd keysharp-input
-sudo apt install cmake build-essential pkg-config libudev-dev libevdev-dev polkitd
+sudo apt install cmake build-essential pkg-config libudev-dev libevdev-dev libssl-dev polkitd
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
